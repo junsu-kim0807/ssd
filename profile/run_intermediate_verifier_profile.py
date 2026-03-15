@@ -284,11 +284,24 @@ def compute_position_stats(
 
 
 def acceptance_length(accept_list: list[int]) -> int:
-    """First index where accept is 0, or len(accept_list) if all accept."""
+    """First index where accept is 0, or len(accept_list) if all accept.
+    This is the number of consecutive accepted draft tokens in one verify round.
+    """
     for i, a in enumerate(accept_list):
         if a == 0:
             return i
     return len(accept_list)
+
+
+# --- Metric definitions (for summary and user reference) ---
+# Position-wise acceptance rate at position j:
+#   = (rounds where positions 0, 1, ..., j were ALL accepted) / (total rounds).
+#   If any position before j rejected, that round counts as reject at j.
+#   So rate at j = P(accept at 0 and 1 and ... and j) -> 0.8, 0.64, 0.512, ... when conditional p=0.8.
+#
+# Average acceptance length:
+#   = mean over rounds of (first rejection index, or K if all accepted).
+#   E[length] = rate[0] + rate[1] + ... + rate[K-1] (with the above definition of rate).
 
 
 def get_recovery_token_from_logits(logits: torch.Tensor, accept_len: int, k: int) -> int:
@@ -416,9 +429,15 @@ def main():
                 draft_tokens, logits_inter, logits_target, args.topk
             )
 
+            # Position-wise rate: accept at j only if 0..j all accepted (else treat as reject)
+            # So rate at j = P(accept at 0 and 1 and ... and j) -> 0.8, 0.64, 0.512, ...
             for j in range(len(draft_tokens)):
-                position_accept_target[j].append(accept_target_list[j])
-                position_accept_inter[j].append(accept_inter_list[j])
+                position_accept_target[j].append(
+                    1 if all(accept_target_list[: j + 1]) else 0
+                )
+                position_accept_inter[j].append(
+                    1 if all(accept_inter_list[: j + 1]) else 0
+                )
 
             n_accept_target = acceptance_length(accept_target_list)
             n_accept_inter = acceptance_length(accept_inter_list)
@@ -515,6 +534,10 @@ def main():
             "codeelo_max_new_tokens": args.codeelo_max_new_tokens,
             "num_prompts": len(prompts_and_ids),
             "total_verify_rounds": total_rounds,
+        },
+        "metric_definitions": {
+            "position_accept_rate": "At position j: (rounds where positions 0,1,...,j were ALL accepted) / total_rounds. If any earlier position rejected, round counts as reject at j. So rate j = P(accept 0 and ... and j) -> 0.8, 0.64, 0.512, ...",
+            "avg_acceptance_length": "Per round: first index where draft != target top-1 (or K if all accepted). Mean over rounds. With position_accept_rate above, E[length] = rate[0]+rate[1]+...+rate[K-1].",
         },
         "position_accept_rate_target": position_avg_accept_target,
         "position_accept_rate_intermediate": position_avg_accept_inter,
