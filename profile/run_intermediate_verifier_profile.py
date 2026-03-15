@@ -1,21 +1,21 @@
 #!/usr/bin/env python3
 """
-Profile script: Draft -> serial Intermediate verifier -> Target verifier on AIME 2025.
+Profile script: Draft -> serial Intermediate verifier -> Target verifier.
 
 Compares position-wise:
 - Intermediate verifier vs Target: top-5 tokens per position, acceptance rate, avg acceptance length.
 - Accept decision is always made by Target top-1; we record what Intermediate would have done.
 
-Models (paths or HF ids):
-  Draft: Qwen3-0.6B
-  Intermediate verifier: Qwen3-4B
-  Target: Qwen3-30B-A3B
+Models and datasets are loaded from HuggingFace by default (no local paths required).
+  Draft: Qwen/Qwen3-0.6B
+  Intermediate verifier: Qwen/Qwen3-4B
+  Target: Qwen/Qwen3-30B-A3B
+  Datasets: aime25 (opencompass/AIME2025), codeelo (Qwen/CodeElo)
 
 Usage:
-  pip install datasets  # if loading AIME from HuggingFace
-  python profile/run_intermediate_verifier_profile.py \
-    --draft <path_or_hf_id> --intermediate <path_or_hf_id> --target <path_or_hf_id> \
-    --output-dir profile/results --k 5 --max-new-tokens 256 --max-samples 5
+  pip install datasets
+  python profile/run_intermediate_verifier_profile.py --datasets aime25 --max-samples-aime25 5
+  python profile/run_intermediate_verifier_profile.py --datasets aime25,codeelo
 """
 
 from __future__ import annotations
@@ -26,6 +26,7 @@ import os
 import sys
 from collections import defaultdict
 from pathlib import Path
+from typing import Any
 
 import torch
 
@@ -39,12 +40,13 @@ except ImportError:
     raise ImportError("Install transformers: pip install transformers")
 
 try:
-    from datasets import load_dataset
+    from datasets import load_dataset, concatenate_datasets
 except ImportError:
     load_dataset = None
+    concatenate_datasets = None
 
 
-# Default model names (HF ids or env-overridable paths)
+# Default model names (HF ids; override with env SSD_PROFILE_*_MODEL or --draft/--intermediate/--target)
 def _model_path(name: str, default_hf: str) -> str:
     env = os.environ.get(f"SSD_PROFILE_{name.upper()}_MODEL")
     return env if env else default_hf
@@ -52,34 +54,106 @@ def _model_path(name: str, default_hf: str) -> str:
 
 DEFAULT_DRAFT = "Qwen/Qwen3-0.6B"
 DEFAULT_INTERMEDIATE = "Qwen/Qwen3-4B"
-DEFAULT_TARGET = "Qwen/Qwen3-30B-A3B"  # override via env or --target if using different checkpoint
+DEFAULT_TARGET = "Qwen/Qwen3-30B-A3B"
+
+AIME25_REPO = "opencompass/AIME2025"
+CODEELO_REPO = "Qwen/CodeElo"
 
 
-def load_aime2025(max_samples: int | None, dataset_dir: str | None, use_chat_template: bool):
-    """Load AIME 2025 prompts. Prefer local jsonl, else HuggingFace."""
-    prompts_and_ids = []  # list of (prompt_text, sample_id)
-
-    if dataset_dir and os.path.isdir(dataset_dir):
-        path = os.path.join(dataset_dir, "aime2025_test.jsonl")
-        if not os.path.exists(path):
-            path = os.path.join(dataset_dir, "aime2025", "aime2025_test.jsonl")
-        if os.path.exists(path):
-            with open(path, "r", encoding="utf-8") as f:
-                for i, line in enumerate(f):
-                    if max_samples is not None and i >= max_samples:
-                        break
-                    data = json.loads(line.strip())
-                    prompts_and_ids.append((data["problem"], data.get("id", str(i))))
-            return prompts_and_ids
-
+def load_dataset_split(repo: str):
+    """Load dataset; for AIME2025 concatenate I and II."""
+    if repo == AIME25_REPO:
+        if load_dataset is None or concatenate_datasets is None:
+            raise RuntimeError("Install datasets: pip install datasets")
+        ds_i = load_dataset(repo, "AIME2025-I", split="test")
+        ds_ii = load_dataset(repo, "AIME2025-II", split="test")
+        return concatenate_datasets([ds_i, ds_ii]), "test"
     if load_dataset is None:
-        raise RuntimeError("AIME 2025 not found locally. Install datasets: pip install datasets")
-    ds = load_dataset("math-ai/aime25", split="test")
-    n = min(len(ds), max_samples or len(ds))
-    for i in range(n):
-        ex = ds[i]
-        prompts_and_ids.append((ex["problem"], ex.get("id", str(i))))
-    return prompts_and_ids
+        raise RuntimeError("Install datasets: pip install datasets")
+    for split in ("test", "validation", "train"):
+        try:
+            return load_dataset(repo, split=split), split
+        except Exception:
+            continue
+    raise RuntimeError(f"Could not load dataset {repo}")
+
+
+def extract_first_present(example: dict[str, Any], keys: list[str], default: str = "") -> str:
+    for key in keys:
+        if key in example and example[key] is not None:
+            return str(example[key])
+    return default
+
+
+def build_aime25_prompt(example: dict[str, Any]) -> str:
+    problem = extract_first_present(example, ["problem", "question", "input", "prompt"])
+    return (
+        "Solve the following AIME 2025 problem. "
+        "Return only the final answer as a non-negative integer.\n\n"
+        f"Problem:\n{problem}\n\n"
+        "Final answer:"
+    )
+
+
+def build_codeelo_prompt(example: dict[str, Any]) -> str:
+    title = extract_first_present(example, ["name", "title"], default="")
+    description = extract_first_present(example, ["description"], default="")
+    input_spec = extract_first_present(example, ["input"], default="")
+    output_spec = extract_first_present(example, ["output"], default="")
+    interaction = extract_first_present(example, ["interaction"], default="")
+    note = extract_first_present(example, ["note"], default="")
+    sections = []
+    if title:
+        sections.append(f"Title:\n{title}")
+    if description:
+        sections.append(f"Problem:\n{description}")
+    if input_spec:
+        sections.append(f"Input Format:\n{input_spec}")
+    if output_spec:
+        sections.append(f"Output Format:\n{output_spec}")
+    if interaction:
+        sections.append(f"Interaction:\n{interaction}")
+    if note:
+        sections.append(f"Notes:\n{note}")
+    body = "\n\n".join(sections)
+    return (
+        "Solve the following competitive programming problem. "
+        "Output only the final C++17 solution code inside one markdown code block.\n\n"
+        f"{body}\n\n"
+        "Answer:"
+    )
+
+
+def get_dataset_prompts(
+    dataset_key: str,
+    max_samples_aime25: int | None,
+    max_samples_codeelo: int | None,
+) -> list[tuple[str, str, str]]:
+    """Returns list of (prompt_text, sample_id, dataset_key)."""
+    out: list[tuple[str, str, str]] = []
+    if dataset_key == "aime25":
+        ds, split = load_dataset_split(AIME25_REPO)
+        rows = list(ds)
+        if max_samples_aime25 is not None:
+            rows = rows[:max_samples_aime25]
+        for i, x in enumerate(rows):
+            prompt = build_aime25_prompt(x)
+            sid = extract_first_present(x, ["id", "name"], str(i))
+            out.append((prompt, sid, "aime25"))
+        print(f"[dataset] aime25: repo={AIME25_REPO}, split={split}, samples={len(out)}")
+        return out
+    if dataset_key == "codeelo":
+        ds, split = load_dataset_split(CODEELO_REPO)
+        rows = list(ds)
+        if max_samples_codeelo is not None:
+            rows = rows[:max_samples_codeelo]
+        for i, x in enumerate(rows):
+            prompt = build_codeelo_prompt(x)
+            sid = extract_first_present(x, ["id", "name"], str(i))
+            out.append((prompt, sid, "codeelo"))
+        print(f"[dataset] codeelo: repo={CODEELO_REPO}, split={split}, samples={len(out)}")
+        return out
+    raise ValueError(f"Unsupported dataset key: {dataset_key}")
 
 
 def get_tokenizer(model_path: str):
@@ -88,9 +162,9 @@ def get_tokenizer(model_path: str):
 
 def encode_prompt(tokenizer, prompt_text: str, use_chat_template: bool, max_prompt_tokens: int | None):
     if use_chat_template and hasattr(tokenizer, "apply_chat_template"):
-        # Qwen-style chat
+        messages = [{"role": "user", "content": prompt_text}]
         tokens = tokenizer.apply_chat_template(
-            [{"role": "user", "content": prompt_text}],
+            messages,
             add_generation_prompt=True,
             tokenize=True,
         )
@@ -99,6 +173,14 @@ def encode_prompt(tokenizer, prompt_text: str, use_chat_template: bool, max_prom
     if max_prompt_tokens is not None and len(tokens) > max_prompt_tokens:
         tokens = tokens[:max_prompt_tokens]
     return tokens
+
+
+def get_dataset_max_new_tokens(dataset_key: str, aime_max_new_tokens: int, codeelo_max_new_tokens: int) -> int:
+    if dataset_key == "aime25":
+        return aime_max_new_tokens
+    if dataset_key == "codeelo":
+        return codeelo_max_new_tokens
+    return aime_max_new_tokens
 
 
 def get_logits_at_positions(model, input_ids: torch.Tensor, positions: list[int], device):
@@ -221,35 +303,46 @@ def get_recovery_token_from_logits(logits: torch.Tensor, accept_len: int, k: int
     return logits[0, k].argmax(dim=-1).item()
 
 
+def parse_csv_list(raw: str) -> list[str]:
+    return [x.strip() for x in raw.split(",") if x.strip()]
+
+
 def main():
-    parser = argparse.ArgumentParser(description="Profile intermediate vs target verifier on AIME 2025")
-    parser.add_argument("--draft", type=str, default=_model_path("draft", DEFAULT_DRAFT), help="Draft model path or HF id")
-    parser.add_argument("--intermediate", type=str, default=_model_path("intermediate", DEFAULT_INTERMEDIATE))
-    parser.add_argument("--target", type=str, default=_model_path("target", DEFAULT_TARGET))
+    parser = argparse.ArgumentParser(
+        description="Profile intermediate vs target verifier (datasets from HuggingFace, no path setup)."
+    )
+    parser.add_argument("--draft", type=str, default=_model_path("draft", DEFAULT_DRAFT), help="Draft model HF id (default: Qwen/Qwen3-0.6B)")
+    parser.add_argument("--intermediate", type=str, default=_model_path("intermediate", DEFAULT_INTERMEDIATE), help="Intermediate verifier HF id")
+    parser.add_argument("--target", type=str, default=_model_path("target", DEFAULT_TARGET), help="Target model HF id")
     parser.add_argument("--output-dir", type=str, default="profile/results", help="Directory to save stats and per-position data")
+    parser.add_argument("--datasets", type=str, default="aime25", help="Comma-separated dataset keys: aime25, codeelo")
+    parser.add_argument("--max-samples-aime25", type=int, default=None, help="Cap number of AIME25 samples")
+    parser.add_argument("--max-samples-codeelo", type=int, default=None, help="Cap number of CodeElo samples")
+    parser.add_argument("--aime-max-new-tokens", type=int, default=256, help="Max new tokens for AIME25")
+    parser.add_argument("--codeelo-max-new-tokens", type=int, default=1024, help="Max new tokens for CodeElo")
     parser.add_argument("--k", type=int, default=5, help="Number of draft tokens per round")
-    parser.add_argument("--max-new-tokens", type=int, default=256, help="Max new tokens per prompt (multiple rounds)")
-    parser.add_argument("--max-samples", type=int, default=None, help="Max AIME problems (default: all 30)")
-    parser.add_argument("--dataset-dir", type=str, default=None, help="Local dataset dir (e.g. SSD_DATASET_DIR); else load from HF")
-    parser.add_argument("--chat-template", action="store_true", help="Apply chat template to prompts")
+    parser.add_argument("--chat-template", action="store_true", default=True, help="Apply chat template (default: True)")
+    parser.add_argument("--no-chat-template", action="store_false", dest="chat_template")
     parser.add_argument("--max-prompt-tokens", type=int, default=2048, help="Truncate prompt to this length")
     parser.add_argument("--topk", type=int, default=5, help="Top-k tokens to record per position")
     parser.add_argument("--device-draft", type=str, default="cuda:0", help="Draft model device (multi-GPU safe)")
     parser.add_argument("--device-intermediate", type=str, default="cuda:0", help="Intermediate verifier device")
-    parser.add_argument("--device-target", type=str, default="cuda:0", help="Target model device (e.g. cuda:1; no cross-device tensors)")
+    parser.add_argument("--device-target", type=str, default="cuda:0", help="Target model device (e.g. cuda:1)")
     parser.add_argument("--save-per-position-detail", action="store_true", help="Save per-sample per-position top-5 details (can be large)")
     args = parser.parse_args()
 
     os.makedirs(args.output_dir, exist_ok=True)
 
-    # Dataset dir from env if not set
-    dataset_dir = args.dataset_dir or os.environ.get("SSD_DATASET_DIR")
-
-    prompts_and_ids = load_aime2025(args.max_samples, dataset_dir, args.chat_template)
+    dataset_keys = parse_csv_list(args.datasets)
+    prompts_and_ids: list[tuple[str, str, str]] = []  # (prompt_text, sample_id, dataset_key)
+    for key in dataset_keys:
+        prompts_and_ids.extend(
+            get_dataset_prompts(key, args.max_samples_aime25, args.max_samples_codeelo)
+        )
     if not prompts_and_ids:
-        print("No AIME 2025 prompts loaded. Exiting.")
+        print("No prompts loaded. Exiting.")
         return 1
-    print(f"Loaded {len(prompts_and_ids)} AIME 2025 prompts")
+    print(f"Loaded {len(prompts_and_ids)} prompts from {dataset_keys}")
 
     tokenizer = get_tokenizer(args.target)
     print("Loading draft model...")
@@ -289,8 +382,11 @@ def main():
     pending_inter_recovery: int | None = None
 
     total_rounds = 0
-    for sample_idx, (prompt_text, sample_id) in enumerate(prompts_and_ids):
+    for sample_idx, (prompt_text, sample_id, dataset_key) in enumerate(prompts_and_ids):
         pending_inter_recovery = None  # reset per sample so we don't carry over across prompts
+        max_new_tokens = get_dataset_max_new_tokens(
+            dataset_key, args.aime_max_new_tokens, args.codeelo_max_new_tokens
+        )
         prompt_ids = encode_prompt(tokenizer, prompt_text, args.chat_template, args.max_prompt_tokens)
         if not prompt_ids:
             continue
@@ -305,7 +401,7 @@ def main():
         current_recovery = recovery_token_id
         prompt_ids_for_round = list(prompt_ids)
 
-        while generated_count < args.max_new_tokens:
+        while generated_count < max_new_tokens:
             draft_tokens, logits_inter, logits_target = run_one_verify_round(
                 draft_model,
                 inter_model,
@@ -381,7 +477,7 @@ def main():
             generated_count += n_accept_target + 1
             # current_recovery already holds the new recovery for the next round's draft start
 
-            if generated_count >= args.max_new_tokens or current_recovery == tokenizer.eos_token_id:
+            if generated_count >= max_new_tokens or current_recovery == tokenizer.eos_token_id:
                 break
 
     # Summary stats
@@ -418,7 +514,9 @@ def main():
             "intermediate": args.intermediate,
             "target": args.target,
             "k": args.k,
-            "max_new_tokens": args.max_new_tokens,
+            "datasets": dataset_keys,
+            "aime_max_new_tokens": args.aime_max_new_tokens,
+            "codeelo_max_new_tokens": args.codeelo_max_new_tokens,
             "num_prompts": len(prompts_and_ids),
             "total_verify_rounds": total_rounds,
         },
