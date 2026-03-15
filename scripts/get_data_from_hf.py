@@ -237,6 +237,49 @@ def download_alpaca_data(num_samples=None):
     return output_file
 
 
+def download_aime2025_data(num_samples=None):
+    """Download AIME 2025 dataset (math-ai/aime25) and save as JSONL.
+    Fields: problem, answer, id. Used for intermediate verifier profile evaluation.
+    """
+    output_dir = os.path.join(get_base_output_dir(), "aime2025")
+    os.makedirs(output_dir, exist_ok=True)
+
+    max_samples = 30  # AIME 2025 has 30 problems
+    if num_samples is None:
+        num_samples = max_samples
+    else:
+        num_samples = min(num_samples, max_samples)
+
+    output_file = os.path.join(output_dir, "aime2025_test.jsonl")
+
+    if os.path.exists(output_file):
+        print(f"File {output_file} already exists. Skipping download.")
+        return output_file
+
+    print("Loading AIME 2025 dataset (math-ai/aime25)...")
+    try:
+        dataset = load_dataset("math-ai/aime25", split="test")
+    except Exception as e:
+        print(f"Error loading AIME 2025: {e}")
+        raise
+
+    total_samples = len(dataset)
+    samples_to_process = min(num_samples, total_samples)
+
+    with open(output_file, "w", encoding="utf-8") as f:
+        for i in range(samples_to_process):
+            example = dataset[i]
+            sample = {
+                "problem": example["problem"],
+                "answer": example["answer"],
+                "id": example["id"],
+            }
+            f.write(json.dumps(sample, ensure_ascii=False) + "\n")
+
+    print(f"Saved {samples_to_process} AIME 2025 samples to {output_file}")
+    return output_file
+
+
 def download_all_datasets(num_samples=None):
     """Download all datasets."""
     print("Downloading all datasets...")
@@ -247,6 +290,7 @@ def download_all_datasets(num_samples=None):
         ("UltraFeedback", download_ultrafeedback_data),
         ("HumanEval", download_humaneval_data),
         ("Alpaca", download_alpaca_data),
+        ("AIME2025", download_aime2025_data),
     ]
     
     output_files = {}

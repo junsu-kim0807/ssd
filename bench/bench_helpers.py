@@ -170,7 +170,8 @@ def load_dataset_token_ids(
                 if len(prompts) >= num_prompts:
                     break
                 data = json.loads(line.strip())
-                text: str = data["text"]
+                # AIME 2025 uses "problem" instead of "text"
+                text: str = data.get("problem", data.get("text", ""))
                 if use_chat_template and hasattr(tokenizer, 'apply_chat_template'):
                     tokens = tokenizer.apply_chat_template(
                         [{"role": "system", "content": "You are a helpful assistant."}, {"role": "user", "content": text}],
