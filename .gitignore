@@ -38,7 +38,6 @@ wandb_runs/
 bench/tmp*/
 bench/results/
 plots/
-profile/
 summaries/
 
 # Temporary / scratch
