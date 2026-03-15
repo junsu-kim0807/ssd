@@ -345,24 +345,20 @@ def main():
     print(f"Loaded {len(prompts_and_ids)} prompts from {dataset_keys}")
 
     tokenizer = get_tokenizer(args.target)
+    # Load without device_map so accelerate is not required; move to device with .to()
+    def _load_causal_lm(path: str, device: str):
+        try:
+            model = AutoModelForCausalLM.from_pretrained(path, dtype=torch.bfloat16)
+        except TypeError:
+            model = AutoModelForCausalLM.from_pretrained(path, torch_dtype=torch.bfloat16)
+        return model.to(device)
+
     print("Loading draft model...")
-    draft_model = AutoModelForCausalLM.from_pretrained(
-        args.draft,
-        torch_dtype=torch.bfloat16,
-        device_map=args.device_draft,
-    )
+    draft_model = _load_causal_lm(args.draft, args.device_draft)
     print("Loading intermediate model...")
-    inter_model = AutoModelForCausalLM.from_pretrained(
-        args.intermediate,
-        torch_dtype=torch.bfloat16,
-        device_map=args.device_intermediate,
-    )
+    inter_model = _load_causal_lm(args.intermediate, args.device_intermediate)
     print("Loading target model...")
-    target_model = AutoModelForCausalLM.from_pretrained(
-        args.target,
-        torch_dtype=torch.bfloat16,
-        device_map=args.device_target,
-    )
+    target_model = _load_causal_lm(args.target, args.device_target)
 
     # Aggregates over all rounds and samples
     position_accept_target: dict[int, list[int]] = defaultdict(list)   # position -> list of 0/1
