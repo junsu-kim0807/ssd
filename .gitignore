@@ -14,6 +14,7 @@ venv/
 env/
 
 # Test / type / lint caches
+profile/results/*
 .pytest_cache/
 .mypy_cache/
 .ruff_cache/
