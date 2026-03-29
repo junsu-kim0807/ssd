@@ -352,21 +352,19 @@ def run_one_verify_round_batch(
         threshold_cross_position_batch = [threshold_cross_position_round for _ in range(bsz)]
 
     full_seqs = [list(prompt_ids_batch[i]) + [int(recovery_token_ids[i])] + draft_tokens_batch[i] for i in range(bsz)]
-    positions_per_sample = [list(range(len(prompt_ids_batch[i]) - 1, len(prompt_ids_batch[i]) + k)) for i in range(bsz)]
+    positions_per_sample = [list(range(len(prompt_ids_batch[i]) - 1, len(prompt_ids_batch[i]) + k + 1)) for i in range(bsz)]
     logits_inter, inter_total_tokens, inter_total_slots = _batched_logits_at_positions(
         inter_model,
         full_seqs,
         positions_per_sample,
         device_inter,
     )
-    logits_target, _, target_total_tokens, target_total_slots = _sequential_logits_at_positions_padded(
+    logits_target, target_total_tokens, target_total_slots = _batched_logits_at_positions(
         target_model,
         full_seqs,
         positions_per_sample,
         device_target,
     )
-    # positions_per_sample has equal lengths here, so valid mask is not needed.
-    logits_target = logits_target[:, : len(positions_per_sample[0])]
 
     if method == "morphable":
         for i in range(bsz):
@@ -617,7 +615,7 @@ def run_dataset_profile_batch(
                         carry_prompt_batch.append(base_prompt)
                         carry_recovery_batch.append(int(s["current_recovery"]))
                         carry_candidate_batch.append(eval_draft_tokens)
-                        carry_positions_batch.append(list(range(len(base_prompt) - 1, len(base_prompt) + len(eval_draft_tokens))))
+                        carry_positions_batch.append(list(range(len(base_prompt) - 1, len(base_prompt) + len(eval_draft_tokens) + 1)))
 
                     carry_full_seqs = [
                         list(carry_prompt_batch[j]) + [int(carry_recovery_batch[j])] + list(carry_candidate_batch[j])
@@ -629,7 +627,7 @@ def run_dataset_profile_batch(
                         carry_positions_batch,
                         args.device_intermediate,
                     )
-                    carry_logits_target, _, _, _ = _sequential_logits_at_positions_padded(
+                    carry_logits_target, _, _, _ = _batched_logits_at_positions_padded(
                         target_model,
                         carry_full_seqs,
                         carry_positions_batch,
@@ -685,11 +683,11 @@ def run_dataset_profile_batch(
                     if n_accept_target < len(eval_draft_tokens):
                         target_recovery = int(logits_target_eval[0, n_accept_target + 1].argmax(dim=-1).item())
                     else:
-                        target_recovery = int(logits_target_eval[0, len(eval_draft_tokens)].argmax(dim=-1).item())
+                        target_recovery = int(logits_target_eval[0, len(eval_draft_tokens) + 1].argmax(dim=-1).item())
                     if n_accept_inter < len(eval_draft_tokens):
                         inter_recovery = int(logits_inter_eval[0, n_accept_inter + 1].argmax(dim=-1).item())
                     else:
-                        inter_recovery = int(logits_inter_eval[0, len(eval_draft_tokens)].argmax(dim=-1).item())
+                        inter_recovery = int(logits_inter_eval[0, len(eval_draft_tokens) + 1].argmax(dim=-1).item())
 
                     target_accepted_token_stats: list[dict[str, Any]] = []
                     for j in range(n_accept_target):
@@ -701,7 +699,7 @@ def run_dataset_profile_batch(
                         token_stats["position"] = j
                         target_accepted_token_stats.append(token_stats)
 
-                    target_recovery_logits_idx = (n_accept_target + 1) if n_accept_target < len(eval_draft_tokens) else len(eval_draft_tokens)
+                    target_recovery_logits_idx = (n_accept_target + 1) if n_accept_target < len(eval_draft_tokens) else len(eval_draft_tokens) + 1
                     target_recovery_stats = _token_and_topk_probs_from_logits(
                         logits_target_eval[0, target_recovery_logits_idx],
                         target_recovery,
@@ -1146,13 +1144,18 @@ def main() -> int:
 
     _rank0_print("Loading draft model...")
     draft_model = _load_causal_lm(args.draft, args.device_draft)
+    draft_model.set_attn_implementation("eager")
     draft_model.eval()
+    
     _rank0_print("Loading intermediate model...")
     inter_model = _load_causal_lm(args.intermediate, args.device_intermediate)
+    inter_model.set_attn_implementation("eager")
     inter_model.eval()
     _rank0_print("Loading target model...")
     target_model = _load_causal_lm(args.target, args.device_target, tp_size=args.target_tp_size)
+    target_model.set_attn_implementation("eager")
     target_model.eval()
+
 
     overall_state = make_metric_state()
     overall_state["batch_sizes"] = []

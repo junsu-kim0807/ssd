@@ -662,7 +662,7 @@ def run_one_verify_round(
         )
         seq.append(next_tok)
 
-    positions_needed = list(range(prompt_len - 1, prompt_len + k))
+    positions_needed = list(range(prompt_len - 1, prompt_len + k + 1))
     full_seq = list(prompt_ids) + [recovery_token_id] + draft_tokens
     inp_full = torch.tensor([full_seq], dtype=torch.long)
     logits_inter = get_logits_at_positions(inter_model, inp_full, positions_needed, device_inter)
@@ -688,8 +688,17 @@ def compute_position_stats(draft_tokens: list[int], logits_inter: torch.Tensor, 
         target_logits_j = logits_target[0, j + 1]
         inter_topk = inter_logits_j.topk(min(topk, inter_logits_j.size(0))).indices.cpu().tolist()
         target_topk = target_logits_j.topk(min(topk, target_logits_j.size(0))).indices.cpu().tolist()
-        inter_top1 = inter_topk[0]
-        target_top1 = target_topk[0]
+        # inter_top1 = inter_topk[0]
+        # target_top1 = target_topk[0]
+        inter_top1 = int(inter_logits_j.argmax(dim=-1).item())
+        target_top1 = int(target_logits_j.argmax(dim=-1).item())
+
+        argmax_target = int(target_logits_j.argmax(dim=-1).item())
+        topk_target = int(target_logits_j.topk(1).indices[0].item())
+        if argmax_target != topk_target:
+            print("TARGET TOP1 MISMATCH", j, argmax_target, topk_target)
+
+            
         accept_target_list.append(1 if draft_tok == target_top1 else 0)
         accept_inter_list.append(1 if draft_tok == inter_top1 else 0)
         inter_topk_list.append(inter_topk)
@@ -706,9 +715,8 @@ def acceptance_length(accept_list: list[int]) -> int:
 
 
 def get_recovery_token_from_logits(logits: torch.Tensor, accept_len: int, k: int) -> int:
-    if accept_len < k:
-        return int(logits[0, accept_len + 1].argmax(dim=-1).item())
-    return int(logits[0, k].argmax(dim=-1).item())
+    del k
+    return int(logits[0, accept_len + 1].argmax(dim=-1).item())
 
 
 def compute_intermediate_precision_against_target(
@@ -1133,10 +1141,7 @@ def run_dataset_profile(
                         round_accept_rate_target = n_accept_target / len(draft_tokens) if draft_tokens else 0.0
                         round_accept_rate_inter = n_accept_inter / len(draft_tokens) if draft_tokens else 0.0
 
-                        if n_accept_target < len(draft_tokens):
-                            target_recovery = int(logits_target[0, n_accept_target + 1].argmax(dim=-1).item())
-                        else:
-                            target_recovery = int(logits_target[0, args.k].argmax(dim=-1).item())
+                        target_recovery = int(logits_target[0, n_accept_target + 1].argmax(dim=-1).item())
                         inter_recovery = get_recovery_token_from_logits(logits_inter, n_accept_inter, args.k)
 
                         target_accepted_token_stats: list[dict[str, Any]] = []
@@ -1149,7 +1154,7 @@ def run_dataset_profile(
                             token_stats["position"] = j
                             target_accepted_token_stats.append(token_stats)
 
-                        target_recovery_logits_idx = (n_accept_target + 1) if n_accept_target < len(draft_tokens) else args.k
+                        target_recovery_logits_idx = n_accept_target + 1
                         target_recovery_stats = _token_and_topk_probs_from_logits(
                             logits_target[0, target_recovery_logits_idx],
                             target_recovery,
@@ -1551,9 +1556,11 @@ def main() -> int:
     draft_model.eval()
     _rank0_print("Loading intermediate model...")
     inter_model = _load_causal_lm(args.intermediate, args.device_intermediate)
+    inter_model.set_attn_implementation("eager")
     inter_model.eval()
     _rank0_print("Loading target model...")
     target_model = _load_causal_lm(args.target, args.device_target, tp_size=args.target_tp_size)
+    target_model.set_attn_implementation("eager")
     target_model.eval()
 
     overall_state = make_metric_state()

@@ -12,6 +12,8 @@ dist/
 .venv/
 venv/
 env/
+.claude/
+Claude/
 
 # Test / type / lint caches
 profile/results/*
