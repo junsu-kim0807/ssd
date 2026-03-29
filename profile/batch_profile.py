@@ -111,7 +111,10 @@ def _batched_next_logits(model, seqs: list[list[int]], device_fallback: str) -> 
     model_device = _get_model_input_device(model, device_fallback)
     input_ids, attention_mask, lengths, max_len = _pad_sequences(seqs, device=model_device)
     with torch.inference_mode():
-        out = model(input_ids=input_ids, attention_mask=attention_mask, use_cache=False, return_dict=True)
+        if input_ids.shape[0] > 1:
+            out = model(input_ids=input_ids, attention_mask=attention_mask, use_cache=False, return_dict=True)
+        else:
+            out = model(input_ids=input_ids, use_cache=False, return_dict=True)
     logits = out.logits
     row_idx = torch.arange(logits.size(0), device=logits.device)
     col_idx = torch.tensor([n - 1 for n in lengths], dtype=torch.long, device=logits.device)
@@ -156,7 +159,10 @@ def _batched_logits_at_positions(
     model_device = _get_model_input_device(model, device_fallback)
     input_ids, attention_mask, lengths, max_len = _pad_sequences(seqs, device=model_device)
     with torch.inference_mode():
-        out = model(input_ids=input_ids, attention_mask=attention_mask, use_cache=False, return_dict=True)
+        if input_ids.shape[0] > 1:
+            out = model(input_ids=input_ids, attention_mask=attention_mask, use_cache=False, return_dict=True)
+        else:
+            out = model(input_ids=input_ids, use_cache=False, return_dict=True)
     logits = out.logits
 
     bsz = len(seqs)
@@ -183,7 +189,10 @@ def _batched_logits_at_positions_padded(
     model_device = _get_model_input_device(model, device_fallback)
     input_ids, attention_mask, lengths, max_len = _pad_sequences(seqs, device=model_device)
     with torch.inference_mode():
-        out = model(input_ids=input_ids, attention_mask=attention_mask, use_cache=False, return_dict=True)
+        if input_ids.shape[0] > 1:
+            out = model(input_ids=input_ids, attention_mask=attention_mask, use_cache=False, return_dict=True)
+        else:
+            out = model(input_ids=input_ids, use_cache=False, return_dict=True)
     logits = out.logits
 
     bsz = len(seqs)
@@ -282,6 +291,10 @@ def run_one_verify_round_batch(
 
     draft_total_tokens = 0
     draft_total_slots = 0
+    draft_model_tokens = 0
+    draft_model_slots = 0
+    inter_draft_tokens = 0
+    inter_draft_slots = 0
     cumprod = [1.0 for _ in range(bsz)]
     threshold_cross_position_round: int | None = None
     for step_idx in range(k):
@@ -292,13 +305,23 @@ def run_one_verify_round_batch(
             next_logits, token_count, slot_count = _batched_next_logits(current_model, seqs, current_device)
             draft_total_tokens += token_count
             draft_total_slots += slot_count
+            if use_inter:
+                inter_draft_tokens += token_count
+                inter_draft_slots += slot_count
+            else:
+                draft_model_tokens += token_count
+                draft_model_slots += slot_count
             draft_logits = next_logits if not use_inter else None
             inter_logits = next_logits if use_inter else None
         else:
             draft_logits, token_count, slot_count = _batched_next_logits(draft_model, seqs, device_draft)
             draft_total_tokens += token_count
             draft_total_slots += slot_count
-            inter_logits, _, _ = _batched_next_logits(inter_model, seqs, device_inter)
+            draft_model_tokens += token_count
+            draft_model_slots += slot_count
+            inter_logits, inter_draft_tc, inter_draft_sc = _batched_next_logits(inter_model, seqs, device_inter)
+            inter_draft_tokens += inter_draft_tc
+            inter_draft_slots += inter_draft_sc
 
         next_tokens: list[int] = []
         for i in range(bsz):
@@ -397,6 +420,14 @@ def run_one_verify_round_batch(
             "inter_padded_slots": inter_total_slots,
             "target_tokens_computed": target_total_tokens,
             "target_padded_slots": target_total_slots,
+            "draft_model_draft_tokens": draft_model_tokens,
+            "draft_model_draft_slots": draft_model_slots,
+            "inter_model_draft_tokens": inter_draft_tokens,
+            "inter_model_draft_slots": inter_draft_slots,
+            "inter_model_verify_tokens": inter_total_tokens,
+            "inter_model_verify_slots": inter_total_slots,
+            "target_model_verify_tokens": target_total_tokens,
+            "target_model_verify_slots": target_total_slots,
         },
     }
 
@@ -459,11 +490,19 @@ def _batch_stats_from_round_chars(round_chars: dict[str, int]) -> dict[str, floa
     draft_slots = max(round_chars["draft_padded_slots"], 1)
     inter_slots = max(round_chars["inter_padded_slots"], 1)
     target_slots = max(round_chars["target_padded_slots"], 1)
+    draft_model_draft_slots = max(round_chars["draft_model_draft_slots"], 1)
+    inter_model_draft_slots = max(round_chars["inter_model_draft_slots"], 1)
+    inter_model_verify_slots = max(round_chars["inter_model_verify_slots"], 1)
+    target_model_verify_slots = max(round_chars["target_model_verify_slots"], 1)
     return {
         **round_chars,
         "draft_utilization": float(round_chars["draft_tokens_computed"] / draft_slots),
         "inter_utilization": float(round_chars["inter_tokens_computed"] / inter_slots),
         "target_utilization": float(round_chars["target_tokens_computed"] / target_slots),
+        "draft_model_draft_utilization": float(round_chars["draft_model_draft_tokens"] / draft_model_draft_slots),
+        "inter_model_draft_utilization": float(round_chars["inter_model_draft_tokens"] / inter_model_draft_slots),
+        "inter_model_verify_utilization": float(round_chars["inter_model_verify_tokens"] / inter_model_verify_slots),
+        "target_model_verify_utilization": float(round_chars["target_model_verify_tokens"] / target_model_verify_slots),
     }
 
 
@@ -491,6 +530,14 @@ def run_dataset_profile_batch(
     state["batch_draft_utilization"] = []
     state["batch_inter_utilization"] = []
     state["batch_target_utilization"] = []
+    state["batch_draft_model_draft_utilization"] = []
+    state["batch_inter_model_draft_utilization"] = []
+    state["batch_inter_model_verify_utilization"] = []
+    state["batch_target_model_verify_utilization"] = []
+    state["total_draft_model_draft_tokens"] = 0
+    state["total_inter_model_draft_tokens"] = 0
+    state["total_inter_model_verify_tokens"] = 0
+    state["total_target_model_verify_tokens"] = 0
     state["verification_model_target_rounds"] = 0
     state["verification_model_intermediate_rounds"] = 0
     state["interval_forced_target_rounds"] = 0
@@ -580,6 +627,14 @@ def run_dataset_profile_batch(
                 state["batch_draft_utilization"].append(float(round_chars["draft_utilization"]))
                 state["batch_inter_utilization"].append(float(round_chars["inter_utilization"]))
                 state["batch_target_utilization"].append(float(round_chars["target_utilization"]))
+                state["batch_draft_model_draft_utilization"].append(float(round_chars["draft_model_draft_utilization"]))
+                state["batch_inter_model_draft_utilization"].append(float(round_chars["inter_model_draft_utilization"]))
+                state["batch_inter_model_verify_utilization"].append(float(round_chars["inter_model_verify_utilization"]))
+                state["batch_target_model_verify_utilization"].append(float(round_chars["target_model_verify_utilization"]))
+                state["total_draft_model_draft_tokens"] += int(round_chars["draft_model_draft_tokens"])
+                state["total_inter_model_draft_tokens"] += int(round_chars["inter_model_draft_tokens"])
+                state["total_inter_model_verify_tokens"] += int(round_chars["inter_model_verify_tokens"])
+                state["total_target_model_verify_tokens"] += int(round_chars["target_model_verify_tokens"])
 
                 draft_tokens_batch = round_out["draft_tokens_batch"]
                 draft_step_stats_batch = round_out["draft_step_stats_batch"]
@@ -1013,6 +1068,14 @@ def run_dataset_profile_batch(
         "draft_utilization": _stats_num(state.get("batch_draft_utilization", [])),
         "inter_utilization": _stats_num(state.get("batch_inter_utilization", [])),
         "target_utilization": _stats_num(state.get("batch_target_utilization", [])),
+        "draft_model_draft_utilization": _stats_num(state.get("batch_draft_model_draft_utilization", [])),
+        "inter_model_draft_utilization": _stats_num(state.get("batch_inter_model_draft_utilization", [])),
+        "inter_model_verify_utilization": _stats_num(state.get("batch_inter_model_verify_utilization", [])),
+        "target_model_verify_utilization": _stats_num(state.get("batch_target_model_verify_utilization", [])),
+        "total_draft_model_draft_tokens": int(state.get("total_draft_model_draft_tokens", 0)),
+        "total_inter_model_draft_tokens": int(state.get("total_inter_model_draft_tokens", 0)),
+        "total_inter_model_verify_tokens": int(state.get("total_inter_model_verify_tokens", 0)),
+        "total_target_model_verify_tokens": int(state.get("total_target_model_verify_tokens", 0)),
     }
     total_model_rounds = state["verification_model_target_rounds"] + state["verification_model_intermediate_rounds"]
     summary["morphable_characteristics"] = {
@@ -1100,6 +1163,7 @@ def main() -> int:
     args.bonus_method = _normalize_bonus_method(args.bonus_method)
 
     configure_reproducibility(seed=args.seed, deterministic=args.deterministic)
+    torch.use_deterministic_algorithms(True)
 
     local_rank = _maybe_init_target_tp(args.target_tp_size)
     args.device_draft = _resolve_device_arg(args.device_draft, fallback_cuda_index=local_rank)
@@ -1135,6 +1199,7 @@ def main() -> int:
 
     def _load_causal_lm(path: str, device: str, *, tp_size: int = 1):
         load_kwargs = {"torch_dtype": torch.bfloat16}
+        # load_kwargs = {"torch_dtype": torch.float32}
         if tp_size > 1:
             try:
                 return AutoModelForCausalLM.from_pretrained(path, tp_plan="auto", tp_size=tp_size, **load_kwargs)
@@ -1156,12 +1221,19 @@ def main() -> int:
     target_model.set_attn_implementation("eager")
     target_model.eval()
 
-
     overall_state = make_metric_state()
     overall_state["batch_sizes"] = []
     overall_state["batch_draft_utilization"] = []
     overall_state["batch_inter_utilization"] = []
     overall_state["batch_target_utilization"] = []
+    overall_state["batch_draft_model_draft_utilization"] = []
+    overall_state["batch_inter_model_draft_utilization"] = []
+    overall_state["batch_inter_model_verify_utilization"] = []
+    overall_state["batch_target_model_verify_utilization"] = []
+    overall_state["total_draft_model_draft_tokens"] = 0
+    overall_state["total_inter_model_draft_tokens"] = 0
+    overall_state["total_inter_model_verify_tokens"] = 0
+    overall_state["total_target_model_verify_tokens"] = 0
     overall_state["verification_model_target_rounds"] = 0
     overall_state["verification_model_intermediate_rounds"] = 0
     overall_state["interval_forced_target_rounds"] = 0
@@ -1191,6 +1263,14 @@ def main() -> int:
         overall_state["batch_draft_utilization"].extend(dataset_state.get("batch_draft_utilization", []))
         overall_state["batch_inter_utilization"].extend(dataset_state.get("batch_inter_utilization", []))
         overall_state["batch_target_utilization"].extend(dataset_state.get("batch_target_utilization", []))
+        overall_state["batch_draft_model_draft_utilization"].extend(dataset_state.get("batch_draft_model_draft_utilization", []))
+        overall_state["batch_inter_model_draft_utilization"].extend(dataset_state.get("batch_inter_model_draft_utilization", []))
+        overall_state["batch_inter_model_verify_utilization"].extend(dataset_state.get("batch_inter_model_verify_utilization", []))
+        overall_state["batch_target_model_verify_utilization"].extend(dataset_state.get("batch_target_model_verify_utilization", []))
+        overall_state["total_draft_model_draft_tokens"] += int(dataset_state.get("total_draft_model_draft_tokens", 0))
+        overall_state["total_inter_model_draft_tokens"] += int(dataset_state.get("total_inter_model_draft_tokens", 0))
+        overall_state["total_inter_model_verify_tokens"] += int(dataset_state.get("total_inter_model_verify_tokens", 0))
+        overall_state["total_target_model_verify_tokens"] += int(dataset_state.get("total_target_model_verify_tokens", 0))
         overall_state["verification_model_target_rounds"] += int(dataset_state.get("verification_model_target_rounds", 0))
         overall_state["verification_model_intermediate_rounds"] += int(dataset_state.get("verification_model_intermediate_rounds", 0))
         overall_state["interval_forced_target_rounds"] += int(dataset_state.get("interval_forced_target_rounds", 0))
@@ -1224,6 +1304,14 @@ def main() -> int:
         "draft_utilization": _stats_num(overall_state.get("batch_draft_utilization", [])),
         "inter_utilization": _stats_num(overall_state.get("batch_inter_utilization", [])),
         "target_utilization": _stats_num(overall_state.get("batch_target_utilization", [])),
+        "draft_model_draft_utilization": _stats_num(overall_state.get("batch_draft_model_draft_utilization", [])),
+        "inter_model_draft_utilization": _stats_num(overall_state.get("batch_inter_model_draft_utilization", [])),
+        "inter_model_verify_utilization": _stats_num(overall_state.get("batch_inter_model_verify_utilization", [])),
+        "target_model_verify_utilization": _stats_num(overall_state.get("batch_target_model_verify_utilization", [])),
+        "total_draft_model_draft_tokens": int(overall_state.get("total_draft_model_draft_tokens", 0)),
+        "total_inter_model_draft_tokens": int(overall_state.get("total_inter_model_draft_tokens", 0)),
+        "total_inter_model_verify_tokens": int(overall_state.get("total_inter_model_verify_tokens", 0)),
+        "total_target_model_verify_tokens": int(overall_state.get("total_target_model_verify_tokens", 0)),
     }
     total_model_rounds = overall_state["verification_model_target_rounds"] + overall_state["verification_model_intermediate_rounds"]
     overall_summary["morphable_characteristics"] = {
