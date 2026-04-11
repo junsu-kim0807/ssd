@@ -12,6 +12,7 @@ from ssd.engine.speculator_async import SpeculatorAsync
 from ssd.engine.speculator_sync import SpeculatorSync
 from ssd.engine.step import InferenceStep, AutoRegressiveStep, SpecDecodeStep
 from ssd.engine.verifier import Verifier
+from ssd.engine.verifier_pivot import VerifierPivot
 
 import atexit
 from dataclasses import fields
@@ -33,6 +34,9 @@ METRICS = {
     "decode_total_tokens": 0,
     "target_step_times": [],
     "target_verify_times": [],
+    "pivot_intermediate_rounds": 0,
+    "pivot_target_rounds": 0,
+    "pivot_forced_target_rounds": 0,
 }
 
 
@@ -268,6 +272,13 @@ class LLMEngine:
                 else:
                     print(
                         f"[metrics] Avg Tokens per step on Cache Hit: N/A (no cache hits)", flush=True)
+            if self.config.spec_policy == "pivot":
+                print(
+                    f"[metrics] Pivot intermediate rounds: {METRICS['pivot_intermediate_rounds']}", flush=True)
+                print(
+                    f"[metrics] Pivot target rounds: {METRICS['pivot_target_rounds']}", flush=True)
+                print(
+                    f"[metrics] Pivot forced target rounds: {METRICS['pivot_forced_target_rounds']}", flush=True)
 
     def create_inference_step(self, config: Config) -> InferenceStep:
         if config.speculate:
@@ -302,6 +313,18 @@ class LLMEngine:
                 jit_speculate=config.jit_speculate,
                 tokenizer=self.tokenizer,
                 metrics=METRICS,
+            ) if config.spec_policy != "pivot" else VerifierPivot(
+                lookahead=config.speculate_k,
+                device=config.device,
+                target_model_runner=self.model_runner,
+                sampler_x=config.sampler_x,
+                async_fan_out=config.async_fan_out,
+                jit_speculate=config.jit_speculate,
+                tokenizer=self.tokenizer,
+                metrics=METRICS,
+                interval=config.interval,
+                threshold=config.threshold,
+                expansion_pct=config.expansion_pct,
             )
             return SpecDecodeStep(
                 scheduler=self.scheduler,

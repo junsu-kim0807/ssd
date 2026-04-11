@@ -32,6 +32,11 @@ def parse_args():
     p.add_argument("--k", type=int, default=7)
     p.add_argument("--f", type=int, default=2)
     p.add_argument("--backup", type=str, default="jit")
+    p.add_argument("--spec_policy", type=str, choices=["default", "pivot"], default="default")
+    p.add_argument("--spec_hive", action="store_true")
+    p.add_argument("--interval", type=int, default=0)
+    p.add_argument("--threshold", type=float, default=0.8)
+    p.add_argument("--expansion_pct", type=float, default=1.0)
     p.add_argument("--b", type=int, default=1)
     p.add_argument("--x", type=float, default=None)
     p.add_argument("--eager", action="store_true")
@@ -71,7 +76,12 @@ def ssd_chat(args):
               draft_async=args.async_spec, async_fan_out=args.f,
               draft=DRAFT, kvcache_block_size=256, max_num_seqs=args.b,
               max_model_len=8192, sampler_x=args.x,
-              jit_speculate=(args.backup == "jit"))
+              jit_speculate=(args.backup == "jit"),
+              spec_policy=args.spec_policy,
+              spec_hive=args.spec_hive,
+              interval=args.interval,
+              threshold=args.threshold,
+              expansion_pct=args.expansion_pct)
 
     history = []
     print(f"\nChat via SSD. Type 'quit' to exit.\n")

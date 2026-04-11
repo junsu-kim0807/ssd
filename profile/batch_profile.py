@@ -382,7 +382,7 @@ def run_one_verify_round_batch(
         positions_per_sample,
         device_inter,
     )
-    logits_target, target_total_tokens, target_total_slots = _batched_logits_at_positions(
+    logits_target, _, target_total_tokens, target_total_slots = _sequential_logits_at_positions_padded(
         target_model,
         full_seqs,
         positions_per_sample,
@@ -656,33 +656,36 @@ def run_dataset_profile_batch(
                 carry_logits_target_by_idx: dict[int, torch.Tensor] = {}
                 if carry_target_indices:
                     carry_prompt_batch: list[list[int]] = []
-                    carry_recovery_batch: list[int] = []
-                    carry_candidate_batch: list[list[int]] = []
+                    carry_eval_draft_batch: list[list[int]] = []
                     carry_positions_batch: list[list[int]] = []
                     for i in carry_target_indices:
                         s = active_states[i]
                         carry_prefix_tokens = list(s["carry_over_prefix_tokens"])
                         raw_draft_tokens = draft_tokens_batch[i]
-                        eval_draft_tokens = carry_prefix_tokens + raw_draft_tokens
-                        base_prompt = list(s["prompt_ids_for_round"])
-                        if len(carry_prefix_tokens) <= len(base_prompt):
-                            base_prompt = base_prompt[: len(base_prompt) - len(carry_prefix_tokens)]
+                        prompt_round = list(s["prompt_ids_for_round"])
+                        c = len(carry_prefix_tokens)
+                        if c > len(prompt_round) or prompt_round[-c:] != carry_prefix_tokens:
+                            raise ValueError(
+                                "carry_over_prefix_tokens must exactly match the suffix of prompt_ids_for_round "
+                                f"(got carry_len={c}, prompt_len={len(prompt_round)})"
+                            )
+                        base_prompt = prompt_round[:-c]
+                        # Same order as drafting: P = base + carry, then seq = P + [current_recovery] + raw_draft.
+                        eval_draft_tokens = carry_prefix_tokens + [int(s["current_recovery"])] + raw_draft_tokens
                         carry_prompt_batch.append(base_prompt)
-                        carry_recovery_batch.append(int(s["current_recovery"]))
-                        carry_candidate_batch.append(eval_draft_tokens)
-                        carry_positions_batch.append(list(range(len(base_prompt) - 1, len(base_prompt) + len(eval_draft_tokens) + 1)))
+                        carry_eval_draft_batch.append(eval_draft_tokens)
+                        carry_positions_batch.append(
+                            list(range(len(base_prompt) - 1, len(base_prompt) + len(eval_draft_tokens) + 1))
+                        )
 
-                    carry_full_seqs = [
-                        list(carry_prompt_batch[j]) + [int(carry_recovery_batch[j])] + list(carry_candidate_batch[j])
-                        for j in range(len(carry_prompt_batch))
-                    ]
+                    carry_full_seqs = [carry_prompt_batch[j] + carry_eval_draft_batch[j] for j in range(len(carry_prompt_batch))]
                     carry_logits_inter, _, _, _ = _batched_logits_at_positions_padded(
                         inter_model,
                         carry_full_seqs,
                         carry_positions_batch,
                         args.device_intermediate,
                     )
-                    carry_logits_target, _, _, _ = _batched_logits_at_positions_padded(
+                    carry_logits_target, _, _, _ = _sequential_logits_at_positions_padded(
                         target_model,
                         carry_full_seqs,
                         carry_positions_batch,
@@ -702,7 +705,7 @@ def run_dataset_profile_batch(
                     carry_prefix_tokens = list(s["carry_over_prefix_tokens"])
 
                     if verification_model == "target" and carry_prefix_tokens:
-                        eval_draft_tokens = carry_prefix_tokens + raw_draft_tokens
+                        eval_draft_tokens = carry_prefix_tokens + [int(s["current_recovery"])] + raw_draft_tokens
                         logits_inter_eval = carry_logits_inter_by_idx[i]
                         logits_target_eval = carry_logits_target_by_idx[i]
                     else:
@@ -834,21 +837,31 @@ def run_dataset_profile_batch(
                         state["diff_accept_len_count"] += 1
 
                     if detail_f is not None:
+                        carry_prefix_len = len(carry_prefix_tokens)
+                        pending_recovery_in_eval = 1 if carry_prefix_len else 0
                         for j, (dt, itopk, ttopk, at, ai) in enumerate(
                             zip(draft_tok_list, inter_topk_list, target_topk_list, accept_target_list, accept_inter_list)
                         ):
-                            carry_len = max(len(eval_draft_tokens) - len(raw_draft_tokens), 0)
-                            if j < carry_len:
+                            synthetic = {
+                                "draft_source_model": "carry_over_prefix",
+                                "draft_top1_prob": None,
+                                "draft_top5_token_ids": [],
+                                "draft_top5_probs": [],
+                                "draft_model_top1_confidence": None,
+                                "draft_confidence_cumprod": None,
+                            }
+                            if carry_prefix_len == 0:
+                                step_stat = draft_step_stats_batch[i][j]
+                            elif j < carry_prefix_len:
+                                step_stat = synthetic
+                            elif j == carry_prefix_len and pending_recovery_in_eval:
                                 step_stat = {
-                                    "draft_source_model": "carry_over_prefix",
-                                    "draft_top1_prob": None,
-                                    "draft_top5_token_ids": [],
-                                    "draft_top5_probs": [],
-                                    "draft_model_top1_confidence": None,
-                                    "draft_confidence_cumprod": None,
+                                    **synthetic,
+                                    "draft_source_model": "pending_recovery",
                                 }
                             else:
-                                step_stat = draft_step_stats_batch[i][j - carry_len]
+                                draft_pos = j - carry_prefix_len - pending_recovery_in_eval
+                                step_stat = draft_step_stats_batch[i][draft_pos]
                             target_pos_stats = _token_and_topk_probs_from_logits(logits_target_eval[0, j + 1], dt, topk=args.topk)
                             inter_pos_stats = _token_and_topk_probs_from_logits(logits_inter_eval[0, j + 1], dt, topk=args.topk)
                             detail_row = {
@@ -923,7 +936,16 @@ def run_dataset_profile_batch(
 
                         s["prompt_ids_for_round"] = s["prompt_ids_for_round"] + carry_tokens
                         s["max_context_seen"] = max(s["max_context_seen"], len(s["prompt_ids_for_round"]))
-                        s["current_recovery"] = inter_recovery
+                        if recovery_included:
+                            # inter_recovery is already the last token of carry_tokens / prompt tail.
+                            next_inter_logits, _, _ = _batched_next_logits(
+                                inter_model,
+                                [list(s["prompt_ids_for_round"])],
+                                args.device_intermediate,
+                            )
+                            s["current_recovery"] = int(next_inter_logits[0].argmax(dim=-1).item())
+                        else:
+                            s["current_recovery"] = inter_recovery
                         # Do not terminate on intermediate EOS; target must finalize termination.
                         if verification_f is not None:
                             verification_f.write(json.dumps(verification_row, ensure_ascii=False) + "\n")
@@ -941,7 +963,10 @@ def run_dataset_profile_batch(
                     if carry_prefix_tokens:
                         base_prompt_for_commit = base_prompt_for_commit[: len(base_prompt_for_commit) - len(carry_prefix_tokens)]
                     s["carry_over_prefix_tokens"] = []
-                    emitted_tokens_full = [s["current_recovery"]] + eval_draft_tokens[:n_accept_target]
+                    if carry_prefix_tokens:
+                        emitted_tokens_full = eval_draft_tokens[:n_accept_target]
+                    else:
+                        emitted_tokens_full = [s["current_recovery"]] + eval_draft_tokens[:n_accept_target]
                     next_recovery = target_recovery
 
                     if verification_f is not None:

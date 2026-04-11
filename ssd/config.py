@@ -32,6 +32,11 @@ class Config:
     fan_out_list_miss: list[int] | None = None
     sampler_x: float | None = None 
     jit_speculate: bool = False 
+    spec_policy: str = "default"
+    spec_hive: bool = False
+    interval: int = 0
+    threshold: float = 0.8
+    expansion_pct: float = 1.0
 
     # eagle3
     use_eagle: bool = False 
@@ -68,6 +73,18 @@ class Config:
                 if self.fan_out_list_miss is None:
                     self.fan_out_list_miss = self.fan_out_list 
                 assert sum(self.fan_out_list_miss) == sum(self.fan_out_list), "ERROR in Config: fan_out_list_miss must be the same as fan_out_list"
+            if self.spec_policy not in {"default", "pivot"}:
+                raise ValueError(
+                    f"Unsupported spec_policy={self.spec_policy}. Use 'default' or 'pivot'.")
+            if self.interval < 0:
+                raise ValueError("interval must be >= 0")
+            if not (0.0 <= self.threshold <= 1.0):
+                raise ValueError("threshold must be in [0, 1]")
+            if self.expansion_pct <= 0.0:
+                raise ValueError("expansion_pct must be > 0")
+            if self.spec_policy == "pivot":
+                assert self.draft_async, "pivot policy currently requires draft_async=True"
+                assert self.spec_hive, "pivot policy currently requires spec_hive=True"
                 
         if self.use_eagle:
             if self.eagle_layers is None:

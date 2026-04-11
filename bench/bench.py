@@ -38,6 +38,16 @@ def parse_arguments():
     parser.add_argument("--flh", type=int, nargs='+', default=None, help="Fan out list (e.g., --flh 1 3 4 becomes [1, 3, 4])")
     parser.add_argument("--flm", type=int, nargs='+', default=None, help="Fan out list miss (e.g., --flm 1 3 4 becomes [1, 3, 4])")
     parser.add_argument("--backup", type=str, choices=["jit", "fast"], default="jit", help="Backup strategy (jit or fast)")
+    parser.add_argument("--spec_policy", type=str, choices=["default", "pivot"], default="default",
+                        help="Speculative policy to use")
+    parser.add_argument("--spec_hive", action="store_true",
+                        help="Enable spec_hive mode for pivot policy")
+    parser.add_argument("--interval", type=int, default=0,
+                        help="Pivot interval to force target verification")
+    parser.add_argument("--threshold", type=float, default=0.8,
+                        help="Pivot confidence threshold")
+    parser.add_argument("--expansion_pct", type=float, default=1.0,
+                        help="Pivot top-k expansion percentage")
 
     # Memory and batching configuration
     parser.add_argument("--block_sz", type=int, default=256, help="KV cache block size (see config.py: kvcache_block_size)")
@@ -153,6 +163,11 @@ def initialize_wandb(args, run_name):
             "sampler_x": args.x,
             "implementation": "ssd",
             "max_steps": args.max_steps,
+            "spec_policy": args.spec_policy,
+            "spec_hive": args.spec_hive,
+            "interval": args.interval,
+            "threshold": args.threshold,
+            "expansion_pct": args.expansion_pct,
         }
     )
 
@@ -174,6 +189,11 @@ def create_llm_kwargs(args, draft_path):
         sampler_x=args.x,
         jit_speculate=(args.backup == "jit"),
         max_steps=args.max_steps,
+        spec_policy=args.spec_policy,
+        spec_hive=args.spec_hive,
+        interval=args.interval,
+        threshold=args.threshold,
+        expansion_pct=args.expansion_pct,
     )
 
     if args.flh is not None:
