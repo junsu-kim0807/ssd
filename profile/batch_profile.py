@@ -6,6 +6,9 @@ Methods:
 - vanila: draft model drafts K tokens, then intermediate/target verify.
 - bump: first draft token is produced by intermediate, remaining K-1 by draft model,
   then intermediate/target verify.
+- topk_expansion: expand low-confidence requests along the batch dimension using
+  multiple first-token candidates from the draft model, verify all variants together,
+  then keep the variant with the longest target acceptance length for each request.
 
 This script performs true tensor batching (padding + attention masks) across requests.
 """
@@ -13,6 +16,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import os
 import sys
 from pathlib import Path
@@ -68,8 +72,8 @@ def _normalize_method(method: str) -> str:
     low = method.strip().lower()
     if low == "vanilla":
         return "vanila"
-    if low not in {"vanila", "bump", "morphable"}:
-        raise ValueError(f"Unsupported --method={method}. Use vanila, bump, or morphable.")
+    if low not in {"vanila", "bump", "morphable", "topk_expansion"}:
+        raise ValueError(f"Unsupported --method={method}. Use vanila, bump, morphable, or topk_expansion.")
     return low
 
 
@@ -167,7 +171,10 @@ def _batched_logits_at_positions(
 
     bsz = len(seqs)
     num_pos = each_len[0]
+    max_per_row = torch.tensor([n - 1 for n in lengths], dtype=torch.long, device=logits.device).unsqueeze(1)
     pos_tensor = torch.tensor(positions_per_sample, dtype=torch.long, device=logits.device)
+    pos_tensor = pos_tensor.clamp(min=0)
+    pos_tensor = torch.minimum(pos_tensor, max_per_row)
     row_idx = torch.arange(bsz, device=logits.device).unsqueeze(1).expand(bsz, num_pos)
     gathered = logits[row_idx, pos_tensor]
     total_tokens = sum(lengths)
@@ -203,7 +210,9 @@ def _batched_logits_at_positions_padded(
         if not pos_list:
             continue
         n = len(pos_list)
-        pos_tensor[i, :n] = torch.tensor(pos_list, dtype=torch.long, device=logits.device)
+        max_pi = lengths[i] - 1
+        clamped = [max(0, min(int(p), max_pi)) for p in pos_list]
+        pos_tensor[i, :n] = torch.tensor(clamped, dtype=torch.long, device=logits.device)
         valid_mask[i, :n] = True
 
     row_idx = torch.arange(bsz, device=logits.device).unsqueeze(1).expand(bsz, max_pos_len)
@@ -240,7 +249,9 @@ def _sequential_logits_at_positions_padded(
             logits = out.logits[0]
             row = torch.zeros((max_pos_len, logits.size(-1)), dtype=logits.dtype, device=logits.device)
             if pos_list:
-                pos_tensor = torch.tensor(pos_list, dtype=torch.long, device=logits.device)
+                max_pi = len(seq) - 1
+                clamped = [max(0, min(int(p), max_pi)) for p in pos_list]
+                pos_tensor = torch.tensor(clamped, dtype=torch.long, device=logits.device)
                 n = len(pos_list)
                 row[:n] = logits[pos_tensor]
                 valid_mask[i, :n] = True
@@ -260,6 +271,414 @@ def _topk_info(logits_1d: torch.Tensor, k: int = 5) -> dict[str, Any]:
         "top1_prob": float(vals[0].item()),
         "top5_token_ids": [int(x) for x in idx.cpu().tolist()],
         "top5_probs": [float(x) for x in vals.cpu().tolist()],
+    }
+
+
+def _default_topk_expansion_metadata() -> dict[str, Any]:
+    return {
+        "enabled": False,
+        "original_round_batch_size": None,
+        "expanded_round_batch_size": None,
+        "num_expanded_requests": 0,
+        "num_extra_variants": 0,
+        "was_expanded_request": False,
+        "selected_variant_rank": 0,
+        "selected_first_token": None,
+        "selected_first_token_prob": None,
+        "original_first_top1_token": None,
+        "original_first_top1_prob": None,
+        "candidate_first_token_ids": [],
+        "candidate_first_token_probs": [],
+        "selection_pool_size": 0,
+    }
+
+
+def _select_low_confidence_request_indices(first_top1_probs: list[float], expansion_pct: float) -> list[int]:
+    if not first_top1_probs or expansion_pct <= 0.0:
+        return []
+    num_expand = min(len(first_top1_probs), int(math.ceil(expansion_pct * len(first_top1_probs))))
+    if num_expand <= 0:
+        return []
+    ranked = sorted(range(len(first_top1_probs)), key=lambda i: (first_top1_probs[i], i))
+    return ranked[:num_expand]
+
+
+def _compute_accept_length_from_logits(draft_tokens: list[int], logits_2d: torch.Tensor) -> int:
+    n_accept = 0
+    for pos_idx, draft_tok in enumerate(draft_tokens):
+        verifier_tok = int(logits_2d[pos_idx + 1].argmax(dim=-1).item())
+        if verifier_tok != draft_tok:
+            break
+        n_accept += 1
+    return n_accept
+
+
+def _split_base_prompt_and_carry_prefix(
+    prompt_ids: list[int],
+    carry_prefix_tokens: list[int],
+) -> tuple[list[int], list[int]]:
+    base_prompt = list(prompt_ids)
+    carry_prefix = list(carry_prefix_tokens)
+    if not carry_prefix:
+        return base_prompt, carry_prefix
+    if len(carry_prefix) > len(base_prompt) or base_prompt[-len(carry_prefix) :] != carry_prefix:
+        raise ValueError('carry_over_prefix_tokens must be a suffix of prompt_ids_for_round')
+    return base_prompt[: len(base_prompt) - len(carry_prefix)], carry_prefix
+
+
+def _build_target_eval_sequence_with_carry(
+    *,
+    prompt_ids: list[int],
+    recovery_tok: int,
+    raw_draft_tokens: list[int],
+    carry_prefix_tokens: list[int],
+) -> tuple[list[int], list[int], list[int], list[int]]:
+    """Build full target forward sequence and logits gather positions for carry + target verify.
+
+    No carry: same as vanilla — ``full_seq`` = base + [recovery] + raw, ``eval_draft_tokens``
+    = raw only, ``positions`` = ``range(B-1, B+len(raw)+1)``.
+
+    With carry: ``full_seq`` = base + carry + [recovery] + raw. Then ``len(eval)`` equals the
+    tail length ``L``. Using ``range(B-1, B+L+1)`` requests index ``B+L`` but the last valid
+    logit index is ``B+L-1`` (off-by-one OOB). The span ``range(B-2, B+L)`` has length ``L+2``
+    and ends at ``B+L-1``. For ``B < 2`` the span is shifted to start at 0; gather paths clamp
+    indices to ``[0, len(seq)-1]`` as a backstop.
+    """
+    base_prompt, carry_prefix = _split_base_prompt_and_carry_prefix(prompt_ids, carry_prefix_tokens)
+    rec = int(recovery_tok)
+    raw = list(raw_draft_tokens)
+    b = len(base_prompt)
+    if not carry_prefix:
+        eval_draft_tokens = raw
+        full_seq = list(base_prompt) + [rec] + raw
+        positions = list(range(b - 1, b + len(eval_draft_tokens) + 1))
+        return base_prompt, eval_draft_tokens, full_seq, positions
+
+    eval_draft_tokens = list(carry_prefix) + [rec] + raw
+    full_seq = list(base_prompt) + eval_draft_tokens
+    le = len(eval_draft_tokens)
+    start = max(0, b - 2)
+    positions = list(range(start, start + le + 2))
+    return base_prompt, eval_draft_tokens, full_seq, positions
+
+
+def _recompute_eval_logits_with_carry(
+    *,
+    prompt_ids_batch: list[list[int]],
+    recovery_token_ids: list[int],
+    raw_draft_tokens_batch: list[list[int]],
+    carry_prefix_tokens_batch: list[list[int]],
+    inter_model,
+    target_model,
+    device_inter: str,
+    device_target: str,
+) -> tuple[list[list[int]], torch.Tensor, torch.Tensor]:
+    eval_draft_tokens_batch: list[list[int]] = []
+    full_seqs: list[list[int]] = []
+    positions_per_sample: list[list[int]] = []
+    for prompt_ids, recovery_tok, raw_draft, carry_prefix in zip(
+        prompt_ids_batch,
+        recovery_token_ids,
+        raw_draft_tokens_batch,
+        carry_prefix_tokens_batch,
+    ):
+        _, eval_draft_tokens, full_seq, positions = _build_target_eval_sequence_with_carry(
+            prompt_ids=prompt_ids,
+            recovery_tok=int(recovery_tok),
+            raw_draft_tokens=list(raw_draft),
+            carry_prefix_tokens=list(carry_prefix),
+        )
+        eval_draft_tokens_batch.append(eval_draft_tokens)
+        full_seqs.append(full_seq)
+        positions_per_sample.append(positions)
+
+    logits_inter, _, _, _ = _batched_logits_at_positions_padded(
+        inter_model,
+        full_seqs,
+        positions_per_sample,
+        device_inter,
+    )
+    logits_target, _, _, _ = _batched_logits_at_positions_padded(
+        target_model,
+        full_seqs,
+        positions_per_sample,
+        device_target,
+    )
+    return eval_draft_tokens_batch, logits_inter, logits_target
+
+
+def run_one_verify_round_topk_expansion_rows_batch(
+    *,
+    draft_model,
+    inter_model,
+    target_model,
+    prompt_ids_batch: list[list[int]],
+    recovery_token_ids: list[int],
+    parent_request_indices: list[int],
+    allow_expansion_mask: list[bool],
+    k: int,
+    topk_selection: int,
+    expansion_pct: float,
+    device_draft: str,
+    device_inter: str,
+    device_target: str,
+    metadata_seed_batch: list[dict[str, Any]] | None = None,
+) -> dict[str, Any]:
+    bsz = len(prompt_ids_batch)
+    if bsz == 0:
+        raise ValueError('prompt_ids_batch must be non-empty')
+    if len(recovery_token_ids) != bsz or len(parent_request_indices) != bsz or len(allow_expansion_mask) != bsz:
+        raise ValueError('topk expansion row inputs must have same batch size')
+    if metadata_seed_batch is None:
+        metadata_seed_batch = [_default_topk_expansion_metadata() for _ in range(bsz)]
+
+    base_seqs = [list(prompt_ids_batch[i]) + [int(recovery_token_ids[i])] for i in range(bsz)]
+    first_step_logits, selection_tokens, selection_slots = _batched_next_logits(
+        draft_model,
+        base_seqs,
+        device_draft,
+    )
+    info_k = max(5, topk_selection)
+    first_step_infos = [_topk_info(first_step_logits[i], k=info_k) for i in range(bsz)]
+    expandable_rows = [i for i, flag in enumerate(allow_expansion_mask) if flag]
+    expandable_probs = [float(first_step_infos[i]['top1_prob']) for i in expandable_rows]
+    selected_expand_local = set(_select_low_confidence_request_indices(expandable_probs, expansion_pct))
+    selected_expand_rows = {expandable_rows[idx] for idx in selected_expand_local}
+
+    expanded_prompt_ids_batch: list[list[int]] = []
+    expanded_recovery_token_ids: list[int] = []
+    expanded_parent_request_indices: list[int] = []
+    expanded_source_row_indices: list[int] = []
+    expanded_draft_tokens_batch: list[list[int]] = []
+    expanded_draft_step_stats_batch: list[list[dict[str, Any]]] = []
+    expanded_draft_confidence_batch: list[list[float]] = []
+    expanded_draft_confidence_cumprod_batch: list[list[float]] = []
+    expanded_topk_metadata_batch: list[dict[str, Any]] = []
+
+    for row_idx in range(bsz):
+        info = first_step_infos[row_idx]
+        seed_meta = dict(metadata_seed_batch[row_idx])
+        candidate_token_ids = [int(x) for x in info['top5_token_ids'][:topk_selection]]
+        candidate_token_probs = [float(x) for x in info['top5_probs'][:topk_selection]]
+        if not candidate_token_ids:
+            candidate_token_ids = [int(info['top1_token_id'])]
+            candidate_token_probs = [float(info['top1_prob'])]
+        if row_idx in selected_expand_rows:
+            variant_tokens = list(zip(range(len(candidate_token_ids)), candidate_token_ids, candidate_token_probs))
+        else:
+            variant_tokens = [(0, int(info['top1_token_id']), float(info['top1_prob']))]
+        for variant_rank, first_token_id, first_token_prob in variant_tokens:
+            expanded_prompt_ids_batch.append(list(prompt_ids_batch[row_idx]))
+            expanded_recovery_token_ids.append(int(recovery_token_ids[row_idx]))
+            expanded_parent_request_indices.append(int(parent_request_indices[row_idx]))
+            expanded_source_row_indices.append(int(row_idx))
+            expanded_draft_tokens_batch.append([int(first_token_id)])
+            expanded_draft_confidence_batch.append([float(first_token_prob)])
+            expanded_draft_confidence_cumprod_batch.append([float(first_token_prob)])
+            expanded_draft_step_stats_batch.append([
+                {
+                    'position': 0,
+                    'draft_token_id': int(first_token_id),
+                    'draft_top1_prob': float(info['top1_prob']),
+                    'draft_selected_token_prob': float(first_token_prob),
+                    'draft_top5_token_ids': [int(x) for x in info['top5_token_ids']],
+                    'draft_top5_probs': [float(x) for x in info['top5_probs']],
+                    'draft_source_model': 'draft_topk_expansion' if row_idx in selected_expand_rows else 'draft',
+                    'draft_model_top1_confidence': float(info['top1_prob']),
+                    'draft_confidence_cumprod': float(first_token_prob),
+                }
+            ])
+            meta = {
+                'enabled': True,
+                'original_round_batch_size': bsz,
+                'expanded_round_batch_size': None,
+                'num_expanded_requests': len(selected_expand_rows),
+                'num_extra_variants': None,
+                'was_expanded_request': bool(seed_meta.get('was_expanded_request') or (row_idx in selected_expand_rows)),
+                'selected_variant_rank': int(variant_rank if row_idx in selected_expand_rows else seed_meta.get('selected_variant_rank', 0)),
+                'selected_first_token': int(first_token_id),
+                'selected_first_token_prob': float(first_token_prob),
+                'original_first_top1_token': int(info['top1_token_id']),
+                'original_first_top1_prob': float(info['top1_prob']),
+                'candidate_first_token_ids': [int(x) for x in candidate_token_ids],
+                'candidate_first_token_probs': [float(x) for x in candidate_token_probs],
+                'selection_pool_size': len(candidate_token_ids),
+            }
+            if seed_meta.get('enabled') and row_idx not in selected_expand_rows:
+                meta['selected_variant_rank'] = int(seed_meta.get('selected_variant_rank', 0))
+                meta['selected_first_token'] = seed_meta.get('selected_first_token')
+                meta['selected_first_token_prob'] = seed_meta.get('selected_first_token_prob')
+                meta['was_expanded_request'] = bool(seed_meta.get('was_expanded_request'))
+                meta['candidate_first_token_ids'] = list(seed_meta.get('candidate_first_token_ids', candidate_token_ids))
+                meta['candidate_first_token_probs'] = list(seed_meta.get('candidate_first_token_probs', candidate_token_probs))
+                meta['selection_pool_size'] = int(seed_meta.get('selection_pool_size', len(candidate_token_ids)))
+            expanded_topk_metadata_batch.append(meta)
+
+    expanded_bsz = len(expanded_prompt_ids_batch)
+    for meta in expanded_topk_metadata_batch:
+        meta['expanded_round_batch_size'] = expanded_bsz
+        meta['num_extra_variants'] = expanded_bsz - bsz
+
+    expanded_seqs = [list(expanded_prompt_ids_batch[i]) + [expanded_recovery_token_ids[i]] + list(expanded_draft_tokens_batch[i]) for i in range(expanded_bsz)]
+    draft_total_tokens = selection_tokens
+    draft_total_slots = selection_slots
+    draft_model_tokens = selection_tokens
+    draft_model_slots = selection_slots
+
+    for step_idx in range(1, k):
+        next_logits, token_count, slot_count = _batched_next_logits(draft_model, expanded_seqs, device_draft)
+        draft_total_tokens += token_count
+        draft_total_slots += slot_count
+        draft_model_tokens += token_count
+        draft_model_slots += slot_count
+        for row_idx in range(expanded_bsz):
+            next_tok = int(next_logits[row_idx].argmax(dim=-1).item())
+            prob_info = _topk_info(next_logits[row_idx], k=5)
+            expanded_draft_tokens_batch[row_idx].append(next_tok)
+            expanded_draft_confidence_batch[row_idx].append(float(prob_info['top1_prob']))
+            prev_cumprod = float(expanded_draft_confidence_cumprod_batch[row_idx][-1]) if expanded_draft_confidence_cumprod_batch[row_idx] else 1.0
+            new_cumprod = float(prev_cumprod * prob_info['top1_prob'])
+            expanded_draft_confidence_cumprod_batch[row_idx].append(new_cumprod)
+            expanded_draft_step_stats_batch[row_idx].append(
+                {
+                    'position': step_idx,
+                    'draft_token_id': next_tok,
+                    'draft_top1_prob': float(prob_info['top1_prob']),
+                    'draft_selected_token_prob': float(prob_info['top1_prob']),
+                    'draft_top5_token_ids': prob_info['top5_token_ids'],
+                    'draft_top5_probs': prob_info['top5_probs'],
+                    'draft_source_model': 'draft',
+                    'draft_model_top1_confidence': float(prob_info['top1_prob']),
+                    'draft_confidence_cumprod': new_cumprod,
+                }
+            )
+            expanded_seqs[row_idx].append(next_tok)
+
+    full_seqs = [
+        list(expanded_prompt_ids_batch[i]) + [int(expanded_recovery_token_ids[i])] + list(expanded_draft_tokens_batch[i])
+        for i in range(expanded_bsz)
+    ]
+    positions_per_sample = [
+        list(range(len(expanded_prompt_ids_batch[i]) - 1, len(expanded_prompt_ids_batch[i]) + k + 1))
+        for i in range(expanded_bsz)
+    ]
+    logits_inter, inter_total_tokens, inter_total_slots = _batched_logits_at_positions(
+        inter_model,
+        full_seqs,
+        positions_per_sample,
+        device_inter,
+    )
+    logits_target, target_total_tokens, target_total_slots = _batched_logits_at_positions(
+        target_model,
+        full_seqs,
+        positions_per_sample,
+        device_target,
+    )
+
+    return {
+        'parent_request_indices': expanded_parent_request_indices,
+        'source_row_indices': expanded_source_row_indices,
+        'prompt_ids_batch': expanded_prompt_ids_batch,
+        'recovery_token_ids': expanded_recovery_token_ids,
+        'draft_tokens_batch': expanded_draft_tokens_batch,
+        'draft_step_stats_batch': expanded_draft_step_stats_batch,
+        'draft_confidence_batch': expanded_draft_confidence_batch,
+        'draft_confidence_cumprod_batch': expanded_draft_confidence_cumprod_batch,
+        'topk_expansion_metadata_batch': expanded_topk_metadata_batch,
+        'logits_inter': logits_inter,
+        'logits_target': logits_target,
+        'batch_characteristics': {
+            'round_batch_size': expanded_bsz,
+            'original_round_batch_size': bsz,
+            'expanded_round_batch_size': expanded_bsz,
+            'num_expanded_requests': len(selected_expand_rows),
+            'num_extra_variants': expanded_bsz - bsz,
+            'topk_expansion_selection_tokens': selection_tokens,
+            'topk_expansion_selection_slots': selection_slots,
+            'draft_tokens_computed': draft_total_tokens,
+            'draft_padded_slots': draft_total_slots,
+            'inter_tokens_computed': inter_total_tokens,
+            'inter_padded_slots': inter_total_slots,
+            'target_tokens_computed': target_total_tokens,
+            'target_padded_slots': target_total_slots,
+            'draft_model_draft_tokens': draft_model_tokens,
+            'draft_model_draft_slots': draft_model_slots,
+            'inter_model_draft_tokens': 0,
+            'inter_model_draft_slots': 0,
+            'inter_model_verify_tokens': inter_total_tokens,
+            'inter_model_verify_slots': inter_total_slots,
+            'target_model_verify_tokens': target_total_tokens,
+            'target_model_verify_slots': target_total_slots,
+        },
+    }
+
+
+def run_one_verify_round_topk_expansion_batch(
+    *,
+    draft_model,
+    inter_model,
+    target_model,
+    prompt_ids_batch: list[list[int]],
+    recovery_token_ids: list[int],
+    k: int,
+    topk_selection: int,
+    expansion_pct: float,
+    device_draft: str,
+    device_inter: str,
+    device_target: str,
+) -> dict[str, Any]:
+    base_out = run_one_verify_round_topk_expansion_rows_batch(
+        draft_model=draft_model,
+        inter_model=inter_model,
+        target_model=target_model,
+        prompt_ids_batch=prompt_ids_batch,
+        recovery_token_ids=recovery_token_ids,
+        parent_request_indices=list(range(len(prompt_ids_batch))),
+        allow_expansion_mask=[True for _ in range(len(prompt_ids_batch))],
+        k=k,
+        topk_selection=topk_selection,
+        expansion_pct=expansion_pct,
+        device_draft=device_draft,
+        device_inter=device_inter,
+        device_target=device_target,
+        metadata_seed_batch=[_default_topk_expansion_metadata() for _ in range(len(prompt_ids_batch))],
+    )
+    parent_request_indices = base_out['parent_request_indices']
+    draft_tokens_batch_all = base_out['draft_tokens_batch']
+    logits_inter = base_out['logits_inter']
+    logits_target = base_out['logits_target']
+
+    best_row_by_parent: dict[int, int] = {}
+    best_score_by_parent: dict[int, tuple[int, int, int]] = {}
+    for row_idx, parent_idx in enumerate(parent_request_indices):
+        draft_tokens = draft_tokens_batch_all[row_idx]
+        n_accept_target = _compute_accept_length_from_logits(draft_tokens, logits_target[row_idx])
+        variant_rank = int(base_out['topk_expansion_metadata_batch'][row_idx].get('selected_variant_rank', 0))
+        score = (n_accept_target, -variant_rank, -row_idx)
+        if parent_idx not in best_score_by_parent or score > best_score_by_parent[parent_idx]:
+            best_score_by_parent[parent_idx] = score
+            best_row_by_parent[parent_idx] = row_idx
+
+    selected_row_indices = [best_row_by_parent[i] for i in range(len(prompt_ids_batch))]
+    select_idx_tensor = torch.tensor(selected_row_indices, dtype=torch.long, device=logits_inter.device)
+    selected_logits_inter = torch.index_select(logits_inter, 0, select_idx_tensor)
+    selected_logits_target = torch.index_select(logits_target, 0, select_idx_tensor)
+    selected_batch_chars = dict(base_out['batch_characteristics'])
+    selected_batch_chars['round_batch_size'] = len(prompt_ids_batch)
+
+    return {
+        'draft_tokens_batch': [list(draft_tokens_batch_all[idx]) for idx in selected_row_indices],
+        'draft_step_stats_batch': [list(base_out['draft_step_stats_batch'][idx]) for idx in selected_row_indices],
+        'draft_confidence_batch': [list(base_out['draft_confidence_batch'][idx]) for idx in selected_row_indices],
+        'draft_confidence_cumprod_batch': [list(base_out['draft_confidence_cumprod_batch'][idx]) for idx in selected_row_indices],
+        'threshold_cross_position_batch': [None for _ in range(len(prompt_ids_batch))],
+        'draft_confidence_cumprod_avg_per_position': [],
+        'verification_model_batch': ['target' for _ in range(len(prompt_ids_batch))],
+        'forced_target_by_interval_batch': [False for _ in range(len(prompt_ids_batch))],
+        'topk_expansion_metadata_batch': [dict(base_out['topk_expansion_metadata_batch'][idx]) for idx in selected_row_indices],
+        'logits_inter': selected_logits_inter,
+        'logits_target': selected_logits_target,
+        'batch_characteristics': selected_batch_chars,
     }
 
 
@@ -297,29 +716,45 @@ def run_one_verify_round_batch(
     inter_draft_slots = 0
     cumprod = [1.0 for _ in range(bsz)]
     threshold_cross_position_round: int | None = None
-    for step_idx in range(k):
+
+    # k 의미:
+    #   vanila: 총 후보 토큰 수 = k
+    #   bump  : draft model이 만드는 토큰 수 = k, intermediate 1개 추가 => 총 k+1
+    num_candidate_tokens = k + 1 if method == "bump" else k
+
+    for step_idx in range(num_candidate_tokens):
         if method in {"vanila", "bump"}:
             use_inter = method == "bump" and step_idx == 0
             current_model = inter_model if use_inter else draft_model
             current_device = device_inter if use_inter else device_draft
-            next_logits, token_count, slot_count = _batched_next_logits(current_model, seqs, current_device)
+
+            next_logits, token_count, slot_count = _batched_next_logits(
+                current_model, seqs, current_device
+            )
             draft_total_tokens += token_count
             draft_total_slots += slot_count
+
             if use_inter:
                 inter_draft_tokens += token_count
                 inter_draft_slots += slot_count
             else:
                 draft_model_tokens += token_count
                 draft_model_slots += slot_count
+
             draft_logits = next_logits if not use_inter else None
             inter_logits = next_logits if use_inter else None
         else:
-            draft_logits, token_count, slot_count = _batched_next_logits(draft_model, seqs, device_draft)
+            draft_logits, token_count, slot_count = _batched_next_logits(
+                draft_model, seqs, device_draft
+            )
             draft_total_tokens += token_count
             draft_total_slots += slot_count
             draft_model_tokens += token_count
             draft_model_slots += slot_count
-            inter_logits, inter_draft_tc, inter_draft_sc = _batched_next_logits(inter_model, seqs, device_inter)
+
+            inter_logits, inter_draft_tc, inter_draft_sc = _batched_next_logits(
+                inter_model, seqs, device_inter
+            )
             inter_draft_tokens += inter_draft_tc
             inter_draft_slots += inter_draft_sc
 
@@ -327,6 +762,7 @@ def run_one_verify_round_batch(
         for i in range(bsz):
             use_inter_for_token = False
             draft_conf = None
+
             if method == "morphable":
                 draft_probs = torch.softmax(draft_logits[i].float(), dim=-1)
                 draft_conf = float(draft_probs.max().item())
@@ -343,13 +779,15 @@ def run_one_verify_round_batch(
                     draft_conf = None
 
             if method == "morphable":
-                # morphable thresholding is determined by batch-average cumulative confidence.
                 use_inter_for_token = (
-                    threshold_cross_position_round is not None and step_idx >= threshold_cross_position_round
+                    threshold_cross_position_round is not None
+                    and step_idx >= threshold_cross_position_round
                 )
+
             selected_logits = inter_logits[i] if use_inter_for_token else draft_logits[i]
             next_tok = int(selected_logits.argmax(dim=-1).item())
             next_tokens.append(next_tok)
+
             prob_info = _topk_info(selected_logits, k=5)
             draft_tokens_batch[i].append(next_tok)
             draft_step_stats_batch[i].append(
@@ -357,6 +795,7 @@ def run_one_verify_round_batch(
                     "position": step_idx,
                     "draft_token_id": next_tok,
                     "draft_top1_prob": prob_info["top1_prob"],
+                    "draft_selected_token_prob": prob_info["top1_prob"],
                     "draft_top5_token_ids": prob_info["top5_token_ids"],
                     "draft_top5_probs": prob_info["top5_probs"],
                     "draft_source_model": "intermediate" if use_inter_for_token else "draft",
@@ -365,6 +804,7 @@ def run_one_verify_round_batch(
                 }
             )
             seqs[i].append(next_tok)
+
         if method == "morphable":
             avg_cumprod = float(sum(cumprod) / max(len(cumprod), 1))
             draft_confidence_cumprod_avg_per_position.append(avg_cumprod)
@@ -374,15 +814,24 @@ def run_one_verify_round_batch(
     if method == "morphable":
         threshold_cross_position_batch = [threshold_cross_position_round for _ in range(bsz)]
 
-    full_seqs = [list(prompt_ids_batch[i]) + [int(recovery_token_ids[i])] + draft_tokens_batch[i] for i in range(bsz)]
-    positions_per_sample = [list(range(len(prompt_ids_batch[i]) - 1, len(prompt_ids_batch[i]) + k + 1)) for i in range(bsz)]
+    full_seqs = [
+        list(prompt_ids_batch[i]) + [int(recovery_token_ids[i])] + draft_tokens_batch[i]
+        for i in range(bsz)
+    ]
+
+    positions_per_sample = [
+        list(range(len(prompt_ids_batch[i]) - 1,
+                   len(prompt_ids_batch[i]) + num_candidate_tokens + 1))
+        for i in range(bsz)
+    ]
+
     logits_inter, inter_total_tokens, inter_total_slots = _batched_logits_at_positions(
         inter_model,
         full_seqs,
         positions_per_sample,
         device_inter,
     )
-    logits_target, _, target_total_tokens, target_total_slots = _sequential_logits_at_positions_padded(
+    logits_target, target_total_tokens, target_total_slots = _batched_logits_at_positions(
         target_model,
         full_seqs,
         positions_per_sample,
@@ -410,6 +859,7 @@ def run_one_verify_round_batch(
         "draft_confidence_cumprod_avg_per_position": draft_confidence_cumprod_avg_per_position,
         "verification_model_batch": verification_model_batch,
         "forced_target_by_interval_batch": forced_target_by_interval_batch,
+        "topk_expansion_metadata_batch": [_default_topk_expansion_metadata() for _ in range(bsz)],
         "logits_inter": logits_inter,
         "logits_target": logits_target,
         "batch_characteristics": {
@@ -543,6 +993,12 @@ def run_dataset_profile_batch(
     state["interval_forced_target_rounds"] = 0
     state["bonus_recovery_included_count"] = 0
     state["bonus_recovery_skipped_count"] = 0
+    state["topk_expansion_original_round_batch_sizes"] = []
+    state["topk_expansion_expanded_round_batch_sizes"] = []
+    state["topk_expansion_num_expanded_requests"] = []
+    state["topk_expansion_num_extra_variants"] = []
+    state["topk_expansion_selected_variant_ranks"] = []
+    state["topk_expansion_expanded_request_rounds"] = 0
     stop_ids = _get_stop_token_ids(tokenizer)
 
     overall_round = starting_overall_round
@@ -589,6 +1045,7 @@ def run_dataset_profile_batch(
                         "request_round_idx": 0,
                         "max_context_seen": initial_context_tokens,
                         "done": False,
+                        "hispec_topk_variants": None,
                     }
                 )
                 if args.print_request_progress:
@@ -602,26 +1059,360 @@ def run_dataset_profile_batch(
                 if not active_states:
                     break
 
+                if args.hispec and args.method == "topk_expansion":
+                    round_is_target = bool(args.interval > 0 and active_states[0]["verification_counter_since_target"] == args.interval)
+                    row_prompt_batch: list[list[int]] = []
+                    row_recovery_batch: list[int] = []
+                    row_parent_indices: list[int] = []
+                    allow_expansion_mask: list[bool] = []
+                    row_variant_sources: list[dict[str, Any]] = []
+                    row_meta_seed: list[dict[str, Any]] = []
+                    for parent_idx, s in enumerate(active_states):
+                        variants = s.get("hispec_topk_variants") or []
+                        if variants:
+                            for v in variants:
+                                row_prompt_batch.append(list(v["prompt_ids_for_round"]))
+                                row_recovery_batch.append(int(v["current_recovery"]))
+                                row_parent_indices.append(parent_idx)
+                                allow_expansion_mask.append(False)
+                                row_variant_sources.append(v)
+                                row_meta_seed.append(dict(v.get("topk_expansion_meta", _default_topk_expansion_metadata())))
+                        else:
+                            seed_variant = {
+                                "prompt_ids_for_round": list(s["prompt_ids_for_round"]),
+                                "current_recovery": int(s["current_recovery"]),
+                                "carry_over_prefix_tokens": list(s["carry_over_prefix_tokens"]),
+                                "topk_expansion_meta": _default_topk_expansion_metadata(),
+                            }
+                            row_prompt_batch.append(list(seed_variant["prompt_ids_for_round"]))
+                            row_recovery_batch.append(int(seed_variant["current_recovery"]))
+                            row_parent_indices.append(parent_idx)
+                            allow_expansion_mask.append(not round_is_target)
+                            row_variant_sources.append(seed_variant)
+                            row_meta_seed.append(dict(seed_variant["topk_expansion_meta"]))
+
+                    round_out = run_one_verify_round_topk_expansion_rows_batch(
+                        draft_model=draft_model,
+                        inter_model=inter_model,
+                        target_model=target_model,
+                        prompt_ids_batch=row_prompt_batch,
+                        recovery_token_ids=row_recovery_batch,
+                        parent_request_indices=row_parent_indices,
+                        allow_expansion_mask=allow_expansion_mask,
+                        k=args.k,
+                        topk_selection=args.topk_selection,
+                        expansion_pct=(0.0 if round_is_target else args.expansion_pct),
+                        device_draft=args.device_draft,
+                        device_inter=args.device_intermediate,
+                        device_target=args.device_target,
+                        metadata_seed_batch=row_meta_seed,
+                    )
+                    round_chars = _batch_stats_from_round_chars(round_out["batch_characteristics"])
+                    state["batch_sizes"].append(int(round_chars["round_batch_size"]))
+                    state["batch_draft_utilization"].append(float(round_chars["draft_utilization"]))
+                    state["batch_inter_utilization"].append(float(round_chars["inter_utilization"]))
+                    state["batch_target_utilization"].append(float(round_chars["target_utilization"]))
+                    state["batch_draft_model_draft_utilization"].append(float(round_chars["draft_model_draft_utilization"]))
+                    state["batch_inter_model_draft_utilization"].append(float(round_chars["inter_model_draft_utilization"]))
+                    state["batch_inter_model_verify_utilization"].append(float(round_chars["inter_model_verify_utilization"]))
+                    state["batch_target_model_verify_utilization"].append(float(round_chars["target_model_verify_utilization"]))
+                    state["total_draft_model_draft_tokens"] += int(round_chars["draft_model_draft_tokens"])
+                    state["total_inter_model_draft_tokens"] += int(round_chars["inter_model_draft_tokens"])
+                    state["total_inter_model_verify_tokens"] += int(round_chars["inter_model_verify_tokens"])
+                    state["total_target_model_verify_tokens"] += int(round_chars["target_model_verify_tokens"])
+                    state["topk_expansion_original_round_batch_sizes"].append(int(round_chars.get("original_round_batch_size", round_chars["round_batch_size"])))
+                    state["topk_expansion_expanded_round_batch_sizes"].append(int(round_chars.get("expanded_round_batch_size", round_chars["round_batch_size"])))
+                    state["topk_expansion_num_expanded_requests"].append(int(round_chars.get("num_expanded_requests", 0)))
+                    state["topk_expansion_num_extra_variants"].append(int(round_chars.get("num_extra_variants", 0)))
+
+                    row_parent_indices = round_out["parent_request_indices"]
+                    row_source_indices = round_out["source_row_indices"]
+                    row_prompt_batch = round_out["prompt_ids_batch"]
+                    row_recovery_batch = round_out["recovery_token_ids"]
+                    draft_tokens_batch = round_out["draft_tokens_batch"]
+                    draft_step_stats_batch = round_out["draft_step_stats_batch"]
+                    draft_confidence_batch = round_out["draft_confidence_batch"]
+                    draft_confidence_cumprod_batch = round_out["draft_confidence_cumprod_batch"]
+                    topk_expansion_metadata_batch = round_out["topk_expansion_metadata_batch"]
+                    logits_inter = round_out["logits_inter"]
+                    logits_target = round_out["logits_target"]
+
+                    if round_is_target:
+                        carry_prefix_tokens_batch = [list(row_variant_sources[row_source_indices[i]]["carry_over_prefix_tokens"]) for i in range(len(row_source_indices))]
+                        eval_draft_tokens_batch, logits_inter_eval_all, logits_target_eval_all = _recompute_eval_logits_with_carry(
+                            prompt_ids_batch=row_prompt_batch,
+                            recovery_token_ids=row_recovery_batch,
+                            raw_draft_tokens_batch=draft_tokens_batch,
+                            carry_prefix_tokens_batch=carry_prefix_tokens_batch,
+                            inter_model=inter_model,
+                            target_model=target_model,
+                            device_inter=args.device_intermediate,
+                            device_target=args.device_target,
+                        )
+                        best_row_by_parent: dict[int, int] = {}
+                        best_score_by_parent: dict[int, tuple[int, int, int]] = {}
+                        for row_idx, parent_idx in enumerate(row_parent_indices):
+                            n_accept_target_for_select = _compute_accept_length_from_logits(eval_draft_tokens_batch[row_idx], logits_target_eval_all[row_idx])
+                            variant_rank = int(topk_expansion_metadata_batch[row_idx].get("selected_variant_rank", 0))
+                            score = (n_accept_target_for_select, -variant_rank, -row_idx)
+                            if parent_idx not in best_score_by_parent or score > best_score_by_parent[parent_idx]:
+                                best_score_by_parent[parent_idx] = score
+                                best_row_by_parent[parent_idx] = row_idx
+                    else:
+                        best_row_by_parent = {}
+                        eval_draft_tokens_batch = [list(x) for x in draft_tokens_batch]
+                        logits_inter_eval_all = logits_inter
+                        logits_target_eval_all = logits_target
+
+                    new_variants_by_parent: dict[int, list[dict[str, Any]]] = {idx: [] for idx in range(len(active_states))}
+                    selected_target_rows: dict[int, dict[str, Any]] = {}
+                    request_round_incremented: set[int] = set()
+
+                    for row_idx, parent_idx in enumerate(row_parent_indices):
+                        s = active_states[parent_idx]
+                        req = s["request"]
+                        raw_draft_tokens = draft_tokens_batch[row_idx]
+                        carry_prefix_tokens = list(row_variant_sources[row_source_indices[row_idx]]["carry_over_prefix_tokens"])
+                        eval_draft_tokens = eval_draft_tokens_batch[row_idx]
+                        logits_inter_eval = logits_inter_eval_all[row_idx : row_idx + 1, : len(eval_draft_tokens) + 2]
+                        logits_target_eval = logits_target_eval_all[row_idx : row_idx + 1, : len(eval_draft_tokens) + 2]
+
+                        (
+                            inter_topk_list,
+                            target_topk_list,
+                            accept_target_list,
+                            accept_inter_list,
+                            draft_tok_list,
+                        ) = compute_position_stats(
+                            eval_draft_tokens,
+                            logits_inter_eval,
+                            logits_target_eval,
+                            args.topk,
+                        )
+                        target_prefix_accept = [1 if all(accept_target_list[: j + 1]) else 0 for j in range(len(eval_draft_tokens))]
+                        inter_prefix_accept = [1 if all(accept_inter_list[: j + 1]) else 0 for j in range(len(eval_draft_tokens))]
+                        for j in range(len(eval_draft_tokens)):
+                            state["position_accept_target"][j].append(target_prefix_accept[j])
+                            state["position_accept_inter"][j].append(inter_prefix_accept[j])
+                        n_accept_target = next((idx for idx, v in enumerate(accept_target_list) if v == 0), len(accept_target_list))
+                        n_accept_inter = next((idx for idx, v in enumerate(accept_inter_list) if v == 0), len(accept_inter_list))
+                        state["accept_len_target_list"].append(n_accept_target)
+                        state["accept_len_inter_list"].append(n_accept_inter)
+                        round_accept_rate_target = n_accept_target / len(eval_draft_tokens) if eval_draft_tokens else 0.0
+                        round_accept_rate_inter = n_accept_inter / len(eval_draft_tokens) if eval_draft_tokens else 0.0
+
+                        if n_accept_target < len(eval_draft_tokens):
+                            target_recovery = int(logits_target_eval[0, n_accept_target + 1].argmax(dim=-1).item())
+                        else:
+                            target_recovery = int(logits_target_eval[0, len(eval_draft_tokens) + 1].argmax(dim=-1).item())
+                        if n_accept_inter < len(eval_draft_tokens):
+                            inter_recovery = int(logits_inter_eval[0, n_accept_inter + 1].argmax(dim=-1).item())
+                        else:
+                            inter_recovery = int(logits_inter_eval[0, len(eval_draft_tokens) + 1].argmax(dim=-1).item())
+
+                        target_accepted_token_stats: list[dict[str, Any]] = []
+                        for j in range(n_accept_target):
+                            token_stats = _token_and_topk_probs_from_logits(
+                                logits_target_eval[0, j + 1],
+                                eval_draft_tokens[j],
+                                topk=args.topk,
+                            )
+                            token_stats["position"] = j
+                            target_accepted_token_stats.append(token_stats)
+                        target_recovery_logits_idx = (n_accept_target + 1) if n_accept_target < len(eval_draft_tokens) else len(eval_draft_tokens) + 1
+                        target_recovery_stats = _token_and_topk_probs_from_logits(
+                            logits_target_eval[0, target_recovery_logits_idx],
+                            target_recovery,
+                            topk=args.topk,
+                        )
+                        target_recovery_stats["position"] = target_recovery_logits_idx - 1
+                        precision_stats = compute_intermediate_precision_against_target(
+                            draft_tokens=eval_draft_tokens,
+                            n_accept_inter=n_accept_inter,
+                            n_accept_target=n_accept_target,
+                            target_recovery=target_recovery,
+                        )
+                        state["inter_precision_tp_total"] += int(precision_stats["true_positive_count"])
+                        state["inter_precision_fp_total"] += int(precision_stats["false_positive_count"])
+                        if precision_stats["precision"] is not None:
+                            state["inter_precision_round_values"].append(float(precision_stats["precision"]))
+                            state["inter_precision_nonempty_rounds"] += 1
+
+                        context_tokens_before_round = len(row_prompt_batch[row_idx]) + 1
+                        s["max_context_seen"] = max(s["max_context_seen"], context_tokens_before_round)
+                        dataset_global_round = state["total_rounds"]
+                        round_idx_for_row = s["request_round_idx"]
+                        round_sample_id = f"{dataset_key}:{req['request_id']}:round_{round_idx_for_row}"
+                        topk_expansion_meta = topk_expansion_metadata_batch[row_idx]
+                        selected_for_commit = bool(round_is_target and best_row_by_parent.get(parent_idx) == row_idx)
+                        verification_row = {
+                            "request_index": s["request_index"],
+                            "request_sample_id": req["request_sample_id"],
+                            "sample_id": round_sample_id,
+                            "request_id": req["request_id"],
+                            "dataset": dataset_key,
+                            "method": args.method,
+                            "hispec": True,
+                            "batch_characteristics": round_chars,
+                            "prompt_style": req["prompt_meta"]["prompt_style"],
+                            "turn_index_used": req["turn_index"],
+                            "num_turns_in_record": req["prompt_meta"]["num_turns_in_record"],
+                            "history_mode": req["prompt_meta"]["history_mode"],
+                            "history_assistant_turns_generated": req["prompt_meta"]["history_assistant_turns_generated"],
+                            "verification_round": round_idx_for_row,
+                            "context_tokens_initial": len(req["prompt_ids"]),
+                            "context_tokens_before_round": context_tokens_before_round,
+                            "dataset_global_round": dataset_global_round,
+                            "overall_global_round": overall_round,
+                            "k": len(eval_draft_tokens),
+                            "verification_model": ("target" if round_is_target else "intermediate"),
+                            "forced_target_by_interval": bool(round_is_target),
+                            "topk_expansion": topk_expansion_meta,
+                            "topk_expansion_selected_for_commit": selected_for_commit,
+                            "draft_confidence_per_position": draft_confidence_batch[row_idx],
+                            "draft_confidence_cumprod_per_position": draft_confidence_cumprod_batch[row_idx],
+                            "target": {
+                                "acceptance_per_position_raw": accept_target_list,
+                                "acceptance_per_position_prefix": target_prefix_accept,
+                                "acceptance_rate": round_accept_rate_target,
+                                "acceptance_length": n_accept_target,
+                                "recovery_token_id": target_recovery,
+                                "accepted_token_stats": target_accepted_token_stats,
+                                "recovery_token_stats": target_recovery_stats,
+                            },
+                            "intermediate": {
+                                "acceptance_per_position_raw": accept_inter_list,
+                                "acceptance_per_position_prefix": inter_prefix_accept,
+                                "acceptance_rate": round_accept_rate_inter,
+                                "acceptance_length": n_accept_inter,
+                                "recovery_token_id": inter_recovery,
+                                "precision_vs_target": precision_stats,
+                            },
+                        }
+                        state["total_rounds"] += 1
+                        overall_round += 1
+                        if verification_f is not None:
+                            verification_f.write(json.dumps(verification_row, ensure_ascii=False) + "\n")
+
+                        if round_is_target:
+                            if selected_for_commit:
+                                state["verification_model_target_rounds"] += 1
+                                state["interval_forced_target_rounds"] += 1
+                                state["topk_expansion_selected_variant_ranks"].append(int(topk_expansion_meta.get("selected_variant_rank", 0)))
+                                if topk_expansion_meta.get("was_expanded_request"):
+                                    state["topk_expansion_expanded_request_rounds"] += 1
+                                selected_target_rows[parent_idx] = {
+                                    "state": s,
+                                    "request": req,
+                                    "eval_draft_tokens": eval_draft_tokens,
+                                    "target_recovery": target_recovery,
+                                    "carry_prefix_tokens": carry_prefix_tokens,
+                                    # Must match the prompt used for _recompute_eval_logits_with_carry /
+                                    # compute_position_stats for this row (variant rows differ from s["prompt_ids_for_round"]).
+                                    "prompt_ids_for_round_at_eval": list(row_prompt_batch[row_idx]),
+                                }
+                        else:
+                            state["verification_model_intermediate_rounds"] += 1
+                            carry_tokens = [row_recovery_batch[row_idx]] + raw_draft_tokens[:n_accept_inter]
+                            new_prompt = list(row_prompt_batch[row_idx]) + carry_tokens
+                            new_variants_by_parent[parent_idx].append(
+                                {
+                                    "prompt_ids_for_round": new_prompt,
+                                    "current_recovery": inter_recovery,
+                                    "carry_over_prefix_tokens": carry_prefix_tokens + carry_tokens,
+                                    "topk_expansion_meta": dict(topk_expansion_meta),
+                                }
+                            )
+                            s["max_context_seen"] = max(s["max_context_seen"], len(new_prompt))
+
+                    if verification_f is not None:
+                        verification_f.flush()
+
+                    if round_is_target:
+                        for parent_idx, s in enumerate(active_states):
+                            req = s["request"]
+                            selected = selected_target_rows[parent_idx]
+                            carry_prefix_tokens = list(selected["carry_prefix_tokens"])
+                            prompt_at_eval = list(
+                                selected.get("prompt_ids_for_round_at_eval", s["prompt_ids_for_round"])
+                            )
+                            base_prompt_for_commit, _ = _split_base_prompt_and_carry_prefix(
+                                prompt_at_eval,
+                                carry_prefix_tokens,
+                            )
+                            emitted_tokens_full = list(selected["eval_draft_tokens"][: _compute_accept_length_from_logits(selected["eval_draft_tokens"], logits_target_eval_all[best_row_by_parent[parent_idx]])])
+                            next_recovery = int(selected["target_recovery"])
+                            remaining_budget = req["max_new_tokens"] - s["generated_count"]
+                            committed_tokens = emitted_tokens_full[: max(remaining_budget, 0)]
+                            committed_tokens, hit_stop_in_committed = _truncate_at_stop_token(committed_tokens, stop_ids)
+                            s["prompt_ids_for_round"] = base_prompt_for_commit + committed_tokens
+                            s["generated_output_ids"].extend(int(tok) for tok in committed_tokens)
+                            s["generated_count"] += len(committed_tokens)
+                            s["max_context_seen"] = max(s["max_context_seen"], len(s["prompt_ids_for_round"]))
+                            s["hispec_topk_variants"] = None
+                            s["carry_over_prefix_tokens"] = []
+                            s["verification_counter_since_target"] = 0
+                            if parent_idx not in request_round_incremented:
+                                s["request_round_idx"] += 1
+                                request_round_incremented.add(parent_idx)
+                            if hit_stop_in_committed or len(committed_tokens) < len(emitted_tokens_full):
+                                s["done"] = True
+                                continue
+                            s["current_recovery"] = next_recovery
+                            if s["generated_count"] >= req["max_new_tokens"]:
+                                s["done"] = True
+                                continue
+                            if s["current_recovery"] in stop_ids:
+                                if s["generated_count"] < req["max_new_tokens"]:
+                                    s["prompt_ids_for_round"] = s["prompt_ids_for_round"] + [s["current_recovery"]]
+                                    s["generated_output_ids"].append(int(s["current_recovery"]))
+                                    s["generated_count"] += 1
+                                    s["max_context_seen"] = max(s["max_context_seen"], len(s["prompt_ids_for_round"]))
+                                s["done"] = True
+                    else:
+                        for parent_idx, s in enumerate(active_states):
+                            s["hispec_topk_variants"] = new_variants_by_parent.get(parent_idx, [])
+                            s["verification_counter_since_target"] += 1
+                            if parent_idx not in request_round_incremented:
+                                s["request_round_idx"] += 1
+                                request_round_incremented.add(parent_idx)
+                    continue
+
                 prompt_batch = [list(s["prompt_ids_for_round"]) for s in active_states]
                 recovery_batch = [int(s["current_recovery"]) for s in active_states]
                 force_target_batch = [
-                    bool(args.method == "morphable" and args.interval > 0 and s["verification_counter_since_target"] == args.interval)
+                    bool((args.method == "morphable" and args.interval > 0 and s["verification_counter_since_target"] == args.interval) or (args.hispec and args.method == "vanila" and args.interval > 0 and s["verification_counter_since_target"] == args.interval))
                     for s in active_states
                 ]
-                round_out = run_one_verify_round_batch(
-                    method=args.method,
-                    draft_model=draft_model,
-                    inter_model=inter_model,
-                    target_model=target_model,
-                    prompt_ids_batch=prompt_batch,
-                    recovery_token_ids=recovery_batch,
-                    k=args.k,
-                    device_draft=args.device_draft,
-                    device_inter=args.device_intermediate,
-                    device_target=args.device_target,
-                    confidence_threshold=args.confidence_threshold,
-                    force_target_batch=force_target_batch,
-                )
+                if args.method == "topk_expansion":
+                    round_out = run_one_verify_round_topk_expansion_batch(
+                        draft_model=draft_model,
+                        inter_model=inter_model,
+                        target_model=target_model,
+                        prompt_ids_batch=prompt_batch,
+                        recovery_token_ids=recovery_batch,
+                        k=args.k,
+                        topk_selection=args.topk_selection,
+                        expansion_pct=args.expansion_pct,
+                        device_draft=args.device_draft,
+                        device_inter=args.device_intermediate,
+                        device_target=args.device_target,
+                    )
+                else:
+                    round_out = run_one_verify_round_batch(
+                        method=args.method,
+                        draft_model=draft_model,
+                        inter_model=inter_model,
+                        target_model=target_model,
+                        prompt_ids_batch=prompt_batch,
+                        recovery_token_ids=recovery_batch,
+                        k=args.k,
+                        device_draft=args.device_draft,
+                        device_inter=args.device_intermediate,
+                        device_target=args.device_target,
+                        confidence_threshold=args.confidence_threshold,
+                        force_target_batch=force_target_batch,
+                    )
                 round_chars = _batch_stats_from_round_chars(round_out["batch_characteristics"])
                 state["batch_sizes"].append(int(round_chars["round_batch_size"]))
                 state["batch_draft_utilization"].append(float(round_chars["draft_utilization"]))
@@ -643,9 +1434,20 @@ def run_dataset_profile_batch(
                 draft_confidence_cumprod_avg_per_position = round_out["draft_confidence_cumprod_avg_per_position"]
                 threshold_cross_position_batch = round_out["threshold_cross_position_batch"]
                 verification_model_batch = round_out["verification_model_batch"]
+                if args.hispec and args.method == "vanila":
+                    verification_model_batch = ["target" if x else "intermediate" for x in force_target_batch]
                 forced_target_by_interval_batch = round_out["forced_target_by_interval_batch"]
                 logits_inter = round_out["logits_inter"]
                 logits_target = round_out["logits_target"]
+                topk_expansion_metadata_batch = round_out.get(
+                    "topk_expansion_metadata_batch",
+                    [_default_topk_expansion_metadata() for _ in range(len(active_states))],
+                )
+                if args.method == "topk_expansion":
+                    state["topk_expansion_original_round_batch_sizes"].append(int(round_chars.get("original_round_batch_size", round_chars["round_batch_size"])))
+                    state["topk_expansion_expanded_round_batch_sizes"].append(int(round_chars.get("expanded_round_batch_size", round_chars["round_batch_size"])))
+                    state["topk_expansion_num_expanded_requests"].append(int(round_chars.get("num_expanded_requests", 0)))
+                    state["topk_expansion_num_extra_variants"].append(int(round_chars.get("num_extra_variants", 0)))
 
                 carry_target_indices = [
                     i
@@ -655,37 +1457,27 @@ def run_dataset_profile_batch(
                 carry_logits_inter_by_idx: dict[int, torch.Tensor] = {}
                 carry_logits_target_by_idx: dict[int, torch.Tensor] = {}
                 if carry_target_indices:
-                    carry_prompt_batch: list[list[int]] = []
-                    carry_eval_draft_batch: list[list[int]] = []
+                    carry_full_seqs: list[list[int]] = []
                     carry_positions_batch: list[list[int]] = []
                     for i in carry_target_indices:
                         s = active_states[i]
                         carry_prefix_tokens = list(s["carry_over_prefix_tokens"])
                         raw_draft_tokens = draft_tokens_batch[i]
-                        prompt_round = list(s["prompt_ids_for_round"])
-                        c = len(carry_prefix_tokens)
-                        if c > len(prompt_round) or prompt_round[-c:] != carry_prefix_tokens:
-                            raise ValueError(
-                                "carry_over_prefix_tokens must exactly match the suffix of prompt_ids_for_round "
-                                f"(got carry_len={c}, prompt_len={len(prompt_round)})"
-                            )
-                        base_prompt = prompt_round[:-c]
-                        # Same order as drafting: P = base + carry, then seq = P + [current_recovery] + raw_draft.
-                        eval_draft_tokens = carry_prefix_tokens + [int(s["current_recovery"])] + raw_draft_tokens
-                        carry_prompt_batch.append(base_prompt)
-                        carry_eval_draft_batch.append(eval_draft_tokens)
-                        carry_positions_batch.append(
-                            list(range(len(base_prompt) - 1, len(base_prompt) + len(eval_draft_tokens) + 1))
+                        _, _, carry_full_seq, carry_positions = _build_target_eval_sequence_with_carry(
+                            prompt_ids=list(s["prompt_ids_for_round"]),
+                            recovery_tok=int(s["current_recovery"]),
+                            raw_draft_tokens=list(raw_draft_tokens),
+                            carry_prefix_tokens=carry_prefix_tokens,
                         )
-
-                    carry_full_seqs = [carry_prompt_batch[j] + carry_eval_draft_batch[j] for j in range(len(carry_prompt_batch))]
+                        carry_full_seqs.append(carry_full_seq)
+                        carry_positions_batch.append(carry_positions)
                     carry_logits_inter, _, _, _ = _batched_logits_at_positions_padded(
                         inter_model,
                         carry_full_seqs,
                         carry_positions_batch,
                         args.device_intermediate,
                     )
-                    carry_logits_target, _, _, _ = _sequential_logits_at_positions_padded(
+                    carry_logits_target, _, _, _ = _batched_logits_at_positions_padded(
                         target_model,
                         carry_full_seqs,
                         carry_positions_batch,
@@ -705,7 +1497,12 @@ def run_dataset_profile_batch(
                     carry_prefix_tokens = list(s["carry_over_prefix_tokens"])
 
                     if verification_model == "target" and carry_prefix_tokens:
-                        eval_draft_tokens = carry_prefix_tokens + [int(s["current_recovery"])] + raw_draft_tokens
+                        _, eval_draft_tokens, _, _ = _build_target_eval_sequence_with_carry(
+                            prompt_ids=list(s["prompt_ids_for_round"]),
+                            recovery_tok=int(s["current_recovery"]),
+                            raw_draft_tokens=list(raw_draft_tokens),
+                            carry_prefix_tokens=carry_prefix_tokens,
+                        )
                         logits_inter_eval = carry_logits_inter_by_idx[i]
                         logits_target_eval = carry_logits_target_by_idx[i]
                     else:
@@ -783,6 +1580,7 @@ def run_dataset_profile_batch(
                     round_idx_for_row = s["request_round_idx"]
                     round_sample_id = f"{dataset_key}:{req['request_id']}:round_{round_idx_for_row}"
 
+                    topk_expansion_meta = topk_expansion_metadata_batch[i]
                     verification_row = {
                         "request_index": s["request_index"],
                         "request_sample_id": req["request_sample_id"],
@@ -811,6 +1609,7 @@ def run_dataset_profile_batch(
                         "draft_confidence_cumprod_avg_per_position": draft_confidence_cumprod_avg_per_position,
                         "bonus_method": args.bonus_method if args.method == "morphable" else None,
                         "bonus_threshold": args.bonus_threshold if args.method == "morphable" else None,
+                        "topk_expansion": topk_expansion_meta,
                         "target": {
                             "acceptance_per_position_raw": accept_target_list,
                             "acceptance_per_position_prefix": target_prefix_accept,
@@ -829,6 +1628,11 @@ def run_dataset_profile_batch(
                             "precision_vs_target": precision_stats,
                         },
                     }
+                    if topk_expansion_meta.get("enabled"):
+                        state["topk_expansion_selected_variant_ranks"].append(int(topk_expansion_meta.get("selected_variant_rank", 0)))
+                        if topk_expansion_meta.get("was_expanded_request"):
+                            state["topk_expansion_expanded_request_rounds"] += 1
+
                     if n_accept_target == n_accept_inter:
                         state["same_accept_len_count"] += 1
                         if target_recovery == inter_recovery:
@@ -839,26 +1643,24 @@ def run_dataset_profile_batch(
                     if detail_f is not None:
                         carry_prefix_len = len(carry_prefix_tokens)
                         pending_recovery_in_eval = 1 if carry_prefix_len else 0
+                        synthetic_carry = {
+                            "draft_source_model": "carry_over_prefix",
+                            "draft_top1_prob": None,
+                            "draft_selected_token_prob": None,
+                            "draft_top5_token_ids": [],
+                            "draft_top5_probs": [],
+                            "draft_model_top1_confidence": None,
+                            "draft_confidence_cumprod": None,
+                        }
                         for j, (dt, itopk, ttopk, at, ai) in enumerate(
                             zip(draft_tok_list, inter_topk_list, target_topk_list, accept_target_list, accept_inter_list)
                         ):
-                            synthetic = {
-                                "draft_source_model": "carry_over_prefix",
-                                "draft_top1_prob": None,
-                                "draft_top5_token_ids": [],
-                                "draft_top5_probs": [],
-                                "draft_model_top1_confidence": None,
-                                "draft_confidence_cumprod": None,
-                            }
                             if carry_prefix_len == 0:
                                 step_stat = draft_step_stats_batch[i][j]
                             elif j < carry_prefix_len:
-                                step_stat = synthetic
+                                step_stat = synthetic_carry
                             elif j == carry_prefix_len and pending_recovery_in_eval:
-                                step_stat = {
-                                    **synthetic,
-                                    "draft_source_model": "pending_recovery",
-                                }
+                                step_stat = {**synthetic_carry, "draft_source_model": "pending_recovery"}
                             else:
                                 draft_pos = j - carry_prefix_len - pending_recovery_in_eval
                                 step_stat = draft_step_stats_batch[i][draft_pos]
@@ -884,6 +1686,7 @@ def run_dataset_profile_batch(
                                 "draft_token_id": dt,
                                 "draft_source_model": step_stat["draft_source_model"],
                                 "draft_top1_prob": step_stat["draft_top1_prob"],
+                                "draft_selected_token_prob": step_stat.get("draft_selected_token_prob"),
                                 "draft_top5_token_ids": step_stat["draft_top5_token_ids"],
                                 "draft_top5_probs": step_stat["draft_top5_probs"],
                                 "draft_model_top1_confidence": step_stat.get("draft_model_top1_confidence"),
@@ -903,6 +1706,15 @@ def run_dataset_profile_batch(
                                 "verification_model": verification_model,
                                 "forced_target_by_interval": bool(forced_target_by_interval),
                                 "threshold_cross_position": threshold_cross_position,
+                                "topk_expansion_enabled": bool(topk_expansion_meta.get("enabled")),
+                                "topk_expansion_was_expanded_request": bool(topk_expansion_meta.get("was_expanded_request")),
+                                "topk_expansion_selected_variant_rank": topk_expansion_meta.get("selected_variant_rank"),
+                                "topk_expansion_selected_first_token": topk_expansion_meta.get("selected_first_token"),
+                                "topk_expansion_selected_first_token_prob": topk_expansion_meta.get("selected_first_token_prob"),
+                                "topk_expansion_original_first_top1_token": topk_expansion_meta.get("original_first_top1_token"),
+                                "topk_expansion_original_first_top1_prob": topk_expansion_meta.get("original_first_top1_prob"),
+                                "topk_expansion_candidate_first_token_ids": topk_expansion_meta.get("candidate_first_token_ids", []),
+                                "topk_expansion_candidate_first_token_probs": topk_expansion_meta.get("candidate_first_token_probs", []),
                             }
                             detail_f.write(json.dumps(detail_row, ensure_ascii=False) + "\n")
                             state["detail_rows_written"] += 1
@@ -918,7 +1730,7 @@ def run_dataset_profile_batch(
                         # for later target verification and do not commit output yet.
                         recovery_included = False
                         carry_tokens = [s["current_recovery"]] + raw_draft_tokens[:n_accept_inter]
-                        if n_accept_inter < len(raw_draft_tokens):
+                        if (args.method == "morphable") and n_accept_inter < len(raw_draft_tokens):
                             inter_recovery_prob = float(torch.softmax(logits_inter_eval[0, n_accept_inter + 1].float(), dim=-1)[inter_recovery].item())
                             recovery_included = _should_include_bonus_recovery(
                                 bonus_method=args.bonus_method,
@@ -937,7 +1749,6 @@ def run_dataset_profile_batch(
                         s["prompt_ids_for_round"] = s["prompt_ids_for_round"] + carry_tokens
                         s["max_context_seen"] = max(s["max_context_seen"], len(s["prompt_ids_for_round"]))
                         if recovery_included:
-                            # inter_recovery is already the last token of carry_tokens / prompt tail.
                             next_inter_logits, _, _ = _batched_next_logits(
                                 inter_model,
                                 [list(s["prompt_ids_for_round"])],
@@ -958,15 +1769,17 @@ def run_dataset_profile_batch(
                         verification_row["recovery_included_in_prefix"] = None
 
                     # Target verification commits accepted prefix over the combined candidate
-                    # stream (carry-over provisional + current round draft).
-                    base_prompt_for_commit = list(s["prompt_ids_for_round"])
+                    # stream (carry-over provisional + current recovery + current round draft).
                     if carry_prefix_tokens:
-                        base_prompt_for_commit = base_prompt_for_commit[: len(base_prompt_for_commit) - len(carry_prefix_tokens)]
-                    s["carry_over_prefix_tokens"] = []
-                    if carry_prefix_tokens:
-                        emitted_tokens_full = eval_draft_tokens[:n_accept_target]
+                        base_prompt_for_commit, _ = _split_base_prompt_and_carry_prefix(
+                            list(s["prompt_ids_for_round"]),
+                            carry_prefix_tokens,
+                        )
+                        emitted_tokens_full = list(eval_draft_tokens[:n_accept_target])
                     else:
-                        emitted_tokens_full = [s["current_recovery"]] + eval_draft_tokens[:n_accept_target]
+                        base_prompt_for_commit = list(s["prompt_ids_for_round"])
+                        emitted_tokens_full = [s["current_recovery"]] + list(eval_draft_tokens[:n_accept_target])
+                    s["carry_over_prefix_tokens"] = []
                     next_recovery = target_recovery
 
                     if verification_f is not None:
@@ -1088,6 +1901,9 @@ def run_dataset_profile_batch(
     summary["config"]["interval"] = args.interval
     summary["config"]["bonus_method"] = args.bonus_method
     summary["config"]["bonus_threshold"] = args.bonus_threshold
+    summary["config"]["hispec"] = args.hispec
+    summary["config"]["topk_selection"] = args.topk_selection
+    summary["config"]["expansion_pct"] = args.expansion_pct
     summary["batch_characteristics"] = {
         "round_batch_size": _stats_num(state.get("batch_sizes", [])),
         "draft_utilization": _stats_num(state.get("batch_draft_utilization", [])),
@@ -1112,6 +1928,15 @@ def run_dataset_profile_batch(
         "bonus_recovery_included_count": state["bonus_recovery_included_count"],
         "bonus_recovery_skipped_count": state["bonus_recovery_skipped_count"],
     }
+    summary["hispec_characteristics"] = {"enabled": bool(args.hispec), "interval": int(args.interval) if args.hispec else None}
+    summary["topk_expansion_characteristics"] = {
+        "original_round_batch_size": _stats_num(state.get("topk_expansion_original_round_batch_sizes", [])),
+        "expanded_round_batch_size": _stats_num(state.get("topk_expansion_expanded_round_batch_sizes", [])),
+        "num_expanded_requests": _stats_num(state.get("topk_expansion_num_expanded_requests", [])),
+        "num_extra_variants": _stats_num(state.get("topk_expansion_num_extra_variants", [])),
+        "selected_variant_rank": _stats_num(state.get("topk_expansion_selected_variant_ranks", [])),
+        "expanded_request_rounds": int(state.get("topk_expansion_expanded_request_rounds", 0)),
+    }
     summary_path = save_summary(summary, dataset_out_dir) if _is_main_process() else (dataset_out_dir / "intermediate_vs_target_summary.json")
     return summary, state, overall_round, summary_path, detail_path, response_path
 
@@ -1128,7 +1953,7 @@ def _stats_num(values: list[int | float]) -> dict[str, float | int]:
 
 
 def main() -> int:
-    parser = argparse.ArgumentParser(description="Batch speculative decoding profile with vanila/bump/morphable methods.")
+    parser = argparse.ArgumentParser(description="Batch speculative decoding profile with vanila, bump, morphable, and topk_expansion methods.")
     parser.add_argument("--draft", type=str, default=_model_path("draft", DEFAULT_DRAFT), help="Draft model HF id")
     parser.add_argument("--intermediate", type=str, default=_model_path("intermediate", DEFAULT_INTERMEDIATE), help="Intermediate verifier HF id")
     parser.add_argument("--target", type=str, default=_model_path("target", DEFAULT_TARGET), help="Target model HF id")
@@ -1142,7 +1967,10 @@ def main() -> int:
     parser.add_argument("--mt-bench-max-new-tokens", type=int, default=1024)
     parser.add_argument("--qa-max-new-tokens", type=int, default=1024)
     parser.add_argument("--k", type=int, default=5, help="Number of draft tokens per round")
-    parser.add_argument("--method", type=str, default="vanila", choices=["vanila", "vanilla", "bump", "morphable"], help="Speculative method.")
+    parser.add_argument("--method", type=str, default="vanila", choices=["vanila", "vanilla", "bump", "morphable", "topk_expansion"], help="Speculative method.")
+    parser.add_argument("--topk-selection", type=int, default=5, choices=[2, 5], help="Number of first-token candidates to expand for topk_expansion")
+    parser.add_argument("--expansion-pct", type=float, default=0.2, help="Fraction of lowest-confidence requests to expand in topk_expansion")
+    parser.add_argument("--hispec", action=argparse.BooleanOptionalAction, default=False, help="Use intermediate verification for interval rounds and target-only commit")
     parser.add_argument("--confidence-threshold", type=float, default=0.8, help="Morphable cumulative draft confidence threshold")
     parser.add_argument("--interval", type=int, default=4, help="Force target verification when intermediate counter reaches interval")
     parser.add_argument("--bonus-method", type=str, default="adaptive", choices=["proactive", "conservative", "adaptive"], help="Carry-over recovery inclusion policy")
@@ -1184,6 +2012,12 @@ def main() -> int:
         raise ValueError("--confidence-threshold must be in [0, 1]")
     if not (0.0 <= args.bonus_threshold <= 1.0):
         raise ValueError("--bonus-threshold must be in [0, 1]")
+    if not (0.0 <= args.expansion_pct <= 1.0):
+        raise ValueError("--expansion-pct must be in [0, 1]")
+    if args.hispec and args.method not in {"vanila", "topk_expansion"}:
+        raise ValueError("--hispec currently supports only vanila and topk_expansion")
+    if args.hispec and args.interval < 1:
+        raise ValueError("--hispec requires --interval >= 1")
     args.method = _normalize_method(args.method)
     args.bonus_method = _normalize_bonus_method(args.bonus_method)
 
@@ -1264,6 +2098,12 @@ def main() -> int:
     overall_state["interval_forced_target_rounds"] = 0
     overall_state["bonus_recovery_included_count"] = 0
     overall_state["bonus_recovery_skipped_count"] = 0
+    overall_state["topk_expansion_original_round_batch_sizes"] = []
+    overall_state["topk_expansion_expanded_round_batch_sizes"] = []
+    overall_state["topk_expansion_num_expanded_requests"] = []
+    overall_state["topk_expansion_num_extra_variants"] = []
+    overall_state["topk_expansion_selected_variant_ranks"] = []
+    overall_state["topk_expansion_expanded_request_rounds"] = 0
     overall_round = 0
 
     for dataset_key in dataset_keys:
@@ -1301,6 +2141,12 @@ def main() -> int:
         overall_state["interval_forced_target_rounds"] += int(dataset_state.get("interval_forced_target_rounds", 0))
         overall_state["bonus_recovery_included_count"] += int(dataset_state.get("bonus_recovery_included_count", 0))
         overall_state["bonus_recovery_skipped_count"] += int(dataset_state.get("bonus_recovery_skipped_count", 0))
+        overall_state["topk_expansion_original_round_batch_sizes"].extend(dataset_state.get("topk_expansion_original_round_batch_sizes", []))
+        overall_state["topk_expansion_expanded_round_batch_sizes"].extend(dataset_state.get("topk_expansion_expanded_round_batch_sizes", []))
+        overall_state["topk_expansion_num_expanded_requests"].extend(dataset_state.get("topk_expansion_num_expanded_requests", []))
+        overall_state["topk_expansion_num_extra_variants"].extend(dataset_state.get("topk_expansion_num_extra_variants", []))
+        overall_state["topk_expansion_selected_variant_ranks"].extend(dataset_state.get("topk_expansion_selected_variant_ranks", []))
+        overall_state["topk_expansion_expanded_request_rounds"] += int(dataset_state.get("topk_expansion_expanded_request_rounds", 0))
         _rank0_print(f"Wrote dataset summary to {summary_path}")
         if detail_path is not None:
             _rank0_print(f"Wrote detail rows to {detail_path}")
@@ -1324,6 +2170,9 @@ def main() -> int:
     overall_summary["config"]["interval"] = args.interval
     overall_summary["config"]["bonus_method"] = args.bonus_method
     overall_summary["config"]["bonus_threshold"] = args.bonus_threshold
+    overall_summary["config"]["hispec"] = args.hispec
+    overall_summary["config"]["topk_selection"] = args.topk_selection
+    overall_summary["config"]["expansion_pct"] = args.expansion_pct
     overall_summary["batch_characteristics"] = {
         "round_batch_size": _stats_num(overall_state.get("batch_sizes", [])),
         "draft_utilization": _stats_num(overall_state.get("batch_draft_utilization", [])),
@@ -1347,6 +2196,15 @@ def main() -> int:
         "interval_forced_target_rounds": overall_state["interval_forced_target_rounds"],
         "bonus_recovery_included_count": overall_state["bonus_recovery_included_count"],
         "bonus_recovery_skipped_count": overall_state["bonus_recovery_skipped_count"],
+    }
+    overall_summary["hispec_characteristics"] = {"enabled": bool(args.hispec), "interval": int(args.interval) if args.hispec else None}
+    overall_summary["topk_expansion_characteristics"] = {
+        "original_round_batch_size": _stats_num(overall_state.get("topk_expansion_original_round_batch_sizes", [])),
+        "expanded_round_batch_size": _stats_num(overall_state.get("topk_expansion_expanded_round_batch_sizes", [])),
+        "num_expanded_requests": _stats_num(overall_state.get("topk_expansion_num_expanded_requests", [])),
+        "num_extra_variants": _stats_num(overall_state.get("topk_expansion_num_extra_variants", [])),
+        "selected_variant_rank": _stats_num(overall_state.get("topk_expansion_selected_variant_ranks", [])),
+        "expanded_request_rounds": int(overall_state.get("topk_expansion_expanded_request_rounds", 0)),
     }
     overall_summary_path = save_summary(overall_summary, Path(args.output_dir)) if _is_main_process() else (Path(args.output_dir) / "intermediate_vs_target_summary.json")
     _rank0_print(f"Wrote aggregate summary to {overall_summary_path}")
