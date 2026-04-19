@@ -56,3 +56,8 @@ Outputs under `--output-dir`:
 5. **Advance**: accept/reject by **target** top-1 only; append accepted tokens and set recovery; repeat until `max_new_tokens` or EOS.
 
 This gives position-wise and aggregate stats to see how well the intermediate verifier approximates the target before wiring it into the real GPU0/GPU1 pipeline.
+
+## `batch_profile.py` (batch speculative profile)
+
+- **`--method vanilla`**: accepted as an alias of **`vanila`** (same draft/verify path after normalization).
+- **`--hispec`**: intermediate rounds plus interval target commit; supported for **`vanila`** (including the `vanilla` spelling) and **`topk_expansion`**. The latter can branch on multiple first-step draft candidates when expansion is enabled; with **`--expansion-pct 0`** the first-step draft matches vanila greedy behavior for the shared verify layout helpers in code.

@@ -30,6 +30,12 @@ ROOT_DIR = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(THIS_DIR))
 sys.path.insert(0, str(ROOT_DIR))
 
+from batch_profile_contract_utils import (
+    _normalize_bonus_method,
+    _normalize_method,
+    _verify_full_seq_no_carry,
+    _verify_positions_no_carry,
+)
 from run_intermediate_verifier_profile import (
     DEFAULT_DRAFT,
     DEFAULT_INTERMEDIATE,
@@ -66,22 +72,6 @@ try:
     from transformers import AutoModelForCausalLM
 except ImportError:
     raise ImportError("Install transformers: pip install transformers")
-
-
-def _normalize_method(method: str) -> str:
-    low = method.strip().lower()
-    if low == "vanilla":
-        return "vanila"
-    if low not in {"vanila", "bump", "morphable", "topk_expansion"}:
-        raise ValueError(f"Unsupported --method={method}. Use vanila, bump, morphable, or topk_expansion.")
-    return low
-
-
-def _normalize_bonus_method(bonus_method: str) -> str:
-    low = bonus_method.strip().lower()
-    if low not in {"proactive", "conservative", "adaptive"}:
-        raise ValueError(f"Unsupported --bonus-method={bonus_method}. Use proactive, conservative, or adaptive.")
-    return low
 
 
 def _should_include_bonus_recovery(
@@ -350,8 +340,8 @@ def _build_target_eval_sequence_with_carry(
     b = len(base_prompt)
     if not carry_prefix:
         eval_draft_tokens = raw
-        full_seq = list(base_prompt) + [rec] + raw
-        positions = list(range(b - 1, b + len(eval_draft_tokens) + 1))
+        full_seq = _verify_full_seq_no_carry(base_prompt, rec, eval_draft_tokens)
+        positions = _verify_positions_no_carry(b, len(eval_draft_tokens))
         return base_prompt, eval_draft_tokens, full_seq, positions
 
     eval_draft_tokens = list(carry_prefix) + [rec] + raw
@@ -555,12 +545,15 @@ def run_one_verify_round_topk_expansion_rows_batch(
             expanded_seqs[row_idx].append(next_tok)
 
     full_seqs = [
-        list(expanded_prompt_ids_batch[i]) + [int(expanded_recovery_token_ids[i])] + list(expanded_draft_tokens_batch[i])
+        _verify_full_seq_no_carry(
+            list(expanded_prompt_ids_batch[i]),
+            int(expanded_recovery_token_ids[i]),
+            list(expanded_draft_tokens_batch[i]),
+        )
         for i in range(expanded_bsz)
     ]
     positions_per_sample = [
-        list(range(len(expanded_prompt_ids_batch[i]) - 1, len(expanded_prompt_ids_batch[i]) + k + 1))
-        for i in range(expanded_bsz)
+        _verify_positions_no_carry(len(expanded_prompt_ids_batch[i]), k) for i in range(expanded_bsz)
     ]
     logits_inter, inter_total_tokens, inter_total_slots = _batched_logits_at_positions(
         inter_model,
@@ -815,14 +808,16 @@ def run_one_verify_round_batch(
         threshold_cross_position_batch = [threshold_cross_position_round for _ in range(bsz)]
 
     full_seqs = [
-        list(prompt_ids_batch[i]) + [int(recovery_token_ids[i])] + draft_tokens_batch[i]
+        _verify_full_seq_no_carry(
+            list(prompt_ids_batch[i]),
+            int(recovery_token_ids[i]),
+            list(draft_tokens_batch[i]),
+        )
         for i in range(bsz)
     ]
 
     positions_per_sample = [
-        list(range(len(prompt_ids_batch[i]) - 1,
-                   len(prompt_ids_batch[i]) + num_candidate_tokens + 1))
-        for i in range(bsz)
+        _verify_positions_no_carry(len(prompt_ids_batch[i]), num_candidate_tokens) for i in range(bsz)
     ]
 
     logits_inter, inter_total_tokens, inter_total_slots = _batched_logits_at_positions(
@@ -1252,7 +1247,7 @@ def run_dataset_profile_batch(
                             "request_id": req["request_id"],
                             "dataset": dataset_key,
                             "method": args.method,
-                            "hispec": True,
+                            "hispec": bool(args.hispec),
                             "batch_characteristics": round_chars,
                             "prompt_style": req["prompt_meta"]["prompt_style"],
                             "turn_index_used": req["turn_index"],
@@ -1588,6 +1583,7 @@ def run_dataset_profile_batch(
                         "request_id": req["request_id"],
                         "dataset": dataset_key,
                         "method": args.method,
+                        "hispec": bool(args.hispec),
                         "batch_characteristics": round_chars,
                         "prompt_style": req["prompt_meta"]["prompt_style"],
                         "turn_index_used": req["turn_index"],
@@ -2014,11 +2010,11 @@ def main() -> int:
         raise ValueError("--bonus-threshold must be in [0, 1]")
     if not (0.0 <= args.expansion_pct <= 1.0):
         raise ValueError("--expansion-pct must be in [0, 1]")
+    args.method = _normalize_method(args.method)
     if args.hispec and args.method not in {"vanila", "topk_expansion"}:
         raise ValueError("--hispec currently supports only vanila and topk_expansion")
     if args.hispec and args.interval < 1:
         raise ValueError("--hispec requires --interval >= 1")
-    args.method = _normalize_method(args.method)
     args.bonus_method = _normalize_bonus_method(args.bonus_method)
 
     configure_reproducibility(seed=args.seed, deterministic=args.deterministic)
