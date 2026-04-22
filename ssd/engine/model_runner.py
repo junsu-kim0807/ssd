@@ -351,6 +351,10 @@ class ModelRunner:
             and getattr(config, "intermediate_hf_config", None) is not None
         )
 
+    def _intermediate_colocated_verify_needs_eager(self) -> bool:
+        """Colocated ``intermediate_model`` has no verify CUDAGraph on this runner; must not use ``graph_vars['verify']``."""
+        return bool(getattr(self, "_hierarchical_intermediate_parallel", False))
+
     def _setup_hierarchical_intermediate_parallel(self, target_config: Config) -> None:
         """Shard intermediate across the same TP ranks / ``tp_pg`` as the target model."""
         im_cfg = make_intermediate_shard_config(target_config)
@@ -374,8 +378,8 @@ class ModelRunner:
         im_kwargs = dict(
             config=im_dec,
             draft=False,
-            speculate=False,
-            spec_k=1,
+            speculate=True,
+            spec_k=target_config.speculate_k,
             async_fan_out=1,
             draft_async=False,
             tp_group=self.tp_pg,
@@ -405,15 +409,12 @@ class ModelRunner:
         max_model_len = self.intermediate_shard_cfg.max_model_len
         num_seqs = min(max_num_batched_tokens // max_model_len, self.intermediate_shard_cfg.max_num_seqs)
         seqs = [Sequence([0] * max_model_len) for _ in range(num_seqs)]
-        eager_was = self.enforce_eager
-        self.enforce_eager = True
         try:
             input_ids, positions = self._prepare_prefill_intermediate(seqs)
             _ = self.run_model(
                 input_ids, positions, True, last_only=True, model=self.intermediate_model
             )
         finally:
-            self.enforce_eager = eager_was
             reset_context()
         torch.cuda.empty_cache()
 
@@ -441,6 +442,7 @@ class ModelRunner:
                 f"blocks={im_cfg.num_kvcache_blocks}",
                 flush=True,
             )
+        print("inside allocate_intermediate_kv_cache -- ", flush=True)
         self.intermediate_kv_cache = torch.zeros(
             2,
             hf_config.num_hidden_layers,
@@ -448,6 +450,10 @@ class ModelRunner:
             self.block_size,
             num_kv_heads,
             hf_config.head_dim,
+        )
+        print(
+            f"allocate_intermediate_kv_cache(): kv_cache shape = {self.intermediate_kv_cache.shape}",
+            flush=True,
         )
         layer_id = 0
         for module in self.intermediate_model.modules():
@@ -755,8 +761,6 @@ class ModelRunner:
         if not self._hierarchical_intermediate_parallel:
             raise RuntimeError("intermediate_run requires hierarchical multi-GPU intermediate setup")
         assert is_prefill, "intermediate_run only supports prefill for hierarchical intermediate"
-        eager_was = self.enforce_eager
-        self.enforce_eager = True
         try:
             input_ids, positions = self._prepare_prefill_intermediate(seqs)
             temperatures = self.prepare_sample(seqs) if self.rank == 0 else None
@@ -764,18 +768,24 @@ class ModelRunner:
                 input_ids, positions, True, last_only=True, model=self.intermediate_model
             )
             token_ids = self.sampler(logits, temperatures).tolist() if self.rank == 0 else None
-            reset_context()
             return token_ids
         finally:
-            self.enforce_eager = eager_was
+            reset_context()
 
     def run_intermediate_verify_suffix(self, seqs: list[Sequence], k: int) -> torch.Tensor:
-        """Single eager forward: extend intermediate KV along ``token_ids[c:c+k+1]`` (sync spec tail)."""
+        """Extend intermediate KV along ``token_ids[c:c+k+1]`` (sync spec tail).
+
+        Standalone ``IntermediateRunner`` respects ``config.enforce_eager`` (verify CUDAGraph
+        when eager is off). TP-colocated ``intermediate_model`` has no verify graph on this
+        runner, so that path forces eager for this forward only.
+        """
         assert getattr(self, "intermediate_mode", False) or getattr(
             self, "_hierarchical_intermediate_parallel", False
         ), "run_intermediate_verify_suffix requires intermediate_mode or TP-colocated intermediate"
+        force_eager = self._intermediate_colocated_verify_needs_eager()
         eager_was = self.enforce_eager
-        self.enforce_eager = True
+        if force_eager:
+            self.enforce_eager = True
         try:
             input_ids, positions, slot_mapping, context_lens, cu_seqlens_q, max_seqlen_q = (
                 prepare_intermediate_verify_suffix_tensors(seqs, self.block_size, k)
@@ -795,7 +805,8 @@ class ModelRunner:
             _m = self.intermediate_model if self._hierarchical_intermediate_parallel else None
             return self.run_model(input_ids, positions, False, last_only=False, model=_m)
         finally:
-            self.enforce_eager = eager_was
+            if force_eager:
+                self.enforce_eager = eager_was
             reset_context()
 
     def prepare_sample(self, seqs: list[Sequence]):
