@@ -25,6 +25,7 @@ from ssd.engine.helpers.runner_helpers import (
     prepare_verify_tensors_varlen,
     prepare_intermediate_verify_suffix_tensors,
 )
+from ssd.engine.intermediate_shard_config import make_intermediate_shard_config
 from ssd.engine.helpers.cudagraph_helpers import (
     run_verify_cudagraph,
     run_decode_cudagraph,
@@ -57,6 +58,10 @@ class ModelRunner:
         assert not (is_draft and is_intermediate), "is_draft and is_intermediate are mutually exclusive"
         self.is_draft = is_draft
         self.intermediate_mode = is_intermediate
+        self.intermediate_model = None
+        self.intermediate_shard_cfg: Config | None = None
+        self.intermediate_kv_cache = None
+        self._hierarchical_intermediate_parallel = False
         if self.is_draft: 
             draft_dtype = getattr(_decoder_cfg(config.draft_hf_config), "torch_dtype", None)
             target_dtype = getattr(_decoder_cfg(config.hf_config), "torch_dtype", None)
@@ -84,8 +89,7 @@ class ModelRunner:
         if self.is_draft:
             should_use_dist = self.config.draft_async
         elif self.intermediate_mode:
-            # Hierarchical intermediate is colocated on target rank 0 only; never init a second
-            # process group even when config.num_gpus matches the target (TP workers are busy).
+            # Standalone ``IntermediateRunner`` (single-GPU hierarchical): no extra TP group.
             should_use_dist = False
         else:
             should_use_dist = self.config.num_gpus > 1
@@ -302,6 +306,8 @@ class ModelRunner:
         if self.verbose:
             print(f'-----ALLOCATING {model_type}KV CACHE----', flush=True)
         self.allocate_kv_cache()
+        if self._should_load_intermediate_on_target_tp(config, is_draft):
+            self._setup_hierarchical_intermediate_parallel(config)
         if init_q is not None:
             # super().__init__() runs warmup and calculates num_kvcache_blocks, pass that up
             init_q.put(self.config.num_kvcache_blocks)
@@ -334,6 +340,140 @@ class ModelRunner:
                 self.graph_bs_list["glue_decode"] = glue_bs_list
 
         return model_type
+
+    @staticmethod
+    def _should_load_intermediate_on_target_tp(config: Config, is_draft: bool) -> bool:
+        return (
+            not is_draft
+            and config.speculate
+            and getattr(config, "spec_policy", "") == "hierarchical"
+            and config.num_gpus > 1
+            and getattr(config, "intermediate_hf_config", None) is not None
+        )
+
+    def _setup_hierarchical_intermediate_parallel(self, target_config: Config) -> None:
+        """Shard intermediate across the same TP ranks / ``tp_pg`` as the target model."""
+        im_cfg = make_intermediate_shard_config(target_config)
+        self.intermediate_shard_cfg = im_cfg
+        im_dec = _decoder_cfg(im_cfg.hf_config)
+        model_type_name = getattr(im_dec, "model_type", getattr(im_cfg.hf_config, "model_type", None))
+        assert model_type_name is not None, "intermediate_hf_config.model_type is required"
+        if target_config.use_eagle:
+            raise NotImplementedError("hierarchical + EAGLE + multi-GPU intermediate is not supported")
+        if model_type_name == "llama":
+            model_class = LlamaForCausalLM
+        elif model_type_name == "qwen3":
+            model_class = Qwen3ForCausalLM
+        elif model_type_name in {"gemma", "gemma2", "gemma3", "gemma4_text"} or getattr(
+            im_cfg.hf_config, "model_type", None
+        ) == "gemma4":
+            model_class = GemmaForCausalLM
+        else:
+            raise ValueError(f"Unsupported intermediate model type: {model_type_name}")
+
+        im_kwargs = dict(
+            config=im_dec,
+            draft=False,
+            speculate=False,
+            spec_k=1,
+            async_fan_out=1,
+            draft_async=False,
+            tp_group=self.tp_pg,
+            tp_size=self.num_tp_gpus,
+        )
+        self.intermediate_model = model_class(**im_kwargs)
+        if self.verbose:
+            print(f"[model_runner] LOADING INTERMEDIATE (TP x{self.num_tp_gpus}) rank={self.rank}", flush=True)
+        load_model(self.intermediate_model, im_cfg.model, target_path=None, target_hidden_size=None)
+        if self.verbose:
+            print(f"[model_runner] INTERMEDIATE LOADED rank={self.rank}", flush=True)
+        self._warmup_intermediate_model()
+        self.allocate_intermediate_kv_cache()
+        self._hierarchical_intermediate_parallel = True
+        if self.verbose:
+            print(
+                f"[model_runner] hierarchical intermediate TP ready "
+                f"(rank={self.rank}, blocks={im_cfg.num_kvcache_blocks})",
+                flush=True,
+            )
+
+    def _warmup_intermediate_model(self) -> None:
+        assert self.intermediate_model is not None and self.intermediate_shard_cfg is not None
+        torch.cuda.empty_cache()
+        torch.cuda.reset_peak_memory_stats()
+        max_num_batched_tokens = self.intermediate_shard_cfg.max_num_batched_tokens
+        max_model_len = self.intermediate_shard_cfg.max_model_len
+        num_seqs = min(max_num_batched_tokens // max_model_len, self.intermediate_shard_cfg.max_num_seqs)
+        seqs = [Sequence([0] * max_model_len) for _ in range(num_seqs)]
+        eager_was = self.enforce_eager
+        self.enforce_eager = True
+        try:
+            input_ids, positions = self._prepare_prefill_intermediate(seqs)
+            _ = self.run_model(
+                input_ids, positions, True, last_only=True, model=self.intermediate_model
+            )
+        finally:
+            self.enforce_eager = eager_was
+            reset_context()
+        torch.cuda.empty_cache()
+
+    def allocate_intermediate_kv_cache(self) -> None:
+        assert self.intermediate_shard_cfg is not None and self.intermediate_model is not None
+        im_cfg = self.intermediate_shard_cfg
+        hf_config = _decoder_cfg(im_cfg.hf_config)
+        free, _ = torch.cuda.mem_get_info()
+        num_kv_heads = hf_config.num_key_value_heads // self.num_tp_gpus
+        block_bytes = (
+            2
+            * hf_config.num_hidden_layers
+            * self.block_size
+            * num_kv_heads
+            * hf_config.head_dim
+            * hf_config.torch_dtype.itemsize
+        )
+        usable_bytes = free * im_cfg.gpu_memory_utilization
+        im_cfg.num_kvcache_blocks = int(usable_bytes) // block_bytes
+        assert im_cfg.num_kvcache_blocks > 0, "intermediate KV cache too big for free memory"
+        if self.verbose:
+            print(
+                f"KV CACHE ALLOCATION for INTERMEDIATE (TP) rank={self.rank} "
+                f"free={free/1e9:.2f}GB util={im_cfg.gpu_memory_utilization:.2f} "
+                f"blocks={im_cfg.num_kvcache_blocks}",
+                flush=True,
+            )
+        self.intermediate_kv_cache = torch.zeros(
+            2,
+            hf_config.num_hidden_layers,
+            im_cfg.num_kvcache_blocks,
+            self.block_size,
+            num_kv_heads,
+            hf_config.head_dim,
+        )
+        layer_id = 0
+        for module in self.intermediate_model.modules():
+            if hasattr(module, "k_cache") and hasattr(module, "v_cache"):
+                module.k_cache = self.intermediate_kv_cache[0, layer_id]
+                module.v_cache = self.intermediate_kv_cache[1, layer_id]
+                layer_id += 1
+
+    def _prepare_prefill_intermediate(self, seqs: list[Sequence]):
+        input_ids, positions, cu_seqlens_q, cu_seqlens_k, max_seqlen_q, max_seqlen_k, slot_mapping = (
+            prepare_prefill_tensors_from_seqs(seqs, self.block_size, self.is_draft, is_intermediate=True)
+        )
+        block_tables = None
+        if cu_seqlens_k[-1] > cu_seqlens_q[-1]:
+            block_tables = prepare_block_tables_from_seqs(seqs, self.is_draft, is_intermediate=True)
+        set_context(
+            is_prefill=True,
+            cu_seqlens_q=cu_seqlens_q,
+            cu_seqlens_k=cu_seqlens_k,
+            max_seqlen_q=max_seqlen_q,
+            max_seqlen_k=max_seqlen_k,
+            slot_mapping=slot_mapping,
+            context_lens=None,
+            block_tables=block_tables,
+        )
+        return input_ids, positions
 
     def exit(self, hard: bool = True):
         # Idempotent
@@ -610,9 +750,30 @@ class ModelRunner:
             self.enforce_eager = eager_was
             reset_context()
 
+    def intermediate_run(self, seqs: list[Sequence], is_prefill: bool):
+        """Hierarchical intermediate prefill when intermediate shards use the same TP group as target."""
+        if not self._hierarchical_intermediate_parallel:
+            raise RuntimeError("intermediate_run requires hierarchical multi-GPU intermediate setup")
+        assert is_prefill, "intermediate_run only supports prefill for hierarchical intermediate"
+        eager_was = self.enforce_eager
+        self.enforce_eager = True
+        try:
+            input_ids, positions = self._prepare_prefill_intermediate(seqs)
+            temperatures = self.prepare_sample(seqs) if self.rank == 0 else None
+            logits = self.run_model(
+                input_ids, positions, True, last_only=True, model=self.intermediate_model
+            )
+            token_ids = self.sampler(logits, temperatures).tolist() if self.rank == 0 else None
+            reset_context()
+            return token_ids
+        finally:
+            self.enforce_eager = eager_was
+
     def run_intermediate_verify_suffix(self, seqs: list[Sequence], k: int) -> torch.Tensor:
         """Single eager forward: extend intermediate KV along ``token_ids[c:c+k+1]`` (sync spec tail)."""
-        assert getattr(self, "intermediate_mode", False), "run_intermediate_verify_suffix requires intermediate_mode"
+        assert getattr(self, "intermediate_mode", False) or getattr(
+            self, "_hierarchical_intermediate_parallel", False
+        ), "run_intermediate_verify_suffix requires intermediate_mode or TP-colocated intermediate"
         eager_was = self.enforce_eager
         self.enforce_eager = True
         try:
@@ -631,7 +792,8 @@ class ModelRunner:
                 context_lens=context_lens,
                 block_tables=block_tables,
             )
-            return self.run_model(input_ids, positions, False, last_only=False)
+            _m = self.intermediate_model if self._hierarchical_intermediate_parallel else None
+            return self.run_model(input_ids, positions, False, last_only=False, model=_m)
         finally:
             self.enforce_eager = eager_was
             reset_context()
@@ -689,10 +851,27 @@ class ModelRunner:
         )
 
     @torch.inference_mode()
-    def run_model(self, input_ids: torch.Tensor, positions: torch.Tensor, is_prefill: bool, last_only: bool = True, tree_decode_step: int = -1, cache_hits: torch.Tensor | None = None, hidden_states: torch.Tensor | None = None):
+    def run_model(
+        self,
+        input_ids: torch.Tensor,
+        positions: torch.Tensor,
+        is_prefill: bool,
+        last_only: bool = True,
+        tree_decode_step: int = -1,
+        cache_hits: torch.Tensor | None = None,
+        hidden_states: torch.Tensor | None = None,
+        model=None,
+    ):
+        m = model if model is not None else self.model
+        is_inter_m = (
+            model is not None
+            and self.intermediate_model is not None
+            and m is self.intermediate_model
+        )
         is_tree_decode = self.is_draft and self.config.draft_async and tree_decode_step >= 0
-        is_mq_kp1 = self.config.speculate and not last_only
-        spec_and_dec = not is_prefill and self.config.speculate
+        spec_eff = self.intermediate_shard_cfg.speculate if is_inter_m else self.config.speculate
+        is_mq_kp1 = spec_eff and not last_only
+        spec_and_dec = not is_prefill and spec_eff
 
         assert not (is_prefill and not last_only), "ERROR in run_model: is_prefill and not last_only"
         
@@ -700,7 +879,7 @@ class ModelRunner:
             if is_tree_decode:
                 self.eager_tree_decode_plan(input_ids, positions, tree_decode_step, cache_hits)
             
-            if self.config.use_eagle: 
+            if self.config.use_eagle and not is_inter_m: 
                 if self.is_draft:
                     assert hidden_states is not None, "hidden_states required for EAGLE draft"
                     assert isinstance(self.model, Eagle3DraftForCausalLM)
@@ -712,8 +891,8 @@ class ModelRunner:
                     logits = self.model.compute_logits(outputs, last_only)
                     return logits, eagle_acts  # return eagle_acts as conditioning vector for draft
             else: 
-                outputs = self.model(input_ids, positions)
-                logits = self.model.compute_logits(outputs, last_only)
+                outputs = m(input_ids, positions)
+                logits = m.compute_logits(outputs, last_only)
                 return logits 
 
         elif is_tree_decode:

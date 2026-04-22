@@ -122,8 +122,13 @@ class LLMEngine:
         self.intermediate_runner = None
         self.intermediate_cfg = None
         if config.speculate and config.spec_policy == "hierarchical":
-            self.intermediate_runner = IntermediateRunner(config)
-            self.intermediate_cfg = self.intermediate_runner.config
+            if getattr(self.model_runner, "_hierarchical_intermediate_parallel", False):
+                # Intermediate shards share target TP workers and ``tp_pg`` (see ModelRunner).
+                self.intermediate_runner = self.model_runner
+                self.intermediate_cfg = self.model_runner.intermediate_shard_cfg
+            else:
+                self.intermediate_runner = IntermediateRunner(config)
+                self.intermediate_cfg = self.intermediate_runner.config
 
         self.tokenizer = load_auto_tokenizer(
             config.model,

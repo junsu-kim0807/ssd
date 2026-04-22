@@ -4,7 +4,11 @@ Generate Slurm job scripts that run ``bench/bench.py`` with profiling output pat
 
 Layout for ``--profiler_output_dir`` when ``bench.py`` is run with ``--profile`` (relative to the bench cwd)::
 
-    ./results/<profile_mode>/<method>/<batch_size>/k<k|na>/<target>+<draft>/<temp_tag>/
+    ./results/<profile_mode>/<method>/b<batch>/k<k|na>/<target>+<draft>/<temp_tag>[/dataset_slug]/
+
+When **both** ``--batch`` and ``--length`` are set (multids mode), profiler output uses ``.../b<b>/k.../t0/<dataset>/``.
+By default, **one Slurm script per dataset** (job name ``<dataset>_<family>_<method>_b<b>_<kpath>_<temp_tag>``).
+With ``--all``, a **single** Slurm script runs all profile datasets in a ``for`` loop (previous combined behaviour).
 
 Sweep flags (optional, Cartesian product with other dimensions):
   --batch   → batch sizes 1, 4, 16, 64, 256
@@ -25,6 +29,7 @@ import argparse
 import os
 import re
 import shlex
+import sys
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable, Iterable, Sequence
@@ -64,6 +69,15 @@ FIXED_NUMSEQS = 512
 FIXED_OUTPUT_LEN = 2048
 
 PROFILE_MODE_CHOICES = ("cost", "metadata", "cost_metadata")
+
+# When --batch and --length are both passed: one job script runs these bench datasets in order.
+MULTI_DATASET_PROFILE_SLUGS: tuple[str, ...] = (
+    "alpaca",
+    "humaneval",
+    "gsm8k",
+    "math500",
+    "codeelo",
+)
 
 MODEL_PRESETS: dict[str, tuple[str, str, str]] = {
     # family -> (bench flag name, target hub id, draft hub id)
@@ -195,28 +209,28 @@ METHOD_REGISTRY: dict[str, BenchMethodSpec] = {
         id="sync",
         description="Synchronous speculative decoding",
         uses_spec_k=True,
-        default_k=6,
+        default_k=3,
         extra_bench_args=_args_sync,
     ),
     "async": BenchMethodSpec(
         id="async",
         description="Async speculative decoding (SSD)",
         uses_spec_k=True,
-        default_k=7,
+        default_k=3,
         extra_bench_args=_args_async,
     ),
     "hierarchical": BenchMethodSpec(
         id="hierarchical",
         description="Sync spec with hierarchical verification (intermediate + target rounds)",
         uses_spec_k=True,
-        default_k=6,
+        default_k=3,
         extra_bench_args=_args_hierarchical,
     ),
     "pivot": BenchMethodSpec(
         id="pivot",
         description="Async spec with pivot policy (--spec_policy pivot --spec_hive)",
         uses_spec_k=True,
-        default_k=7,
+        default_k=3,
         extra_bench_args=_args_pivot,
     ),
 }
@@ -257,6 +271,7 @@ def dataset_bench_flags(dataset: str) -> list[str]:
         "alpaca": ["--alpaca"],
         "c4": ["--c4"],
         "gsm": [],
+        "gsm8k": [],  # alias for GSM-style default (no extra dataset flag)
         "ultrafeedback": ["--ultrafeedback"],
         "aime2025": ["--aime2025"],
         "livecodebench": ["--livecodebench"],
@@ -279,17 +294,21 @@ def profiler_rel_dir(
     k_path_token: str,
     pair_slug: str,
     temp: float,
+    dataset_slug: str | None = None,
 ) -> str:
     """Path relative to bench cwd (``profile_mode``: cost | metadata | cost_metadata)."""
-    return os.path.join(
+    parts = [
         "results",
         profile_mode,
         method_id,
-        str(batch_size),
+        f"b{int(batch_size)}",
         k_path_token,
         pair_slug,
         temp_path_tag(temp),
-    )
+    ]
+    if dataset_slug:
+        parts.append(sanitize_path_component(dataset_slug))
+    return os.path.join(*parts)
 
 
 def build_bench_argv(
@@ -383,6 +402,82 @@ def format_multiline_cmd(argv: Sequence[str]) -> str:
     return "\n".join(lines)
 
 
+def profiler_mkdirs_block_for_datasets(
+    *,
+    profile_mode: str,
+    method_id: str,
+    batch_size: int,
+    k_path_token: str,
+    pair_slug: str,
+    temp: float,
+    dataset_slugs: Sequence[str],
+) -> str:
+    lines: list[str] = []
+    for ds in dataset_slugs:
+        rel = profiler_rel_dir(
+            profile_mode=profile_mode,
+            method_id=method_id,
+            batch_size=batch_size,
+            k_path_token=k_path_token,
+            pair_slug=pair_slug,
+            temp=temp,
+            dataset_slug=ds,
+        ).replace(os.sep, "/")
+        lines.append(f'mkdir -p "${{BENCH_DIR}}/{rel}"')
+    return ("\n".join(lines) + "\n") if lines else ""
+
+
+def build_multi_dataset_profile_loop_sh(
+    *,
+    model_flag: str,
+    method: BenchMethodSpec,
+    k_bench: int,
+    async_fan_out: int,
+    batch_size: int,
+    temp: float,
+    numseqs: int,
+    output_len: int,
+    gpus: int,
+    profile_mode: str,
+    profiler_base_rel: str,
+    extra_bench_args: Sequence[str],
+) -> str:
+    """Bash loop: ``--profiler_output_dir`` = ``$PROFILE_BASE/$dataset`` (``dataset`` in MULTI_DATASET_PROFILE_SLUGS)."""
+    prof_base_q = shell_quote_single("./" + profiler_base_rel.replace(os.sep, "/"))
+    body_lines: list[str] = [
+        f"PROFILE_BASE={prof_base_q}",
+        "for dataset in " + " ".join(MULTI_DATASET_PROFILE_SLUGS) + "; do",
+        '  echo "==== bench profile dataset=${dataset} ===="',
+        "  case \"${dataset}\" in",
+        "    alpaca) EXTRA_DS=(--alpaca);;",
+        "    humaneval) EXTRA_DS=(--humaneval);;",
+        "    gsm8k) EXTRA_DS=();;",
+        "    math500) EXTRA_DS=(--math500);;",
+        "    codeelo) EXTRA_DS=(--codeelo);;",
+        '    *) echo "unknown dataset: ${dataset}" >&2; exit 1;;',
+        "  esac",
+        "  python -O bench.py \\",
+        f"    --{model_flag} \\",
+        f"    --gpus {int(gpus)} \\",
+        f"    --b {int(batch_size)} \\",
+        f"    --temp {float(temp)} \\",
+        f"    --numseqs {int(numseqs)} \\",
+        f"    --output_len {int(output_len)} \\",
+        '    "${EXTRA_DS[@]}" \\',
+    ]
+    for tok in method.extra_bench_args(k_bench, async_fan_out):
+        body_lines.append(f"    {shlex.quote(str(tok))} \\")
+    for tok in extra_bench_args:
+        body_lines.append(f"    {shlex.quote(str(tok))} \\")
+    body_lines += [
+        "    --profile \\",
+        f"    --profile_mode {shlex.quote(profile_mode)} \\",
+        '    --profiler_output_dir "${PROFILE_BASE}/${dataset}"',
+        "done",
+    ]
+    return "\n".join(body_lines)
+
+
 def make_slurm_script(
     *,
     job_name: str,
@@ -399,6 +494,9 @@ def make_slurm_script(
     bench_rel: str,
     bench_argv: Sequence[str],
     hf_home_fallback: str,
+    optional_env_before_bench: str = "",
+    custom_bench_body: str | None = None,
+    mkdir_block_override: str | None = None,
 ) -> str:
     out_path.parent.mkdir(parents=True, exist_ok=True)
     err_path.parent.mkdir(parents=True, exist_ok=True)
@@ -407,10 +505,15 @@ def make_slurm_script(
         if tok == "--profiler_output_dir" and i + 1 < len(bench_argv):
             prof_dir_token = bench_argv[i + 1]
             break
-    mkdir_block = ""
-    if prof_dir_token:
-        _rel = prof_dir_token.lstrip("./").lstrip("/")
-        mkdir_block = f'mkdir -p "${{BENCH_DIR}}/{_rel}"\n'
+    if mkdir_block_override is not None:
+        mkdir_block = mkdir_block_override
+    else:
+        mkdir_block = ""
+        if prof_dir_token:
+            _rel = prof_dir_token.lstrip("./").lstrip("/")
+            mkdir_block = f'mkdir -p "${{BENCH_DIR}}/{_rel}"\n'
+
+    bench_invocation = custom_bench_body if custom_bench_body is not None else format_multiline_cmd(bench_argv)
 
     return f"""#!/bin/bash
 #SBATCH --job-name={job_name}
@@ -458,9 +561,9 @@ export HUGGINGFACE_HUB_CACHE="${{HUGGINGFACE_HUB_CACHE:-${{HF_HOME}}/hub}}"
 export TRANSFORMERS_CACHE="${{TRANSFORMERS_CACHE:-${{HUGGINGFACE_HUB_CACHE}}}}"
 export HF_DATASETS_CACHE="${{HF_DATASETS_CACHE:-${{HF_HOME}}/datasets}}"
 
-cd "${{BENCH_DIR}}"
+{optional_env_before_bench}cd "${{BENCH_DIR}}"
 {mkdir_block}
-{format_multiline_cmd(bench_argv)}
+{bench_invocation}
 """
 
 
@@ -527,15 +630,27 @@ def main() -> None:
     p.add_argument(
         "--dataset",
         type=str,
-        default="humaneval",
+        default="alpaca",
         help="humaneval|alpaca|c4|gsm|ultrafeedback|aime2025|livecodebench|codeelo|math500|govreport|random|all",
     )
 
-    p.add_argument("--batch", action="store_true", help=f"Sweep batch sizes {BATCH_SWEEP}")
+    p.add_argument(
+        "--batch",
+        action="store_true",
+        help=f"Sweep batch sizes {BATCH_SWEEP}. With --length: multids mode (per-dataset Slurm scripts by default; "
+        f"--all for one script looping datasets). Profiler dirs …/t0/<dataset>/.",
+    )
     p.add_argument(
         "--length",
         action="store_true",
-        help=f"Sweep speculative k {K_SWEEP} (methods with uses_spec_k: sync, async, hierarchical, pivot)",
+        help=f"Sweep speculative k {K_SWEEP} (methods with uses_spec_k). With --batch: multids scripts as above.",
+    )
+    p.add_argument(
+        "--all",
+        action="store_true",
+        dest="multids_all_in_one",
+        help="With --batch and --length: emit one Slurm script that loops all multids datasets. "
+        "Default (omit --all): one Slurm script per dataset.",
     )
     p.add_argument("--temp", action="store_true", help=f"Sweep temperatures {TEMP_SWEEP}")
 
@@ -566,6 +681,21 @@ def main() -> None:
 
     model_families = normalize_model_families(args.models)
     methods = normalize_methods(args.methods)
+    multi_dataset_sweep = bool(args.batch and args.length)
+    if multi_dataset_sweep:
+        if args.multids_all_in_one:
+            print(
+                "multids + --all: one Slurm script per sweep cell runs "
+                f"{', '.join(MULTI_DATASET_PROFILE_SLUGS)} in a loop; --dataset ignored.",
+                file=sys.stderr,
+            )
+        else:
+            print(
+                "multids (default): one Slurm script per dataset "
+                f"({', '.join(MULTI_DATASET_PROFILE_SLUGS)}); use --all for a single loop script. "
+                "--dataset ignored.",
+                file=sys.stderr,
+            )
     dataset_flags = dataset_bench_flags(args.dataset)
 
     batch_sizes = (
@@ -602,15 +732,16 @@ def main() -> None:
         k_path = "kna" if not spec.uses_spec_k else f"k{int(k_val)}"
         k_for_bench = int(spec.default_k) if not spec.uses_spec_k else int(k_val)
 
-        prof_rel = profiler_rel_dir(
+        prof_base_rel = profiler_rel_dir(
             profile_mode=args.profile_mode,
             method_id=spec.id,
             batch_size=b_val,
             k_path_token=k_path,
             pair_slug=pair_slug,
             temp=temp_val,
+            dataset_slug=None,
         )
-        prof_rel = "./" + prof_rel.replace(os.sep, "/")
+        prof_rel = "./" + prof_base_rel.replace(os.sep, "/")
 
         gpu_n = gpus_global if gpus_global is not None else DEFAULT_GPU_BY_FAMILY_METHOD[(fam, spec.id)]
 
@@ -631,9 +762,10 @@ def main() -> None:
         )
 
         temp_tag = temp_path_tag(temp_val)
-        job_name = f"bench_{fam}_{spec.id}_b{b_val}_{k_path}_{temp_tag}"[:64]
 
         rel_bits = Path(args.profile_mode) / fam / spec.id / f"b{b_val}" / k_path / pair_slug / temp_tag
+        if multi_dataset_sweep:
+            rel_bits = rel_bits / "multids_batch_length"
         job_dir = job_root / rel_bits
         out_log_dir = out_log_root / rel_bits
         err_log_dir = err_log_root / rel_bits
@@ -642,29 +774,141 @@ def main() -> None:
             ensure_dir(out_log_dir)
             ensure_dir(err_log_dir)
 
-        script_path = job_dir / f"{job_name}.sh"
-        text = make_slurm_script(
-            job_name=job_name,
-            account=args.account,
-            qos=args.qos,
-            gres=args.gres,
-            mem_per_gpu=args.mem_per_gpu,
-            time_limit=args.time_limit,
-            cpus_per_task=int(args.cpus_per_task),
-            out_path=out_log_dir / f"{job_name}.out",
-            err_path=err_log_dir / f"{job_name}.err",
-            repo_dir=repo_dir,
-            venv_dir=venv_dir,
-            bench_rel=args.bench_subdir,
-            bench_argv=bench_argv,
-            hf_home_fallback=str(args.hf_home_fallback),
-        )
-        if args.dry_run:
-            print(f"would write: {script_path}")
+        optional_env = ""
+        if spec.id == "hierarchical":
+            optional_env = (
+                'export PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}"\n'
+            )
+
+        if multi_dataset_sweep and args.multids_all_in_one:
+            job_name = f"bench_{fam}_{spec.id}_b{b_val}_{k_path}_{temp_tag}_multids_bl"[:64]
+            script_path = job_dir / f"{job_name}.sh"
+            mkdir_ov = profiler_mkdirs_block_for_datasets(
+                profile_mode=args.profile_mode,
+                method_id=spec.id,
+                batch_size=b_val,
+                k_path_token=k_path,
+                pair_slug=pair_slug,
+                temp=temp_val,
+                dataset_slugs=MULTI_DATASET_PROFILE_SLUGS,
+            )
+            custom_body = build_multi_dataset_profile_loop_sh(
+                model_flag=flag_name,
+                method=spec,
+                k_bench=k_for_bench,
+                async_fan_out=int(args.async_fan_out),
+                batch_size=b_val,
+                temp=float(temp_val),
+                numseqs=int(args.numseqs),
+                output_len=int(args.output_len),
+                gpus=gpu_n,
+                profile_mode=args.profile_mode,
+                profiler_base_rel=prof_base_rel,
+                extra_bench_args=tuple(args.extra_bench_arg),
+            )
+            text = make_slurm_script(
+                job_name=job_name,
+                account=args.account,
+                qos=args.qos,
+                gres=args.gres,
+                mem_per_gpu=args.mem_per_gpu,
+                time_limit=args.time_limit,
+                cpus_per_task=int(args.cpus_per_task),
+                out_path=out_log_dir / f"{job_name}.out",
+                err_path=err_log_dir / f"{job_name}.err",
+                repo_dir=repo_dir,
+                venv_dir=venv_dir,
+                bench_rel=args.bench_subdir,
+                bench_argv=bench_argv,
+                hf_home_fallback=str(args.hf_home_fallback),
+                optional_env_before_bench=optional_env,
+                custom_bench_body=custom_body,
+                mkdir_block_override=mkdir_ov,
+            )
+            if args.dry_run:
+                print(f"would write: {script_path}")
+            else:
+                script_path.write_text(text, encoding="utf-8")
+                os.chmod(script_path, 0o755)
+            n_written += 1
+        elif multi_dataset_sweep:
+            for ds in MULTI_DATASET_PROFILE_SLUGS:
+                ds_flags = dataset_bench_flags(ds)
+                prof_rel_ds = "./" + profiler_rel_dir(
+                    profile_mode=args.profile_mode,
+                    method_id=spec.id,
+                    batch_size=b_val,
+                    k_path_token=k_path,
+                    pair_slug=pair_slug,
+                    temp=temp_val,
+                    dataset_slug=ds,
+                ).replace(os.sep, "/")
+                job_name = f"{ds}_{fam}_{spec.id}_b{b_val}_{k_path}_{temp_tag}"[:64]
+                script_path = job_dir / f"{job_name}.sh"
+                bench_argv_ds = build_bench_argv(
+                    model_flag=flag_name,
+                    dataset_flags=ds_flags,
+                    method=spec,
+                    k=k_for_bench,
+                    async_fan_out=int(args.async_fan_out),
+                    batch_size=b_val,
+                    temp=float(temp_val),
+                    numseqs=int(args.numseqs),
+                    output_len=int(args.output_len),
+                    gpus=gpu_n,
+                    profile_mode=args.profile_mode,
+                    profiler_output_dir=prof_rel_ds,
+                    extra_bench_args=tuple(args.extra_bench_arg),
+                )
+                text = make_slurm_script(
+                    job_name=job_name,
+                    account=args.account,
+                    qos=args.qos,
+                    gres=args.gres,
+                    mem_per_gpu=args.mem_per_gpu,
+                    time_limit=args.time_limit,
+                    cpus_per_task=int(args.cpus_per_task),
+                    out_path=out_log_dir / f"{job_name}.out",
+                    err_path=err_log_dir / f"{job_name}.err",
+                    repo_dir=repo_dir,
+                    venv_dir=venv_dir,
+                    bench_rel=args.bench_subdir,
+                    bench_argv=bench_argv_ds,
+                    hf_home_fallback=str(args.hf_home_fallback),
+                    optional_env_before_bench=optional_env,
+                )
+                if args.dry_run:
+                    print(f"would write: {script_path}")
+                else:
+                    script_path.write_text(text, encoding="utf-8")
+                    os.chmod(script_path, 0o755)
+                n_written += 1
         else:
-            script_path.write_text(text, encoding="utf-8")
-            os.chmod(script_path, 0o755)
-        n_written += 1
+            job_name = f"bench_{fam}_{spec.id}_b{b_val}_{k_path}_{temp_tag}"[:64]
+            script_path = job_dir / f"{job_name}.sh"
+            text = make_slurm_script(
+                job_name=job_name,
+                account=args.account,
+                qos=args.qos,
+                gres=args.gres,
+                mem_per_gpu=args.mem_per_gpu,
+                time_limit=args.time_limit,
+                cpus_per_task=int(args.cpus_per_task),
+                out_path=out_log_dir / f"{job_name}.out",
+                err_path=err_log_dir / f"{job_name}.err",
+                repo_dir=repo_dir,
+                venv_dir=venv_dir,
+                bench_rel=args.bench_subdir,
+                bench_argv=bench_argv,
+                hf_home_fallback=str(args.hf_home_fallback),
+                optional_env_before_bench=optional_env,
+            )
+            if args.dry_run:
+                print(f"would write: {script_path}")
+            else:
+                script_path.write_text(text, encoding="utf-8")
+                os.chmod(script_path, 0o755)
+            n_written += 1
 
     print(f"Generated {n_written} job script(s) under {job_root}")
 

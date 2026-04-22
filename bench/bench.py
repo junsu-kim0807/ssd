@@ -1,5 +1,8 @@
 import os
 import ssd.paths  # noqa: F401 — sets TORCH_CUDA_ARCH_LIST before flashinfer import
+
+# Default target KV fraction when bench enables hierarchical spec without --gpu-memory-utilization.
+_HIERARCHICAL_DEFAULT_GPU_MEMORY_UTILIZATION = 0.55
 import sys
 import time
 import argparse
@@ -96,6 +99,15 @@ def parse_arguments():
     parser.add_argument("--block_sz", type=int, default=256, help="KV cache block size (see config.py: kvcache_block_size)")
     parser.add_argument("--b", type=int, default=1, help="Maximum number of sequences in batch")
     parser.add_argument("--max_model_len", type=int, default=8192, help="Maximum model length")
+    parser.add_argument(
+        "--gpu-memory-utilization",
+        type=float,
+        default=None,
+        dest="gpu_memory_utilization",
+        help="Target KV sizing: fraction of free VRAM per GPU in ModelRunner.allocate_kv_cache. "
+        "When omitted and --spec with --spec_policy hierarchical: defaults to 0.55 (rank 0 colocates "
+        "draft + intermediate). Otherwise the engine default (0.7) applies.",
+    )
 
     # Generation configuration
     parser.add_argument("--input_len", type=int, default=128, help="Maximum input length")
@@ -395,6 +407,7 @@ def initialize_wandb(args, run_name):
             "interval": args.interval,
             "threshold": args.threshold,
             "expansion_pct": args.expansion_pct,
+            "gpu_memory_utilization_arg": getattr(args, "gpu_memory_utilization", None),
         }
     )
 
@@ -437,6 +450,14 @@ def create_llm_kwargs(args, draft_path):
     inter = resolve_intermediate_model_path(args, HF_CACHE_DIR)
     if inter:
         llm_kwargs["intermediate"] = inter
+
+    _gmu = getattr(args, "gpu_memory_utilization", None)
+    if _gmu is not None:
+        llm_kwargs["gpu_memory_utilization"] = float(_gmu)
+    elif args.spec and args.spec_policy == "hierarchical":
+        # Sync hierarchical: GPU 0 holds target TP shard 0, DraftRunner, and IntermediateRunner; a high
+        # default (0.7) often leaves too little VRAM for intermediate KV after target KV allocation.
+        llm_kwargs["gpu_memory_utilization"] = _HIERARCHICAL_DEFAULT_GPU_MEMORY_UTILIZATION
 
     return llm_kwargs
 

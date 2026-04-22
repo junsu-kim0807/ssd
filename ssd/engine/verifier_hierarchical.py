@@ -12,7 +12,6 @@ from ssd.engine.helpers.speculate_types import (
     VerifierBase,
     VerifyProfileTrace,
 )
-from ssd.engine.intermediate_runner import IntermediateRunner
 from ssd.engine.model_runner import ModelRunner
 from ssd.engine.sequence import Sequence
 from ssd.utils.verify import verify_greedy_chain_variable
@@ -26,7 +25,7 @@ class VerifierHierarchical(VerifierBase):
         lookahead: int,
         device: torch.device,
         target_model_runner: ModelRunner,
-        intermediate_runner: IntermediateRunner,
+        intermediate_runner: ModelRunner,
         target_verify_interval: int,
         sampler_x: float | None = None,
         async_fan_out: int | None = None,
@@ -59,7 +58,7 @@ class VerifierHierarchical(VerifierBase):
             seq.hv_provisional_token_ids.clear()
             seq.hv_provisional_recovery_token_id = None
             seq.hv_num_provisional_tokens = 0
-        self.intermediate_runner.call("run", seqs, True)
+        self.intermediate_runner.call("intermediate_run", seqs, True)
         for seq in seqs:
             seq.num_inter_cached_tokens = seq.num_prompt_tokens
         return VerifyResult([], [seq.recovery_token_id for seq in seqs], None, is_hv_intermediate=False)
