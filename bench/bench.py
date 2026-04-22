@@ -96,9 +96,9 @@ def parse_arguments():
         default=None,
         metavar="R",
         dest="target_verify_interval",
-        help="Hierarchical spec only (--spec --spec_policy hierarchical): verification depth r (>=2). "
-        "Rounds 0..r-2 verify with the intermediate model; round r-1 verifies with the target. "
-        "Sets Config.target_verify_interval (default when omitted: 2).",
+        help="Hierarchical spec only (--spec --spec_policy hierarchical): index r (>=1). "
+        "Intermediate verify while hv_round_idx < r; target verify when hv_round_idx == r. "
+        "Sets Config.target_verify_interval (default when omitted: from config, typically 1).",
     )
     parser.add_argument("--threshold", type=float, default=0.8,
                         help="Pivot confidence threshold")
@@ -279,8 +279,8 @@ def parse_arguments():
     if getattr(args, "target_verify_interval", None) is not None:
         if not args.spec or args.spec_policy != "hierarchical":
             parser.error("--round requires --spec and --spec_policy hierarchical")
-        if int(args.target_verify_interval) < 2:
-            parser.error("--round must be >= 2 (at least one intermediate verify round before target)")
+        if int(args.target_verify_interval) < 1:
+            parser.error("--round must be >= 1")
 
     return args
 

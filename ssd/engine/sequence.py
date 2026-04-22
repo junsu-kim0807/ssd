@@ -54,7 +54,7 @@ class Sequence:
         self.extend_token_ids = None
         self.extend_count = 0
 
-        # HV: round 0..r-2 => intermediate, r-1 => target (see Scheduler / VerifierHierarchical)
+        # HV: ``hv_round_idx < r`` => intermediate, ``hv_round_idx == r`` => target (see VerifierHierarchical)
         self.hv_round_idx = 0
         self.hv_provisional_token_ids: list[int] = []
         self.hv_provisional_recovery_token_id: int | None = None

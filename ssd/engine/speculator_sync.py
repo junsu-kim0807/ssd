@@ -40,7 +40,12 @@ class SpeculatorSync(SpeculatorBase):
             if seq.recovery_token_id is None:
                 raise ValueError(f"recovery_token_id is None for seq {i}")
             recovery_tokens.append(seq.recovery_token_id)
-            seq.append_token(seq.recovery_token_id)
+            # HV: intermediate recovery is already the last provisional token; do not duplicate
+            # it on ``token_ids`` before the first draft forward (prepare_decode uses prov[-1]).
+            prov = seq.hv_provisional_token_ids
+            skip_append = len(prov) > 0 and prov[-1] == seq.recovery_token_id
+            if not skip_append:
+                seq.append_token(seq.recovery_token_id)
         speculations[:, 0] = torch.tensor(
             recovery_tokens, dtype=torch.int64, device=self.device)
 

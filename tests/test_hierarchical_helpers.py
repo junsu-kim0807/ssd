@@ -43,4 +43,4 @@ def test_verify_greedy_chain_variable_partial():
 
 def test_hv_lookahead_formula_matches_plan():
     K, r = 4, 3
-    assert (K + 1) * r + K + 1 == 20
+    assert (r + 1) * (K + 1) == 20

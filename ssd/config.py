@@ -53,7 +53,7 @@ class Config:
     # hierarchical verification (sync spec, single verify per step)
     intermediate: str = ""  # HF model dir; empty => use same path as draft
     intermediate_hf_config: AutoConfig | None = None
-    target_verify_interval: int = 2  # r: rounds 0..r-2 intermediate, r-1 target (0-indexed)
+    target_verify_interval: int = 1  # r: hv_round_idx 0..r-1 intermediate; hv_round_idx == r => target verify
 
     # eagle3
     use_eagle: bool = False 
@@ -116,8 +116,8 @@ class Config:
             if self.spec_policy == "hierarchical":
                 assert not self.draft_async, "hierarchical policy requires draft_async=False (sync spec)"
                 assert not self.use_eagle, "hierarchical policy does not support EAGLE yet"
-                if self.target_verify_interval < 2:
-                    raise ValueError("target_verify_interval must be >= 2 for hierarchical (need >=1 intermediate round)")
+                if self.target_verify_interval < 1:
+                    raise ValueError("target_verify_interval must be >= 1 for hierarchical")
                 im = self.intermediate or self.draft
                 self.intermediate_hf_config = AutoConfig.from_pretrained(im, trust_remote_code=True)
                 self.max_model_len = min(

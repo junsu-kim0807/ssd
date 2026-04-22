@@ -6,7 +6,7 @@ Layout for ``--profiler_output_dir`` when ``bench.py`` is run with ``--profile``
 
     ./results/<profile_mode>/<method>/b<batch>/k<k|na>/<target>+<draft>/<temp_tag>[/r<R>/][<dataset_slug>/]
 
-For ``--spec_policy hierarchical``, ``r<R>`` is always present (``R`` = ``bench.py --round`` / ``target_verify_interval``, default 2). Job scripts and Slurm logs use the same ``.../<temp_tag>/r<R>/`` segment under ``--job-root`` / log roots.
+For ``--spec_policy hierarchical``, ``r<R>`` is always present (``R`` = ``bench.py --round`` / ``target_verify_interval``, default 1). Job scripts and Slurm logs use the same ``.../<temp_tag>/r<R>/`` segment under ``--job-root`` / log roots.
 
 ``--batch`` and ``--length`` are independent sweep dimensions (batch sizes vs speculative ``k``).
 
@@ -714,10 +714,10 @@ def main() -> None:
 
     if str(args.hv_rounds).strip():
         hv_rounds_parsed = parse_csv_ints(args.hv_rounds)
-        if any(r < 2 for r in hv_rounds_parsed):
-            p.error("--hv-rounds values must be >= 2")
+        if any(r < 1 for r in hv_rounds_parsed):
+            p.error("--hv-rounds values must be >= 1")
     else:
-        hv_rounds_parsed = (2,)
+        hv_rounds_parsed = (1,)
 
     model_families = normalize_model_families(args.models)
     methods = normalize_methods(args.methods)

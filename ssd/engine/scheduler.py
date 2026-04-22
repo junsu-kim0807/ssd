@@ -66,7 +66,8 @@ class Scheduler:
         """Worst-case length of one target HV verify pass (see VerifierHierarchical._build_target_candidates)."""
         r = self.config.target_verify_interval
         K = self.K
-        return r * K + 2
+        # ``r`` intermediate rounds (hv 0..r-1), each up to K+1 provisional tokens, then one spec row.
+        return (r + 1) * (K + 1)
 
     def hv_seq_lookahead_budget(self, seq: Sequence) -> int:
         """Per-sequence decode lookahead: depends on HV round and provisional depth."""
@@ -74,16 +75,15 @@ class Scheduler:
         K = self.K
         p = seq.hv_num_provisional_tokens
         u = seq.hv_round_idx
-        steps_left = max(0, r - u)
+        # Target verify when ``u == r``; include current step in remaining draft depth.
+        steps_left = max(0, r - u + 1)
         return (K + 1) * steps_left + (p + K + 1)
 
     def hv_target_round_lookahead(self, _seq: Sequence) -> int:
         """Target BlockManager headroom for the target HV round, reserved from round 0 onward.
 
-        Must cover the worst-case one-shot verify candidate on committed KV:
-        optional ``hv_provisional_recovery_token_id`` (1) + at most ``(r-1)*K`` provisional
-        tokens + a full speculate row ``(K+1)`` → ``r*K + 2``. Using the current-round
-        ``pr + p + (K+1)`` under-reserves early in the cycle while ``p`` is still small.
+        Must cover the worst-case one-shot verify candidate on committed KV: at most
+        ``r * (K+1)`` provisional tokens (``r`` intermediate rounds) + one speculate row.
         """
         return self.hv_target_lookahead_upper()
 
@@ -446,12 +446,15 @@ class Scheduler:
             # before body). Dropping suffix[0] loses the first accepted token for target verify
             # and undercounts ``hv_num_provisional_tokens`` / draft logical depth.
             seq.hv_provisional_token_ids.extend(suffix)
+            # Intermediate recovery belongs at the end of the provisional tape (distinct from
+            # ``recovery_token_id`` used for sync-spec draft column 0 / target bookkeeping).
+            seq.hv_provisional_token_ids.append(rec)
             seq.hv_num_provisional_tokens = len(seq.hv_provisional_token_ids)
-            seq.hv_provisional_recovery_token_id = rec
+            seq.hv_provisional_recovery_token_id = None
             seq.recovery_token_id = rec
             seq.intermediate_last_spec_step_accepted_len = len(suffix)
             if not seq.ignore_eos and self.eos in suffix:
-                seq.hv_round_idx = r - 1
+                seq.hv_round_idx = r
             else:
                 seq.hv_round_idx += 1
             seq.num_draft_cached_tokens = len(seq) - 1 + seq.hv_num_provisional_tokens

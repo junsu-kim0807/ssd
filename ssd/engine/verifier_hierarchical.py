@@ -44,10 +44,11 @@ class VerifierHierarchical(VerifierBase):
         self.tokenizer = tokenizer
         self.metrics = metrics if metrics is not None else {}
         self.enable_profile_trace = enable_profile_trace
-        assert self.r >= 2, "hierarchical verification requires target_verify_interval >= 2 (need r-1 >= 1 intermediate rounds)"
+        assert self.r >= 1, "hierarchical verification requires target_verify_interval >= 1"
 
     def _is_target_round(self, seq: Sequence) -> bool:
-        return seq.hv_round_idx == self.r - 1
+        """Target verify on the step where ``hv_round_idx == r`` (``r`` intermediate indices 0..r-1)."""
+        return seq.hv_round_idx == self.r
 
     def prefill(self, seqs: list[Sequence], eagle: bool = False) -> VerifyResult:
         assert not eagle, "hierarchical verifier does not support EAGLE"
@@ -134,18 +135,10 @@ class VerifierHierarchical(VerifierBase):
         out: list[list[int]] = []
         for i, seq in enumerate(seqs):
             parts: list[int] = []
-            # Provisional list is the accepted intermediate path in tape order (stem + body).
-            # Intermediate recovery is the token *after* that path; it must follow provisional,
-            # then the draft speculate row (dedupe when spec_row[0] repeats recovery).
+            # Provisional list ends with intermediate recovery (merged in scheduler); then draft spec row.
             parts.extend(seq.hv_provisional_token_ids)
-            if seq.hv_provisional_recovery_token_id is not None:
-                parts.append(seq.hv_provisional_recovery_token_id)
             spec_row = speculate_result.speculations[i].tolist()
-            if (
-                spec_row
-                and seq.hv_provisional_recovery_token_id is not None
-                and spec_row[0] == seq.hv_provisional_recovery_token_id
-            ):
+            if spec_row and parts and spec_row[0] == parts[-1]:
                 parts.extend(spec_row[1:])
             else:
                 parts.extend(spec_row)
