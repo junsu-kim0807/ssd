@@ -442,8 +442,10 @@ class Scheduler:
         r = self.config.target_verify_interval
         for seq, suffix, rec in zip(seqs, new_suffixes, recovery_tokens):
             assert len(suffix) >= 1
-            body = suffix[1:]
-            seq.hv_provisional_token_ids.extend(body)
+            # Store the full accepted intermediate suffix (including suffix[0], the stem
+            # before body). Dropping suffix[0] loses the first accepted token for target verify
+            # and undercounts ``hv_num_provisional_tokens`` / draft logical depth.
+            seq.hv_provisional_token_ids.extend(suffix)
             seq.hv_num_provisional_tokens = len(seq.hv_provisional_token_ids)
             seq.hv_provisional_recovery_token_id = rec
             seq.recovery_token_id = rec

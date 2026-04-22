@@ -134,12 +134,13 @@ class VerifierHierarchical(VerifierBase):
         out: list[list[int]] = []
         for i, seq in enumerate(seqs):
             parts: list[int] = []
+            # Provisional list is the accepted intermediate path in tape order (stem + body).
+            # Intermediate recovery is the token *after* that path; it must follow provisional,
+            # then the draft speculate row (dedupe when spec_row[0] repeats recovery).
+            parts.extend(seq.hv_provisional_token_ids)
             if seq.hv_provisional_recovery_token_id is not None:
                 parts.append(seq.hv_provisional_recovery_token_id)
-            parts.extend(seq.hv_provisional_token_ids)
             spec_row = speculate_result.speculations[i].tolist()
-            # spec_row[0] is next-step recovery; intermediate postprocess sets it equal to
-            # ``hv_provisional_recovery_token_id``, so including both duplicates the token.
             if (
                 spec_row
                 and seq.hv_provisional_recovery_token_id is not None
