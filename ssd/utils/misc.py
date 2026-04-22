@@ -9,6 +9,8 @@ def infer_model_family(model_path: str) -> str:
             return "llama"
         elif "qwen" in model_path_lower:
             return "qwen"
+        elif "gemma" in model_path_lower:
+            return "gemma"
         else:
             return "unknown"
 

@@ -1,7 +1,7 @@
 import os
 import ssd.paths  # noqa: F401 — sets TORCH_CUDA_ARCH_LIST before flashinfer import
 
-from ssd.config import Config
+from ssd.config import Config, _decoder_cfg
 from ssd.sampling_params import SamplingParams
 from ssd.utils.misc import infer_model_family
 from ssd.engine.sequence import Sequence
@@ -313,8 +313,8 @@ class LLMEngine:
                     device=config.device,
                     async_fan_out=config.async_fan_out,
                     max_blocks=config.max_blocks,
-                    vocab_size=config.draft_hf_config.vocab_size,
-                    draft_dtype=config.draft_hf_config.torch_dtype,
+                    vocab_size=_decoder_cfg(config.draft_hf_config).vocab_size,
+                    draft_dtype=_decoder_cfg(config.draft_hf_config).torch_dtype,
                     kvcache_block_size=config.kvcache_block_size,
                     max_model_len=config.max_model_len,
                     async_pg=self.model_runner.async_pg,

@@ -142,7 +142,6 @@ class GemmaAttention(nn.Module):
 
         # Current SSD rope helper supports a single RoPE policy for all layers.
         # We therefore pass a single base theta even for Gemma4 text configs.
-        rope_scaling = None if rope_scaling is not None else rope_scaling
         self.rotary_emb = get_rope(
             self.head_dim,
             rotary_dim=self.head_dim,

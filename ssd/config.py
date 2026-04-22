@@ -5,6 +5,16 @@ from transformers import AutoConfig
 import torch
 from ssd.paths import DEFAULT_TARGET, DEFAULT_DRAFT
 
+
+def _decoder_cfg(cfg):
+    return getattr(cfg, "text_config", cfg)
+
+
+def _cfg_attr(cfg, name, default=None):
+    dec = _decoder_cfg(cfg)
+    return getattr(dec, name, getattr(cfg, name, default))
+
+
 @dataclass
 class Config:
     model: str = DEFAULT_TARGET
@@ -70,14 +80,18 @@ class Config:
         assert os.path.isdir(model)
 
         assert 1 <= self.num_gpus <= 8 # this codebase only works on one node 
-        self.hf_config = AutoConfig.from_pretrained(model)
+        self.hf_config = AutoConfig.from_pretrained(model, trust_remote_code=True)
         self.max_model_len = min(
-            self.max_model_len, self.hf_config.max_position_embeddings) 
+            self.max_model_len,
+            _cfg_attr(self.hf_config, "max_position_embeddings", self.max_model_len),
+        )
         if self.speculate: 
             draft = self.draft
-            self.draft_hf_config = AutoConfig.from_pretrained(draft)
+            self.draft_hf_config = AutoConfig.from_pretrained(draft, trust_remote_code=True)
             self.max_model_len = min(
-                self.max_model_len, self.draft_hf_config.max_position_embeddings)
+                self.max_model_len,
+                _cfg_attr(self.draft_hf_config, "max_position_embeddings", self.max_model_len),
+            )
             if self.draft_async:
                 if self.fan_out_list is None: 
                     self.fan_out_list = [self.async_fan_out] * (self.speculate_k + 1)
@@ -104,9 +118,15 @@ class Config:
                 if self.target_verify_interval < 2:
                     raise ValueError("target_verify_interval must be >= 2 for hierarchical (need >=1 intermediate round)")
                 im = self.intermediate or self.draft
-                self.intermediate_hf_config = AutoConfig.from_pretrained(im)
+                self.intermediate_hf_config = AutoConfig.from_pretrained(im, trust_remote_code=True)
                 self.max_model_len = min(
-                    self.max_model_len, self.intermediate_hf_config.max_position_embeddings)
+                    self.max_model_len,
+                    _cfg_attr(
+                        self.intermediate_hf_config,
+                        "max_position_embeddings",
+                        self.max_model_len,
+                    ),
+                )
 
         if self.profiler_output_dir and str(self.profiler_output_dir).strip():
             if self.profiler_mode not in (
@@ -127,24 +147,27 @@ class Config:
 
         if self.use_eagle:
             if self.eagle_layers is None:
-                L = self.hf_config.num_hidden_layers
+                L = _cfg_attr(self.hf_config, "num_hidden_layers")
+                assert L is not None, "ERROR in Config: num_hidden_layers missing on hf_config"
                 # self.eagle_layers = [3, L//2, L-3]
                 self.eagle_layers = [2, L//2, L-3] # [2, 16, 29] outputs, ie. [3, L//2+1, L-2] inputs
                 print(f'[Config] just set eagle_layers={self.eagle_layers}', flush=True)
             # Eagle draft must use target's rope_theta (draft config may default to wrong value)
             if self.speculate and self.draft_hf_config is not None:
-                target_rope_theta = getattr(self.hf_config, 'rope_theta', 500000.0)
-                draft_rope_theta = getattr(self.draft_hf_config, 'rope_theta', 10000.0)
+                target_dec = _decoder_cfg(self.hf_config)
+                draft_dec = _decoder_cfg(self.draft_hf_config)
+                target_rope_theta = getattr(target_dec, "rope_theta", 500000.0)
+                draft_rope_theta = getattr(draft_dec, "rope_theta", 10000.0)
                 if target_rope_theta != draft_rope_theta:
                     print(f'[Config] Overriding eagle draft rope_theta: {draft_rope_theta} -> {target_rope_theta}', flush=True)
-                    self.draft_hf_config.rope_theta = target_rope_theta
+                    setattr(draft_dec, "rope_theta", target_rope_theta)
                 # Also override max_position_embeddings for correct RoPE cache size
                 # NOTE: Do NOT change max_model_len here - it was already correctly capped.
-                # Only change draft_hf_config.max_position_embeddings for RoPE.
-                target_max_pos = getattr(self.hf_config, 'max_position_embeddings', 8192)
-                draft_max_pos = getattr(self.draft_hf_config, 'max_position_embeddings', 2048)
+                # Only change draft decoder max_position_embeddings for RoPE.
+                target_max_pos = _cfg_attr(self.hf_config, "max_position_embeddings", 8192)
+                draft_max_pos = _cfg_attr(self.draft_hf_config, "max_position_embeddings", 2048)
                 if target_max_pos != draft_max_pos:
                     print(f'[Config] Overriding eagle draft max_position_embeddings: {draft_max_pos} -> {target_max_pos}', flush=True)
-                    self.draft_hf_config.max_position_embeddings = target_max_pos
+                    setattr(draft_dec, "max_position_embeddings", target_max_pos)
         
         assert self.max_num_batched_tokens >= self.max_model_len

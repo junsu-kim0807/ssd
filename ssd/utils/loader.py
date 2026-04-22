@@ -9,6 +9,19 @@ def default_weight_loader(param: nn.Parameter, loaded_weight: torch.Tensor):
     param.data.copy_(loaded_weight)
 
 
+def _remap_hf_weight_name_to_ssd(weight_name: str) -> str:
+    """Map multimodal / wrapper checkpoints (e.g. Gemma4) to SSD module prefixes."""
+    remap = {
+        "model.language_model.": "model.",
+        "language_model.": "model.",
+        "lm_head.": "lm_head.",
+    }
+    for prefix, repl in remap.items():
+        if weight_name.startswith(prefix):
+            return repl + weight_name[len(prefix) :]
+    return weight_name
+
+
 def load_embedding_from_target(model: nn.Module, target_path: str, target_hidden_size: int = None, draft_hidden_size: int = None) -> bool:
     """Try to load embedding weights from target model path (safetensors or bin)"""
     # Only load target embeddings if hidden sizes match (or if sizes not provided, assume compatible)
@@ -189,16 +202,17 @@ def load_safetensors_model(model: nn.Module, path: str, packed_modules_mapping: 
     for file in tqdm(safetensor_files, desc="Loading model files"):
         with safe_open(file, "pt", "cpu") as f:
             for weight_name in f.keys():
+                logical_name = _remap_hf_weight_name_to_ssd(weight_name)
                 for k in packed_modules_mapping:
-                    if k in weight_name:
+                    if k in logical_name:
                         v, shard_id = packed_modules_mapping[k]
-                        param_name = weight_name.replace(k, v)
+                        param_name = logical_name.replace(k, v)
                         param = model.get_parameter(param_name)
                         weight_loader = getattr(param, "weight_loader")
                         weight_loader(param, f.get_tensor(weight_name), shard_id)
                         break
                 else:
-                    param = model.get_parameter(weight_name)
+                    param = model.get_parameter(logical_name)
                     weight_loader = getattr(param, "weight_loader", default_weight_loader)
                     weight_loader(param, f.get_tensor(weight_name))
 

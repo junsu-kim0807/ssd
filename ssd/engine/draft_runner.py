@@ -5,7 +5,7 @@ import torch.distributed as dist
 import dataclasses
 
 from ssd.engine.model_runner import ModelRunner
-from ssd.config import Config
+from ssd.config import Config, _decoder_cfg
 from ssd.utils.context import set_context, reset_context
 from ssd.utils.async_helpers.async_spec_helpers import get_forked_recovery_tokens_from_logits, make_glue_decode_input_ids
 from ssd.utils.async_helpers.nccl_pack import recv_int64
@@ -26,7 +26,11 @@ class DraftRunner(ModelRunner):
             model=cfg.draft,
             gpu_memory_utilization = (0.75 if not cfg.draft_async else 0.8), # REMAINING SPACE if not draft_async
             tokenizer_path=cfg.model if cfg.use_eagle else None,
-            d_model_target=cfg.hf_config.hidden_size if cfg.use_eagle and cfg.hf_config else None,
+            d_model_target=(
+                _decoder_cfg(cfg.hf_config).hidden_size
+                if cfg.use_eagle and cfg.hf_config
+                else None
+            ),
             enforce_eager=cfg.enforce_eager,
             profiler_mode=cfg.profiler_mode,
             profiler_output_dir=cfg.profiler_output_dir,
@@ -76,7 +80,7 @@ class DraftRunner(ModelRunner):
         eagle_acts = None
         if use_eagle:
             eagle_acts = torch.zeros(
-                total_new_tokens, eagle_act_dim, dtype=self.hf_config.torch_dtype, device=self.device,
+                total_new_tokens, eagle_act_dim, dtype=self.decoder_hf_config.torch_dtype, device=self.device,
             )
             dist.recv(eagle_acts, src=0, group=self.async_pg)
 
@@ -156,8 +160,8 @@ class DraftRunner(ModelRunner):
             hidden_states = self.model.fc(target_recovery_activations.to(self.model.fc.weight.dtype))
             spec_activations = torch.empty(
                 input_ids.shape[0], self.config.speculate_k,
-                self.hf_config.hidden_size,
-                dtype=self.hf_config.torch_dtype, device=self.device)
+                self.decoder_hf_config.hidden_size,
+                dtype=self.decoder_hf_config.torch_dtype, device=self.device)
 
         for i in range(self.config.speculate_k): # we're going to glue after this anyways, and by sending the spec request target has verified we have K more slots left in our last page 
             set_context(
@@ -195,19 +199,19 @@ class DraftRunner(ModelRunner):
         """Hits the cache (tensor-backed) and returns tensors to respond to the spec request."""
         global ttl, ttl_hit
         # Draft model now returns full target vocab size logits (after d2t expansion)
-        V = self.hf_config.vocab_size
+        V = self.decoder_hf_config.vocab_size
 
         # Init miss slots with valid random logits so token IDs are in-vocab (fixes B>1 crash)
-        out_logits = torch.empty((B, K, V), dtype=self.hf_config.torch_dtype, device=self.device).uniform_()
+        out_logits = torch.empty((B, K, V), dtype=self.decoder_hf_config.torch_dtype, device=self.device).uniform_()
         out_tokens = out_logits.argmax(dim=-1)
         cache_hits = torch.zeros(B, dtype=torch.int64, device=self.device)
 
         assert request_keys.shape == (B, 3), f"ERROR in hit_cache_and_respond: request_keys should be (B, 3), got {request_keys.shape}"
         
-        hidden_size = self.hf_config.hidden_size
+        hidden_size = self.decoder_hf_config.hidden_size
         out_activations = torch.zeros(
             B, K, hidden_size,
-            dtype=self.hf_config.torch_dtype, device=self.device
+            dtype=self.decoder_hf_config.torch_dtype, device=self.device
         ) if self.config.use_eagle else None
         
         # Statistics
@@ -318,7 +322,7 @@ class DraftRunner(ModelRunner):
         temperatures = temps_as_int64.to(torch.int32).view(torch.float32)
 
         target_recovery_activations = torch.zeros(
-            B, 3 * self.config.d_model_target, dtype=self.hf_config.torch_dtype, device=self.device
+            B, 3 * self.config.d_model_target, dtype=self.decoder_hf_config.torch_dtype, device=self.device
         ) if self.config.use_eagle else None
 
         extend_counts = None
@@ -331,7 +335,7 @@ class DraftRunner(ModelRunner):
             # Receive extend data for fused glue decode
             act_dim = 3 * self.config.d_model_target
             extend_counts = torch.zeros(B, dtype=torch.int64, device=self.device)
-            extend_eagle_acts = torch.zeros(B, K, act_dim, dtype=self.hf_config.torch_dtype, device=self.device)
+            extend_eagle_acts = torch.zeros(B, K, act_dim, dtype=self.decoder_hf_config.torch_dtype, device=self.device)
             extend_token_ids = torch.zeros(B, K, dtype=torch.int64, device=self.device)
             dist.recv(extend_counts, src=0, group=self.async_pg)
             dist.recv(extend_eagle_acts, src=0, group=self.async_pg)
@@ -553,7 +557,7 @@ class DraftRunner(ModelRunner):
             extend_token_ids_batch = partial_tree_decode_args.get("extend_token_ids")
             target_acts = partial_tree_decode_args["target_recovery_activations"]
             prev_acts = partial_tree_decode_args["previous_activations"]
-            hidden_size = self.hf_config.hidden_size
+            hidden_size = self.decoder_hf_config.hidden_size
             fc_dtype = self.model.fc.weight.dtype
 
             gd_view = glue_decode_input_ids.view(B, K + 1)
@@ -568,7 +572,7 @@ class DraftRunner(ModelRunner):
 
             # Build packed fused_ids and fused_hs (no padding, no for loops)
             fused_ids = torch.zeros(total_real, dtype=torch.int64, device=self.device)
-            fused_hs = torch.zeros(total_real, hidden_size, dtype=self.hf_config.torch_dtype, device=self.device)
+            fused_hs = torch.zeros(total_real, hidden_size, dtype=self.decoder_hf_config.torch_dtype, device=self.device)
 
             # Per-token batch index and local offset
             batch_idx = torch.repeat_interleave(torch.arange(B, device=self.device), seqlens_q)
@@ -759,7 +763,7 @@ class DraftRunner(ModelRunner):
         
         reset_context()
         
-        V = self.hf_config.vocab_size  # Draft returns full target vocab size after d2t expansion
+        V = self.decoder_hf_config.vocab_size  # Draft returns full target vocab size after d2t expansion
         logits_flat = logits.view(-1, V)  # [N, V]
         spec_logits[:, depth, :] = logits_flat
         # Inline greedy: payload["_all_greedy"] checked once in _decode_tree
@@ -774,14 +778,14 @@ class DraftRunner(ModelRunner):
         # setup
         B, K, F, N = payload["metadata_ints"]
 
-        V = self.hf_config.vocab_size  # Draft returns full target vocab size after d2t expansion
+        V = self.decoder_hf_config.vocab_size  # Draft returns full target vocab size after d2t expansion
         spec_tokens = torch.zeros(
             (N, K), dtype=torch.int64, device=self.device)
         spec_logits = torch.zeros(
-            (N, K, V), dtype=self.hf_config.torch_dtype, device=self.device)
+            (N, K, V), dtype=self.decoder_hf_config.torch_dtype, device=self.device)
         spec_activations = torch.zeros(
-            (N, K, self.hf_config.hidden_size),
-            dtype=self.hf_config.torch_dtype, device=self.device
+            (N, K, self.decoder_hf_config.hidden_size),
+            dtype=self.decoder_hf_config.torch_dtype, device=self.device
         ) if self.config.use_eagle else None
 
         # Precompute all positions, context_lens, and slot_maps for all K steps

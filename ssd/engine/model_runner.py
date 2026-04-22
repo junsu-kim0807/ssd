@@ -8,10 +8,11 @@ from multiprocessing.shared_memory import SharedMemory
 from transformers import AutoTokenizer, AutoConfig
 import os
 import flashinfer
-from ssd.config import Config
+from ssd.config import Config, _decoder_cfg
 from ssd.engine.sequence import Sequence
 from ssd.models.qwen3 import Qwen3ForCausalLM
 from ssd.models.llama3 import LlamaForCausalLM
+from ssd.models.gemma import GemmaForCausalLM
 from ssd.models.eagle3_draft_llama3 import Eagle3DraftForCausalLM
 from ssd.layers.sampler import Sampler
 from ssd.utils.context import set_context, reset_context, get_context
@@ -56,13 +57,18 @@ class ModelRunner:
         self.is_draft = is_draft
         self.intermediate_mode = is_intermediate
         if self.is_draft: 
-            if config.draft_hf_config.torch_dtype != config.hf_config.torch_dtype:
+            draft_dtype = getattr(_decoder_cfg(config.draft_hf_config), "torch_dtype", None)
+            target_dtype = getattr(_decoder_cfg(config.hf_config), "torch_dtype", None)
+            if draft_dtype != target_dtype:
                 if self.verbose:
-                    print(f"Warning: Draft dtype {config.draft_hf_config.torch_dtype} differs from target {config.hf_config.torch_dtype}. Casting draft to {config.hf_config.torch_dtype}.")
-                config.draft_hf_config.torch_dtype = config.hf_config.torch_dtype
-            assert (config.draft_hf_config.vocab_size == config.hf_config.vocab_size) or config.use_eagle, "ERROR in ModelRunner: draft_hf_config.vocab_size != hf_config.vocab_size"
+                    print(f"Warning: Draft dtype {draft_dtype} differs from target {target_dtype}. Casting draft to {target_dtype}.")
+                setattr(_decoder_cfg(config.draft_hf_config), "torch_dtype", target_dtype)
+            draft_vocab = getattr(_decoder_cfg(config.draft_hf_config), "vocab_size", None)
+            target_vocab = getattr(_decoder_cfg(config.hf_config), "vocab_size", None)
+            assert (draft_vocab == target_vocab) or config.use_eagle, "ERROR in ModelRunner: draft_hf_config.vocab_size != hf_config.vocab_size"
         
         self.hf_config = config.hf_config if not is_draft else config.draft_hf_config
+        self.decoder_hf_config = _decoder_cfg(self.hf_config)
         self.block_size = config.kvcache_block_size
         self.enforce_eager = config.enforce_eager
         self.tokenizer = AutoTokenizer.from_pretrained(config.tokenizer_path if config.tokenizer_path else config.model, use_fast=True)
@@ -120,7 +126,7 @@ class ModelRunner:
             self.tp_pg = dist.new_group(ranks=list(range(self.num_tp_gpus))) # everyone should see the new_group init even if not in group 
 
         default_dtype = torch.get_default_dtype()
-        torch.set_default_dtype(self.hf_config.torch_dtype)
+        torch.set_default_dtype(self.decoder_hf_config.torch_dtype)
         torch.set_default_device("cuda")
         
         if self.is_draft:
@@ -226,20 +232,25 @@ class ModelRunner:
         self.graphs = {}
         self.graph_bs_list = {}
 
-        assert hasattr(hf_config, 'model_type'), "ERROR in ModelRunner: hf_config.model_type is not set"
+        runner_cfg = _decoder_cfg(hf_config)
+        model_type_name = getattr(runner_cfg, "model_type", getattr(hf_config, "model_type", None))
+
+        assert model_type_name is not None, "ERROR in ModelRunner: hf_config.model_type is not set"
         if config.use_eagle and is_draft:
             print(f'[EAGLE3] Loading Eagle3DraftForCausalLM as model_class', flush=True)
             model_class = Eagle3DraftForCausalLM
-        elif hf_config.model_type == 'llama':
+        elif model_type_name == 'llama':
             model_class = LlamaForCausalLM
-        elif hf_config.model_type == 'qwen3':
+        elif model_type_name == 'qwen3':
             model_class = Qwen3ForCausalLM
+        elif model_type_name in {'gemma', 'gemma2', 'gemma3', 'gemma4_text'} or getattr(hf_config, 'model_type', None) == 'gemma4':
+            model_class = GemmaForCausalLM
         else:
-            raise ValueError(f"Unsupported model type: {hf_config.model_type}")
+            raise ValueError(f"Unsupported model type: {model_type_name}")
 
         # only give Qwen3 a tp_group if we're a TARGET runner
         kwargs = dict(
-            config=self.hf_config,
+            config=runner_cfg,
             draft=self.is_draft,
             speculate=self.config.speculate,
             spec_k=self.config.speculate_k,
@@ -451,7 +462,7 @@ class ModelRunner:
         if self.config.use_eagle and self.is_draft:
             num_tokens = num_seqs * max_model_len
             d_model_target = self.config.d_model_target or 4096
-            hidden_states = torch.zeros(num_tokens, 3 * d_model_target, dtype=self.hf_config.torch_dtype, device=self.device)
+            hidden_states = torch.zeros(num_tokens, 3 * d_model_target, dtype=self.decoder_hf_config.torch_dtype, device=self.device)
         
         self.run(seqs, True, hidden_states=hidden_states)
         torch.cuda.empty_cache()
@@ -459,7 +470,7 @@ class ModelRunner:
     def allocate_kv_cache(self):
         print(f'inside allocate_kv_cache -- ', flush=True)
         config = self.config
-        hf_config = self.hf_config
+        hf_config = self.decoder_hf_config
         
         # Simplify: just look at free memory on the GPU, and allocate up to gpu_memory_utilization * free.
         free, _ = torch.cuda.mem_get_info()
@@ -660,13 +671,13 @@ class ModelRunner:
             kv_indptr,
             kv_indices,
             kv_last_page_len,
-            self.hf_config.num_attention_heads,
-            self.hf_config.num_key_value_heads,
-            self.hf_config.head_dim,
+            self.decoder_hf_config.num_attention_heads,
+            self.decoder_hf_config.num_key_value_heads,
+            self.decoder_hf_config.head_dim,
             self.block_size,
             custom_mask=custom_mask,
-            q_data_type=self.hf_config.torch_dtype,
-            kv_data_type=self.hf_config.torch_dtype,
+            q_data_type=self.decoder_hf_config.torch_dtype,
+            kv_data_type=self.decoder_hf_config.torch_dtype,
         )
 
     @torch.inference_mode()
