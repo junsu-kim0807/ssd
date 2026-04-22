@@ -4,6 +4,9 @@ import sys
 import time
 import argparse
 import json
+import shlex
+from typing import Sequence
+
 from random import randint, seed
 from ssd import LLM, SamplingParams
 from ssd.engine.llm_engine import METRICS
