@@ -8,10 +8,11 @@ Layout for ``--profiler_output_dir`` when ``bench.py`` is run with ``--profile``
 
 ``--batch`` and ``--length`` are independent sweep dimensions (batch sizes vs speculative ``k``).
 
-**Multids** (profiler paths ``.../b<b>/k.../t0/<dataset>/`` for alpaca, humaneval, gsm8k, math500, codeelo):
-enable with ``--multids``, or for backward compatibility when **both** ``--batch`` and ``--length`` are set.
+When **either** ``--batch`` or ``--length`` is set, generated jobs cover the profile dataset set
+(alpaca, humaneval, gsm8k, math500, codeelo): profiler paths ``.../b<b>/k.../t0/<dataset>/``.
 By default, **one Slurm script per dataset** (job name ``<dataset>_<family>_<method>_b<b>_<kpath>_<temp_tag>``).
-With ``--all``, one Slurm script runs every multids dataset in a ``for`` loop.
+With ``--all``, one Slurm script runs every dataset in a ``for`` loop. ``--dataset`` is ignored in that mode.
+Job scripts and logs live under the same ``.../b<b>/k.../<pair>/t<tag>/`` layout as non-sweep runs (no extra subfolder).
 
 Sweep flags (optional, Cartesian product with other dimensions):
   --batch   → batch sizes 1, 4, 16, 64, 256
@@ -640,25 +641,20 @@ def main() -> None:
     p.add_argument(
         "--batch",
         action="store_true",
-        help=f"Sweep batch sizes {BATCH_SWEEP} (orthogonal to --length). Does not imply multids by itself.",
+        help=f"Sweep batch sizes {BATCH_SWEEP}. With --batch or --length, jobs use the five profile datasets "
+        f"(one Slurm script per dataset unless --all).",
     )
     p.add_argument(
         "--length",
         action="store_true",
-        help=f"Sweep speculative k {K_SWEEP} (methods with uses_spec_k; orthogonal to --batch).",
-    )
-    p.add_argument(
-        "--multids",
-        action="store_true",
-        help="Emit multids profile jobs (alpaca, humaneval, gsm8k, math500, codeelo): one Slurm script per "
-        "dataset by default, or one loop script with --all. Ignores --dataset. "
-        "If omitted, the same behaviour still activates when both --batch and --length are set (legacy).",
+        help=f"Sweep speculative k {K_SWEEP} (methods with uses_spec_k). With --batch or --length, same multi-dataset "
+        f"behaviour as --batch.",
     )
     p.add_argument(
         "--all",
         action="store_true",
         dest="multids_all_in_one",
-        help="With multids (--multids or --batch+--length): emit one Slurm script that loops all multids datasets. "
+        help="With --batch or --length: emit one Slurm script that loops all profile datasets. "
         "Default (omit --all): one Slurm script per dataset.",
     )
     p.add_argument("--temp", action="store_true", help=f"Sweep temperatures {TEMP_SWEEP}")
@@ -690,22 +686,17 @@ def main() -> None:
 
     model_families = normalize_model_families(args.models)
     methods = normalize_methods(args.methods)
-    multi_dataset_sweep = bool(args.multids or (args.batch and args.length))
+    multi_dataset_sweep = bool(args.batch or args.length)
     if multi_dataset_sweep:
-        if not args.multids and args.batch and args.length:
-            print(
-                "multids enabled via --batch and --length (legacy). Prefer --multids with either or both sweeps.",
-                file=sys.stderr,
-            )
         if args.multids_all_in_one:
             print(
-                "multids + --all: one Slurm script per sweep cell runs "
+                "batch/length sweep + --all: one Slurm script per sweep cell runs "
                 f"{', '.join(MULTI_DATASET_PROFILE_SLUGS)} in a loop; --dataset ignored.",
                 file=sys.stderr,
             )
         else:
             print(
-                "multids (default): one Slurm script per dataset "
+                "batch/length sweep: one Slurm script per dataset "
                 f"({', '.join(MULTI_DATASET_PROFILE_SLUGS)}); use --all for a single loop script. "
                 "--dataset ignored.",
                 file=sys.stderr,
@@ -778,8 +769,6 @@ def main() -> None:
         temp_tag = temp_path_tag(temp_val)
 
         rel_bits = Path(args.profile_mode) / fam / spec.id / f"b{b_val}" / k_path / pair_slug / temp_tag
-        if multi_dataset_sweep:
-            rel_bits = rel_bits / "multids_batch_length"
         job_dir = job_root / rel_bits
         out_log_dir = out_log_root / rel_bits
         err_log_dir = err_log_root / rel_bits
