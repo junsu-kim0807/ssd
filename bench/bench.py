@@ -661,9 +661,12 @@ def main():
 
     ensure_benchmark_dataset(args)
 
-    if args.debug and args.spec and args.spec_policy == "hierarchical":
-        print("[bench] --debug with hierarchical: forcing --output_len=1 for step-wise correctness logs", flush=True)
-        args.output_len = 1
+    if args.debug and args.numseqs != 1:
+        print(
+            "[bench] --debug: forcing --numseqs=1 (was {})".format(args.numseqs),
+            flush=True,
+        )
+        args.numseqs = 1
 
     model_name, model_path, draft_path = get_model_paths(args)
 
