@@ -1,13 +1,12 @@
 import time
 import torch
 from collections import deque
-from transformers import AutoTokenizer
-
 from ssd.config import Config
 from ssd.engine.sequence import Sequence, SequenceStatus
 from ssd.engine.block_manager import BlockManager
 
 from ssd.utils.async_helpers.async_spec_helpers import compute_megaspec_lookahead
+from ssd.utils.misc import load_auto_tokenizer
 
 class Scheduler:
 
@@ -38,7 +37,10 @@ class Scheduler:
         self.block_manager = BlockManager(
             config.num_kvcache_blocks, config.kvcache_block_size, is_draft=False, verbose=self.verbose, max_model_len=self.max_model_len)
 
-        self.tokenizer = AutoTokenizer.from_pretrained(config.model)
+        self.tokenizer = load_auto_tokenizer(
+            config.model,
+            tokenizer_path=config.tokenizer_path,
+        )
 
         # num_kvcache_blocks is determined by gpu_mem_allocation in allocate()
         if self.speculate:

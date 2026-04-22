@@ -6,19 +6,27 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
 import json
 from random import randint
 from typing import List, Optional, Tuple
-from transformers import AutoTokenizer
 try:
     from ssd.paths import DATASET_PATHS, HF_CACHE_DIR, EAGLE3_SPECFORGE_70B, EAGLE3_YUHUILI_8B, EAGLE3_QWEN_32B
 except ImportError:
     from bench_paths import DATASET_PATHS, HF_CACHE_DIR, EAGLE3_SPECFORGE_70B, EAGLE3_YUHUILI_8B, EAGLE3_QWEN_32B
+
+from ssd.utils.misc import load_auto_tokenizer
 
 # HuggingFace hub repo ids → default bench targets/drafts (--size ignored for these presets).
 BENCH_PRESET_QWEN_TARGET = "Qwen/Qwen3-32B"
 BENCH_PRESET_QWEN_DRAFT = "Qwen/Qwen3-0.6B"
 BENCH_PRESET_GEMMA_TARGET = "google/gemma-4-31B-it"
 BENCH_PRESET_GEMMA_DRAFT = "google/gemma-4-E4B-it"
+# Default intermediate for ``--spec_policy hierarchical`` when ``--intermediate`` is unset.
+BENCH_PRESET_HIERARCHICAL_INTERMEDIATE_QWEN = "Qwen/Qwen3-8B"
+BENCH_PRESET_HIERARCHICAL_INTERMEDIATE_LLAMA = "meta-llama/Llama-3.1-8B-Instruct"
 BENCH_PRESET_VICUNA_TARGET = "lmsys/vicuna-13b-v1.3"
 BENCH_PRESET_VICUNA_DRAFT = "double7/vicuna-68m"
+# Single supported Vicuna bench preset for profiling / sweeps (13B + 160M draft; hierarchical uses 7B below).
+BENCH_PRESET_VICUNA13B_160M_TARGET = "lmsys/vicuna-13b-v1.3"
+BENCH_PRESET_VICUNA13B_160M_DRAFT = "double7/vicuna-160m"
+BENCH_PRESET_VICUNA13B_160M_INTERMEDIATE = "lmsys/vicuna-7b-v1.3"
 
 
 def hf_hub_cache_dir(cache_dir: str, repo_id: str) -> str:
@@ -166,6 +174,8 @@ def _get_draft_model_path(args, cache_dir: str) -> str:
     if getattr(args, "spec", False) and args.draft is None:
         if getattr(args, "gemma", False):
             return _get_snapshot_path(hf_hub_cache_dir(cache_dir, BENCH_PRESET_GEMMA_DRAFT))
+        if getattr(args, "vicuna13b_160m", False):
+            return _get_snapshot_path(hf_hub_cache_dir(cache_dir, BENCH_PRESET_VICUNA13B_160M_DRAFT))
         if getattr(args, "vicuna", False):
             return _get_snapshot_path(hf_hub_cache_dir(cache_dir, BENCH_PRESET_VICUNA_DRAFT))
         if args.qwen:
@@ -221,6 +231,10 @@ def get_model_paths(args, cache_dir: str = HF_CACHE_DIR) -> Tuple[str, str, Opti
         model_name = BENCH_PRESET_GEMMA_TARGET
         model_base = hf_hub_cache_dir(cache_dir, BENCH_PRESET_GEMMA_TARGET)
         default_draft_base = hf_hub_cache_dir(cache_dir, BENCH_PRESET_GEMMA_DRAFT)
+    elif getattr(args, "vicuna13b_160m", False):
+        model_name = BENCH_PRESET_VICUNA13B_160M_TARGET
+        model_base = hf_hub_cache_dir(cache_dir, BENCH_PRESET_VICUNA13B_160M_TARGET)
+        default_draft_base = hf_hub_cache_dir(cache_dir, BENCH_PRESET_VICUNA13B_160M_DRAFT)
     elif getattr(args, "vicuna", False):
         model_name = BENCH_PRESET_VICUNA_TARGET
         model_base = hf_hub_cache_dir(cache_dir, BENCH_PRESET_VICUNA_TARGET)
@@ -246,7 +260,9 @@ def get_model_paths(args, cache_dir: str = HF_CACHE_DIR) -> Tuple[str, str, Opti
         default_draft_base = os.path.join(
             cache_dir, "models--meta-llama--Llama-3.2-1B-Instruct")
     else:
-        raise ValueError("Expected --llama (default), --qwen, --gemma, or --vicuna for model selection")
+        raise ValueError(
+            "Expected --llama (default), --qwen, --gemma, --vicuna, or --vicuna13b_160m for model selection"
+        )
 
     model_path = _get_snapshot_path(model_base)
 
@@ -259,6 +275,41 @@ def get_model_paths(args, cache_dir: str = HF_CACHE_DIR) -> Tuple[str, str, Opti
     draft_path = _get_snapshot_path(draft_base)
 
     return model_name, model_path, draft_path
+
+
+def resolve_intermediate_model_path(args, cache_dir: str = HF_CACHE_DIR) -> Optional[str]:
+    """Hierarchical-only: snapshot dir for ``Config.intermediate`` (empty => draft in engine)."""
+    if not getattr(args, "spec", False):
+        return None
+    if getattr(args, "spec_policy", "default") != "hierarchical":
+        return None
+    explicit = getattr(args, "intermediate", None)
+    if explicit and str(explicit).strip():
+        raw = str(explicit).strip()
+        if os.path.isdir(raw):
+            return _get_snapshot_path(raw)
+        if "/" in raw:
+            return _get_snapshot_path(hf_hub_cache_dir(cache_dir, raw))
+        raise ValueError(
+            f"--intermediate must be a local directory or HF hub id 'org/name', got {raw!r}"
+        )
+    if getattr(args, "vicuna13b_160m", False):
+        return _get_snapshot_path(
+            hf_hub_cache_dir(cache_dir, BENCH_PRESET_VICUNA13B_160M_INTERMEDIATE)
+        )
+    if getattr(args, "qwen", False):
+        return _get_snapshot_path(
+            hf_hub_cache_dir(cache_dir, BENCH_PRESET_HIERARCHICAL_INTERMEDIATE_QWEN)
+        )
+    if getattr(args, "gemma", False):
+        return _get_snapshot_path(
+            hf_hub_cache_dir(cache_dir, BENCH_PRESET_GEMMA_DRAFT)
+        )
+    if getattr(args, "llama", False):
+        return _get_snapshot_path(
+            hf_hub_cache_dir(cache_dir, BENCH_PRESET_HIERARCHICAL_INTERMEDIATE_LLAMA)
+        )
+    return None
 
 
 def load_dataset_token_ids(
@@ -284,7 +335,7 @@ def load_dataset_token_ids(
         return None
 
     try:
-        tokenizer = AutoTokenizer.from_pretrained(model_path)
+        tokenizer = load_auto_tokenizer(model_path)
         prompts: List[List[int]] = []
         with open(dataset_file_path, "r") as f:
             for _, line in enumerate(f):
@@ -378,7 +429,7 @@ def generate_benchmark_inputs(
         num_prompts = min(args.numseqs, len(example_prompts))
         selected_prompts = example_prompts[:num_prompts]
 
-        tokenizer = AutoTokenizer.from_pretrained(model_path)
+        tokenizer = load_auto_tokenizer(model_path)
         string_prompts = selected_prompts
         return string_prompts, None, selected_prompts
 

@@ -34,11 +34,15 @@ from typing import Callable, Iterable, Sequence
 # Repo imports (profile/ → bench_helpers)
 _REPO_ROOT = Path(__file__).resolve().parent.parent
 
-# Mirror bench/bench_helpers.py (bench.py --qwen / --gemma presets); keep in sync if defaults change.
+# Mirror bench/bench_helpers.py (bench.py HF presets); keep in sync if defaults change.
+# Hierarchical default intermediates (when bench ``--intermediate`` omitted): Qwen3-8B | Gemma-4-E4B-it |
+# Llama-3.1-8B-Instruct | Vicuna-7B (vicuna13b_160m preset only); see ``resolve_intermediate_model_path``.
 BENCH_PRESET_QWEN_TARGET = "Qwen/Qwen3-32B"
 BENCH_PRESET_QWEN_DRAFT = "Qwen/Qwen3-0.6B"
 BENCH_PRESET_GEMMA_TARGET = "google/gemma-4-31B-it"
 BENCH_PRESET_GEMMA_DRAFT = "google/gemma-4-E4B-it"
+BENCH_PRESET_VICUNA13B_160M_TARGET = "lmsys/vicuna-13b-v1.3"
+BENCH_PRESET_VICUNA13B_160M_DRAFT = "double7/vicuna-160m"
 
 DEFAULT_REPO_DIR = "/project/def-pnair/junsu/kv_cache/ssd"
 DEFAULT_VENV_DIR = "/project/def-pnair/junsu/kv_cache/.venv"
@@ -65,6 +69,11 @@ MODEL_PRESETS: dict[str, tuple[str, str, str]] = {
     # family -> (bench flag name, target hub id, draft hub id)
     "qwen": ("qwen", BENCH_PRESET_QWEN_TARGET, BENCH_PRESET_QWEN_DRAFT),
     "gemma": ("gemma", BENCH_PRESET_GEMMA_TARGET, BENCH_PRESET_GEMMA_DRAFT),
+    "vicuna13b_160m": (
+        "vicuna13b_160m",
+        BENCH_PRESET_VICUNA13B_160M_TARGET,
+        BENCH_PRESET_VICUNA13B_160M_DRAFT,
+    ),
 }
 
 DEFAULT_GPU_BY_FAMILY_METHOD: dict[tuple[str, str], int] = {
@@ -78,6 +87,11 @@ DEFAULT_GPU_BY_FAMILY_METHOD: dict[tuple[str, str], int] = {
     ("gemma", "async"): 3,
     ("gemma", "hierarchical"): 2,
     ("gemma", "pivot"): 3,
+    ("vicuna13b_160m", "ar"): 2,
+    ("vicuna13b_160m", "sync"): 2,
+    ("vicuna13b_160m", "async"): 3,
+    ("vicuna13b_160m", "hierarchical"): 2,
+    ("vicuna13b_160m", "pivot"): 3,
 }
 
 
@@ -497,7 +511,12 @@ def main() -> None:
         help="Used when HF_HOME is unset (bash expands ${HOME} at runtime if you pass it literally).",
     )
 
-    p.add_argument("--models", type=str, default="qwen,gemma", help="Comma-separated model families")
+    p.add_argument(
+        "--models",
+        type=str,
+        default="qwen,gemma,vicuna13b_160m",
+        help="Comma-separated model families (qwen | gemma | vicuna13b_160m)",
+    )
     p.add_argument(
         "--methods",
         type=str,

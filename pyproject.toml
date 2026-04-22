@@ -25,6 +25,7 @@ dependencies = [
     "wandb==0.22.0",
     "hf_transfer",
     "tiktoken",
+    "sentencepiece>=0.2.0",
 ]
 
 [project.optional-dependencies]

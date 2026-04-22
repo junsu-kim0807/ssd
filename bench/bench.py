@@ -10,13 +10,15 @@ from typing import Sequence
 from random import randint, seed
 from ssd import LLM, SamplingParams
 from ssd.engine.llm_engine import METRICS
-from transformers import AutoTokenizer
+from ssd.utils.misc import load_auto_tokenizer
 import wandb
 from bench_helpers import (
+    HF_CACHE_DIR,
     benchmark_dataset_label,
     ensure_benchmark_dataset,
     generate_benchmark_inputs,
     get_model_paths,
+    resolve_intermediate_model_path,
 )
 
 
@@ -43,8 +45,22 @@ def parse_arguments():
         action="store_true",
         help="Bench preset: lmsys/vicuna-13b-v1.3 (ignores --size). With --spec, default draft double7/vicuna-68m unless --draft is set.",
     )
+    parser.add_argument(
+        "--vicuna13b_160m",
+        action="store_true",
+        help="Bench preset: lmsys/vicuna-13b-v1.3 + double7/vicuna-160m draft. "
+        "With --spec_policy hierarchical, defaults intermediate to lmsys/vicuna-7b-v1.3 (overridable via --intermediate).",
+    )
     parser.add_argument("--draft", type=str, default=None,
                         help="Draft model size (0.6 for Qwen-0.6B, 1 for Llama-1B) or path to draft model")
+    parser.add_argument(
+        "--intermediate",
+        type=str,
+        default=None,
+        help="HF hub id (org/name) or local model dir for hierarchical verification. "
+        "If unset: Vicuna13B/160m preset → Vicuna-7B; --qwen → Qwen3-8B; --gemma → Gemma-4-E4B-it; "
+        "--llama → Llama-3.1-8B-Instruct; otherwise intermediate defaults to the draft model.",
+    )
 
     # Execution configuration
     parser.add_argument("--eager", action="store_true", help="Use eager execution (disable CUDA graphs)")
@@ -179,12 +195,14 @@ def parse_arguments():
     args = parser.parse_args()
     _n_hf_preset = int(bool(args.qwen)) + int(bool(getattr(args, "gemma", False))) + int(
         bool(getattr(args, "vicuna", False))
-    )
+    ) + int(bool(getattr(args, "vicuna13b_160m", False)))
     if _n_hf_preset > 1:
-        parser.error("Use at most one of --qwen --gemma --vicuna")
+        parser.error("Use at most one of --qwen --gemma --vicuna --vicuna13b_160m")
     if getattr(args, "gemma", False):
         args.llama = False
     if getattr(args, "vicuna", False):
+        args.llama = False
+    if getattr(args, "vicuna13b_160m", False):
         args.llama = False
     if args.qwen:
         args.llama = False
@@ -193,6 +211,8 @@ def parse_arguments():
         parser.error("--gemma and explicit --llama are mutually exclusive")
     if getattr(args, "vicuna", False) and "--llama" in sys.argv:
         parser.error("--vicuna and explicit --llama are mutually exclusive")
+    if getattr(args, "vicuna13b_160m", False) and "--llama" in sys.argv:
+        parser.error("--vicuna13b_160m and explicit --llama are mutually exclusive")
     if args.eagle:
         args.spec = True
         assert args.llama, "Eagle currently only supports llama models"
@@ -244,6 +264,8 @@ def create_run_name(args):
     jit_mode_str = "_jit" if args.backup == "jit" else ""
     if getattr(args, "gemma", False):
         model_type = "gemma"
+    elif getattr(args, "vicuna13b_160m", False):
+        model_type = "vicuna13b_160m"
     elif getattr(args, "vicuna", False):
         model_type = "vicuna"
     elif args.llama:
@@ -325,9 +347,13 @@ def initialize_wandb(args, run_name):
             "llama": args.llama,
             "gemma_preset": getattr(args, "gemma", False),
             "vicuna_preset": getattr(args, "vicuna", False),
+            "vicuna13b_160m_preset": getattr(args, "vicuna13b_160m", False),
             "qwen_hub_preset": bool(args.qwen),
             "bench_cli_size_ignored_for_hf_preset": bool(
-                args.qwen or getattr(args, "gemma", False) or getattr(args, "vicuna", False)
+                args.qwen
+                or getattr(args, "gemma", False)
+                or getattr(args, "vicuna", False)
+                or getattr(args, "vicuna13b_160m", False)
             ),
             "max_model_len": args.max_model_len,
             "input_len": args.input_len,
@@ -407,6 +433,10 @@ def create_llm_kwargs(args, draft_path):
         if _pod and str(_pod).strip():
             llm_kwargs["profiler_output_dir"] = str(_pod).strip()
             llm_kwargs["profiler_mode"] = getattr(args, "profiler_mode", None) or "cost_metadata"
+
+    inter = resolve_intermediate_model_path(args, HF_CACHE_DIR)
+    if inter:
+        llm_kwargs["intermediate"] = inter
 
     return llm_kwargs
 
@@ -609,7 +639,7 @@ def main():
         for i, prompt in enumerate(prompts):
             if isinstance(prompt, str):
                 print(f'Prompt: {prompt}')
-                tokenizer = AutoTokenizer.from_pretrained(model_path)
+                tokenizer = load_auto_tokenizer(model_path)
                 num_tokens = len(tokenizer.encode(prompt, add_special_tokens=False))
             elif isinstance(prompt, list):
                 num_tokens = len(prompt)
@@ -631,7 +661,7 @@ def main():
         llm_kwargs['debug_mode'] = True
 
     llm = LLM(model_path, **llm_kwargs)
-    bench_jsonl_tokenizer = AutoTokenizer.from_pretrained(model_path)
+    bench_jsonl_tokenizer = load_auto_tokenizer(model_path)
 
     for si, sweep_cfg in enumerate(sweep_configs):
         bad_keys = {"backup", "flh", "flm"} & set(sweep_cfg.keys())

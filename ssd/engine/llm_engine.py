@@ -3,7 +3,7 @@ import ssd.paths  # noqa: F401 — sets TORCH_CUDA_ARCH_LIST before flashinfer i
 
 from ssd.config import Config, _decoder_cfg
 from ssd.sampling_params import SamplingParams
-from ssd.utils.misc import infer_model_family
+from ssd.utils.misc import infer_model_family, load_auto_tokenizer
 from ssd.engine.sequence import Sequence
 from ssd.engine.scheduler import Scheduler
 from ssd.engine.model_runner import ModelRunner
@@ -21,7 +21,6 @@ import atexit
 from dataclasses import fields
 from time import perf_counter
 from tqdm.auto import tqdm
-from transformers import AutoTokenizer
 import torch.multiprocessing as mp
 
 
@@ -126,7 +125,10 @@ class LLMEngine:
             self.intermediate_runner = IntermediateRunner(config)
             self.intermediate_cfg = self.intermediate_runner.config
 
-        self.tokenizer = AutoTokenizer.from_pretrained(config.model, use_fast=True)
+        self.tokenizer = load_auto_tokenizer(
+            config.model,
+            tokenizer_path=config.tokenizer_path,
+        )
         config.eos = self.tokenizer.eos_token_id
         self.scheduler = Scheduler(
             config,

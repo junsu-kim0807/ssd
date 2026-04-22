@@ -5,7 +5,7 @@ import torch
 import torch.distributed as dist
 from multiprocessing.synchronize import Event
 from multiprocessing.shared_memory import SharedMemory
-from transformers import AutoTokenizer, AutoConfig
+from transformers import AutoConfig
 import os
 import flashinfer
 from ssd.config import Config, _decoder_cfg
@@ -17,6 +17,7 @@ from ssd.models.eagle3_draft_llama3 import Eagle3DraftForCausalLM
 from ssd.layers.sampler import Sampler
 from ssd.utils.context import set_context, reset_context, get_context
 from ssd.utils.loader import load_model
+from ssd.utils.misc import load_auto_tokenizer
 from ssd.engine.helpers.runner_helpers import (
     prepare_decode_tensors_from_seqs,
     prepare_block_tables_from_seqs,
@@ -71,7 +72,10 @@ class ModelRunner:
         self.decoder_hf_config = _decoder_cfg(self.hf_config)
         self.block_size = config.kvcache_block_size
         self.enforce_eager = config.enforce_eager
-        self.tokenizer = AutoTokenizer.from_pretrained(config.tokenizer_path if config.tokenizer_path else config.model, use_fast=True)
+        self.tokenizer = load_auto_tokenizer(
+            config.model,
+            tokenizer_path=config.tokenizer_path,
+        )
         self.max_num_blocks = (config.max_model_len + self.block_size - 1) // self.block_size
 
         assert self.hf_config is not None, "ERROR in ModelRunner: hf_config is None" # this implies boundedness to the end 
