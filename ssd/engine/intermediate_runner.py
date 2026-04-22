@@ -13,8 +13,8 @@ class IntermediateRunner(ModelRunner):
     def create_intermediate_config(cls, cfg: Config) -> Config:
         path = cfg.intermediate or cfg.draft
         util = min(0.45, max(0.05, cfg.gpu_memory_utilization * 0.4))
-        # Colocated on rank 0 only: never inherit target TP world (would call init_process_group
-        # with no intermediate worker ranks).
+        # Sync hierarchical: keep ``num_gpus`` aligned with the target Config (node layout / parity).
+        # The intermediate ModelRunner still uses ``num_tp_gpus=1`` on rank 0 (no extra TP workers).
         return dataclasses.replace(
             cfg,
             model=path,
@@ -23,7 +23,7 @@ class IntermediateRunner(ModelRunner):
             enforce_eager=True,
             speculate=False,
             draft_async=False,
-            num_gpus=1,
+            num_gpus=cfg.num_gpus,
         )
 
     def __init__(self, cfg: Config):

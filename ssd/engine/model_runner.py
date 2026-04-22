@@ -79,6 +79,10 @@ class ModelRunner:
         # TODO: Get rid of this.
         if self.is_draft:
             should_use_dist = self.config.draft_async
+        elif self.intermediate_mode:
+            # Hierarchical intermediate is colocated on target rank 0 only; never init a second
+            # process group even when config.num_gpus matches the target (TP workers are busy).
+            should_use_dist = False
         else:
             should_use_dist = self.config.num_gpus > 1
 

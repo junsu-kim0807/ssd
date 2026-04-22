@@ -123,7 +123,11 @@ class Scheduler:
         scheduled_seqs = []
         num_batched_tokens = 0 # within this round only 
         
-        while self.waiting: 
+        while self.waiting:
+            # Option A (HV): admit new prefill only when every running seq is at round 0 so batches
+            # never mix target vs intermediate verify (see VerifierHierarchical.verify).
+            if self.hierarchical and self.running and not all(s.hv_round_idx == 0 for s in self.running):
+                break
 
             seq = self.waiting[0]
 
@@ -216,6 +220,10 @@ class Scheduler:
         if self.intermediate_block_manager is not None:
             self.intermediate_block_manager.deallocate(seq)
         self._hv_discard_provisional(seq)
+        if self.hierarchical and self.intermediate_block_manager is not None:
+            # deallocate() already zeros these; keep explicit invariants after provisional discard.
+            seq.num_inter_cached_tokens = 0
+            seq.inter_block_table.clear()
         self.waiting.appendleft(seq) # self.running handled in schedule() when preempt called
 
         # ── instead, absorb completions as "new prompt" so we re-cache them next prefill

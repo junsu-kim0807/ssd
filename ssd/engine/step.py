@@ -1,4 +1,5 @@
 from abc import ABC, abstractmethod
+import json
 import os
 import torch
 from time import perf_counter
@@ -8,6 +9,7 @@ from ssd.engine.model_runner import ModelRunner
 from ssd.engine.sequence import Sequence
 from ssd.engine.scheduler import Scheduler
 from ssd.engine.helpers.speculate_types import SpeculatorBase, VerifierBase, VerifyResult
+from ssd.engine.verifier_hierarchical import VerifierHierarchical
 from ssd.utils.misc import decode_tokens
 from ssd.utils.profiler import SSDProfiler
 from ssd.utils.profiler_metadata import draft_metadata_from_logits, trace_to_row_indexed
@@ -74,6 +76,36 @@ class SpecDecodeStep(InferenceStep):
         self.async_spec = async_spec
         self.profiler = profiler
 
+    def _hv_correctness_debug_log(
+        self,
+        seqs: list[Sequence],
+        speculate_result,
+        out_verify_result,
+        pre_comp_lens: list[int],
+        round_idx_start: list[int],
+        dbg_target_cands: list[list[int]] | None,
+    ) -> None:
+        """One JSON line per sequence when ``config.debug_mode`` and hierarchical (bench --debug)."""
+        if not isinstance(self.verifier, VerifierHierarchical):
+            return
+        spec_rows = speculate_result.speculations.detach().cpu().tolist()
+        for bi, seq in enumerate(seqs):
+            row = {
+                "hv_correctness_debug": True,
+                "seq_id": seq.seq_id,
+                "hv_round_idx_at_step_start": round_idx_start[bi],
+                "draft_spec_token_ids": spec_rows[bi],
+                "intermediate_verify_accepted_token_ids": out_verify_result.new_suffixes[bi]
+                if out_verify_result.is_hv_intermediate
+                else None,
+                "target_verify_input_token_ids": dbg_target_cands[bi] if dbg_target_cands is not None else None,
+                "verify_recovery_token_id": out_verify_result.recovery_tokens[bi],
+                "output_new_completion_token_ids": list(
+                    seq.completion_token_ids[pre_comp_lens[bi] :]
+                ),
+            }
+            print(json.dumps(row, ensure_ascii=False), flush=True)
+
     def _profiler_active(self) -> bool:
         return isinstance(self.profiler, SSDProfiler)
 
@@ -116,6 +148,13 @@ class SpecDecodeStep(InferenceStep):
                 _nvtx = None
 
         hierarchical = getattr(self.scheduler, "hierarchical", False)
+        dbg_hv_pre_comp: list[int] | None = None
+        dbg_hv_round0: list[int] | None = None
+        dbg_target_cands: list[list[int]] | None = None
+        if hierarchical and getattr(self.scheduler.config, "debug_mode", False):
+            dbg_hv_pre_comp = [seq.num_completion_tokens for seq in seqs]
+            dbg_hv_round0 = [seq.hv_round_idx for seq in seqs]
+
         if hierarchical:
             saved = [
                 (
@@ -180,6 +219,10 @@ class SpecDecodeStep(InferenceStep):
                 decoded_tokens = decode_tokens(new_suffix + [recovery_tokens[i]], self.tokenizer)
                 print(f"[SpecDecodeStep] verification {i}: {decoded_tokens}", flush=True)
 
+        if hierarchical and getattr(self.scheduler.config, "debug_mode", False):
+            if isinstance(self.verifier, VerifierHierarchical) and not out_verify_result.is_hv_intermediate:
+                dbg_target_cands = self.verifier._build_target_candidates(seqs, speculate_result)
+
         # Restore original seq state before postprocess (undo speculate + verify modifications)
         if hierarchical:
             for seq, (orig_len, orig_nt, orig_lt, orig_ndc, orig_nct, orig_nic) in zip(seqs, saved):
@@ -223,6 +266,21 @@ class SpecDecodeStep(InferenceStep):
             )
         if self._profiler_active():
             pr.finish_stage("postprocess")
+
+        if (
+            hierarchical
+            and dbg_hv_pre_comp is not None
+            and dbg_hv_round0 is not None
+            and getattr(self.scheduler.config, "debug_mode", False)
+        ):
+            self._hv_correctness_debug_log(
+                seqs,
+                speculate_result,
+                out_verify_result,
+                dbg_hv_pre_comp,
+                dbg_hv_round0,
+                dbg_target_cands,
+            )
 
         if _prof:
             torch.cuda.synchronize()

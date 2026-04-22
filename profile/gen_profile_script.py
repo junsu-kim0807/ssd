@@ -8,7 +8,7 @@ Layout for ``--profiler_output_dir`` when ``bench.py`` is run with ``--profile``
 
 Sweep flags (optional, Cartesian product with other dimensions):
   --batch   → batch sizes 1, 4, 16, 64, 256
-  --length  → speculative k 3, 5, 7, 9 (sync/async only; AR keeps path segment ``kna``)
+  --length  → speculative k 3, 5, 7, 9 (methods with ``uses_spec_k``; AR keeps path segment ``kna``)
   --temp    → temperatures 0, 0.3, 0.7, 1.0
 
 Adding a method
@@ -65,9 +65,13 @@ DEFAULT_GPU_BY_FAMILY_METHOD: dict[tuple[str, str], int] = {
     ("qwen", "ar"): 2,
     ("qwen", "sync"): 2,
     ("qwen", "async"): 3,
+    ("qwen", "hierarchical"): 2,
+    ("qwen", "pivot"): 3,
     ("gemma", "ar"): 2,
     ("gemma", "sync"): 2,
     ("gemma", "async"): 3,
+    ("gemma", "hierarchical"): 2,
+    ("gemma", "pivot"): 3,
 }
 
 
@@ -141,6 +145,24 @@ def _args_async(k: int, f: int) -> list[str]:
     return ["--spec", "--async", "--k", str(k), "--f", str(f)]
 
 
+def _args_hierarchical(k: int, _f: int) -> list[str]:
+    return ["--spec", "--k", str(k), "--spec_policy", "hierarchical"]
+
+
+def _args_pivot(k: int, f: int) -> list[str]:
+    return [
+        "--spec",
+        "--async",
+        "--k",
+        str(k),
+        "--f",
+        str(f),
+        "--spec_policy",
+        "pivot",
+        "--spec_hive",
+    ]
+
+
 METHOD_REGISTRY: dict[str, BenchMethodSpec] = {
     "ar": BenchMethodSpec(
         id="ar",
@@ -162,6 +184,20 @@ METHOD_REGISTRY: dict[str, BenchMethodSpec] = {
         uses_spec_k=True,
         default_k=7,
         extra_bench_args=_args_async,
+    ),
+    "hierarchical": BenchMethodSpec(
+        id="hierarchical",
+        description="Sync spec with hierarchical verification (intermediate + target rounds)",
+        uses_spec_k=True,
+        default_k=6,
+        extra_bench_args=_args_hierarchical,
+    ),
+    "pivot": BenchMethodSpec(
+        id="pivot",
+        description="Async spec with pivot policy (--spec_policy pivot --spec_hive)",
+        uses_spec_k=True,
+        default_k=7,
+        extra_bench_args=_args_pivot,
     ),
 }
 

@@ -57,8 +57,13 @@ def parse_arguments():
     parser.add_argument("--flh", type=int, nargs='+', default=None, help="Fan out list (e.g., --flh 1 3 4 becomes [1, 3, 4])")
     parser.add_argument("--flm", type=int, nargs='+', default=None, help="Fan out list miss (e.g., --flm 1 3 4 becomes [1, 3, 4])")
     parser.add_argument("--backup", type=str, choices=["jit", "fast"], default="jit", help="Backup strategy (jit or fast)")
-    parser.add_argument("--spec_policy", type=str, choices=["default", "pivot"], default="default",
-                        help="Speculative policy to use")
+    parser.add_argument(
+        "--spec_policy",
+        type=str,
+        choices=["default", "pivot", "hierarchical"],
+        default="default",
+        help="Speculative policy to use",
+    )
     parser.add_argument("--spec_hive", action="store_true",
                         help="Enable spec_hive mode for pivot policy")
     parser.add_argument("--interval", type=int, default=0,
@@ -576,6 +581,10 @@ def main():
         args.numseqs = 8
 
     ensure_benchmark_dataset(args)
+
+    if args.debug and args.spec and args.spec_policy == "hierarchical":
+        print("[bench] --debug with hierarchical: forcing --output_len=1 for step-wise correctness logs", flush=True)
+        args.output_len = 1
 
     model_name, model_path, draft_path = get_model_paths(args)
 
