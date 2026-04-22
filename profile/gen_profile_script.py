@@ -334,7 +334,7 @@ def build_bench_argv(
     argv: list[str] = [
         "python",
         "-O",
-        "bench.py",
+        "bench/bench.py",
         f"--{model_flag}",
         "--gpus",
         str(gpus),
@@ -362,7 +362,7 @@ def format_multiline_cmd(argv: Sequence[str]) -> str:
     """Render bash command with '\' continuations.
 
     Style:
-      python -O bench.py \
+      python -O bench/bench.py \
         --qwen \
         --gpus 2 \
         --b 1 \
@@ -460,7 +460,7 @@ def build_multi_dataset_profile_loop_sh(
         "    codeelo) EXTRA_DS=(--codeelo);;",
         '    *) echo "unknown dataset: ${dataset}" >&2; exit 1;;',
         "  esac",
-        "  python -O bench.py \\",
+        "  python -O bench/bench.py \\",
         f"    --{model_flag} \\",
         f"    --gpus {int(gpus)} \\",
         f"    --b {int(batch_size)} \\",
