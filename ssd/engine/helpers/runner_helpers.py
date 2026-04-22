@@ -84,7 +84,13 @@ def prepare_decode_tensors_from_seqs(
                 pt = seq.hv_num_provisional_tokens
                 prov = seq.hv_provisional_token_ids
                 assert len(prov) == pt, "hv_num_provisional_tokens must match provisional list length"
-                last_tok = prov[-1]
+                # Only the first draft forward of this speculate may sit purely on the provisional
+                # stem (recovery skipped onto ``token_ids``). Later forwards must use the token
+                # just appended so autoregressive draft advances.
+                if seq.num_tokens == seq.num_cached_tokens:
+                    last_tok = prov[-1]
+                else:
+                    last_tok = seq.last_token
                 logical_pos = len(seq) - 1 + pt
                 context_len = len(seq) + pt
             else:
@@ -182,8 +188,10 @@ def prepare_intermediate_verify_suffix_tensors(
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, int]:
     """One packed forward over the speculative tail on the *intermediate* KV.
 
-    ``seq.token_ids[num_cached : num_cached + k + 1]`` is the draft speculative chain
-    (recovery + K drafts), physically appended at the committed frontier ``num_cached``.
+    The chain is always length ``k+1``: recovery then ``k`` draft tokens. When HV
+    ``skip_append`` left recovery only on ``hv_provisional_token_ids[-1]``, the tail is
+    ``[prov[-1]] + token_ids[num_cached : num_cached + k]``; otherwise it is
+    ``token_ids[num_cached : num_cached + k + 1]``.
 
     RoPE positions start at ``num_inter_cached_tokens`` (intermediate KV depth before this
     forward), which must match prior intermediate accepts + provisional depth — not only
@@ -201,7 +209,11 @@ def prepare_intermediate_verify_suffix_tensors(
             f"intermediate verify: num_inter_cached_tokens must be >= num_cached_tokens, "
             f"got {base_pos} vs {c0}"
         )
-        tail = seq.token_ids[c0 : c0 + k + 1]
+        pt = seq.hv_num_provisional_tokens
+        if pt > 0:
+            tail = [seq.hv_provisional_token_ids[-1]] + list(seq.token_ids[c0 : c0 + k])
+        else:
+            tail = list(seq.token_ids[c0 : c0 + k + 1])
         assert len(tail) == k + 1, (
             f"intermediate verify: need K+1 tokens on tail, got {len(tail)} (K={k})"
         )

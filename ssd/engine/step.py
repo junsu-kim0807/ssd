@@ -166,7 +166,6 @@ class SpecDecodeStep(InferenceStep):
                     seq.last_token,
                     seq.num_draft_cached_tokens,
                     seq.num_cached_tokens,
-                    seq.num_inter_cached_tokens,
                 )
                 for seq in seqs
             ]
@@ -228,13 +227,13 @@ class SpecDecodeStep(InferenceStep):
 
         # Restore original seq state before postprocess (undo speculate + verify modifications)
         if hierarchical:
-            for seq, (orig_len, orig_nt, orig_lt, orig_ndc, orig_nct, orig_nic) in zip(seqs, saved):
+            for seq, (orig_len, orig_nt, orig_lt, orig_ndc, orig_nct) in zip(seqs, saved):
                 del seq.token_ids[orig_len:]
                 seq.num_tokens = orig_nt
                 seq.last_token = orig_lt
                 seq.num_draft_cached_tokens = orig_ndc
                 seq.num_cached_tokens = orig_nct
-                seq.num_inter_cached_tokens = orig_nic
+                # Keep ``num_inter_cached_tokens`` from verify (e.g. += K+1 on intermediate).
         else:
             for seq, (orig_len, orig_nt, orig_lt, orig_ndc, orig_nct) in zip(seqs, saved):
                 del seq.token_ids[orig_len:]
