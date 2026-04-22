@@ -63,10 +63,10 @@ class Scheduler:
         self.running: deque[Sequence] = deque()
 
     def hv_target_lookahead_upper(self) -> int:
-        """Worst-case target verify + speculate reservation (see hierarchical plan)."""
+        """Worst-case length of one target HV verify pass (see VerifierHierarchical._build_target_candidates)."""
         r = self.config.target_verify_interval
         K = self.K
-        return (K + 1) * r + K + 1
+        return r * K + 2
 
     def hv_seq_lookahead_budget(self, seq: Sequence) -> int:
         """Per-sequence decode lookahead: depends on HV round and provisional depth."""
@@ -77,12 +77,15 @@ class Scheduler:
         steps_left = max(0, r - u)
         return (K + 1) * steps_left + (p + K + 1)
 
-    def hv_target_round_lookahead(self, seq: Sequence) -> int:
-        """Target model: longest one-shot verify candidate on committed KV (provisional prefix + speculate row)."""
-        K = self.K
-        p = seq.hv_num_provisional_tokens
-        pr = 1 if seq.hv_provisional_recovery_token_id is not None else 0
-        return pr + p + (K + 1)
+    def hv_target_round_lookahead(self, _seq: Sequence) -> int:
+        """Target BlockManager headroom for the target HV round, reserved from round 0 onward.
+
+        Must cover the worst-case one-shot verify candidate on committed KV:
+        optional ``hv_provisional_recovery_token_id`` (1) + at most ``(r-1)*K`` provisional
+        tokens + a full speculate row ``(K+1)`` → ``r*K + 2``. Using the current-round
+        ``pr + p + (K+1)`` under-reserves early in the cycle while ``p`` is still small.
+        """
+        return self.hv_target_lookahead_upper()
 
     def is_finished(self):
         return not self.waiting and not self.running
