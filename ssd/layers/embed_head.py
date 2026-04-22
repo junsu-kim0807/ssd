@@ -99,6 +99,9 @@ class ParallelLMHead(VocabParallelEmbedding):
                     flat_logits = torch.cat(parts, dim=-1) if self.tp_rank == 0 else None
                 if flat_logits is None:
                     return None
+                # Hierarchical target verify: per-seq lengths; B=1 makes total_tokens % B == 0 uninformative.
+                if getattr(context, "is_varlen_verify", False):
+                    return flat_logits
                 # Check if constant query len (verify/tree) or variable (glue)
                 batch_size = context.cu_seqlens_q.size(0) - 1
                 total_tokens = x.size(0)

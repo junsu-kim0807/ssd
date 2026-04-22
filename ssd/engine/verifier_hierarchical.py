@@ -158,6 +158,8 @@ class VerifierHierarchical(VerifierBase):
         # prepare_verify_tensors_varlen uses seq.num_cached_tokens as the KV frontier.
         # Do not bump num_cached_tokens before the call (that would shift positions/slots).
         logits_flat = self.target_model_runner.call("run_verify_varlen", seqs, candidates)
+        if logits_flat is not None and logits_flat.dim() == 3:
+            logits_flat = logits_flat.reshape(-1, logits_flat.size(-1))
 
         new_suffixes: list[list[int]] = []
         recovery_tokens: list[int] = []

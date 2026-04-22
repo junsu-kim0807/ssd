@@ -748,6 +748,7 @@ class ModelRunner:
             slot_mapping=slot_mapping,
             context_lens=context_lens,
             block_tables=block_tables,
+            is_varlen_verify=True,
         )
         return input_ids, positions
 
