@@ -1,5 +1,4 @@
 from abc import ABC, abstractmethod
-from dataclasses import dataclass
 import os
 import torch
 from time import perf_counter
@@ -10,6 +9,12 @@ from ssd.engine.sequence import Sequence
 from ssd.engine.scheduler import Scheduler
 from ssd.engine.helpers.speculate_types import SpeculatorBase, VerifierBase, VerifyResult
 from ssd.utils.misc import decode_tokens
+from ssd.utils.profiler import SSDProfiler
+from ssd.utils.profiler_metadata import (
+    draft_metadata_from_logits,
+    prefill_metadata_rows,
+    trace_to_row_indexed,
+)
 
 
 class InferenceStep(ABC):
@@ -63,6 +68,7 @@ class SpecDecodeStep(InferenceStep):
         eagle: bool,
         tokenizer: AutoTokenizer,
         async_spec: bool,
+        profiler: object | None = None,
     ):
         super().__init__(scheduler)
         self.speculator = speculator
@@ -70,21 +76,54 @@ class SpecDecodeStep(InferenceStep):
         self.eagle = eagle
         self.tokenizer = tokenizer
         self.async_spec = async_spec
+        self.profiler = profiler
+
+    def _profiler_active(self) -> bool:
+        return isinstance(self.profiler, SSDProfiler)
 
     def prefill(self, seqs: list[Sequence]) -> int:
-        # When doing async speculation and not Eagle, we can do draft and target prefills in parallel.
+        pr = self.profiler
+        if self._profiler_active():
+            if not self.eagle and self.async_spec:
+                pr.start_stage("draft_prefill")
+            else:
+                pr.start_stage("target_prefill")
+
         if not self.eagle and self.async_spec:
             empty_verify_result = VerifyResult([], [], None)
             self.speculator.prefill(seqs, empty_verify_result)
+            if self._profiler_active():
+                pr.finish_stage("draft_prefill")
+                pr.start_stage("target_prefill")
             verify_result = self.verifier.prefill(seqs, eagle=False)
+            if self._profiler_active():
+                pr.finish_stage("target_prefill")
         else:
             verify_result = self.verifier.prefill(seqs, eagle=self.eagle)
+            if self._profiler_active():
+                pr.finish_stage("target_prefill")
+                pr.start_stage("draft_prefill")
             self.speculator.prefill(seqs, verify_result)
+            if self._profiler_active():
+                pr.finish_stage("draft_prefill")
+
+        if self._profiler_active() and pr.wants_metadata_computation():
+            rows_pf = prefill_metadata_rows(
+                profiler=pr,
+                seqs=seqs,
+                speculate_k=self.verifier.lookahead,
+                spec_policy=pr.spec_policy,
+                draft_async=pr.draft_async,
+                cost_fields=(pr.mode == "cost_metadata"),
+            )
+            pr.flush_spec_decode_rows(seqs, True, rows_pf)
 
         for seq in seqs:
             assert seq.recovery_token_id is not None
             seq.num_cached_tokens = seq.num_prompt_tokens
             seq.num_draft_cached_tokens = seq.num_prompt_tokens
+            if getattr(self.scheduler, "hierarchical", False):
+                seq.num_inter_cached_tokens = seq.num_prompt_tokens
 
         return sum(len(seq) for seq in seqs)
 
@@ -94,11 +133,35 @@ class SpecDecodeStep(InferenceStep):
             torch.cuda.synchronize()
             _t0 = perf_counter()
 
-        # Save lightweight state instead of expensive clone_spec deep copy.
-        # speculate() modifies: token_ids (append+extend), num_tokens, last_token, num_draft_cached_tokens
-        # verify() modifies: num_cached_tokens (line 77 of verifier.py)
-        # postprocess_speculate() needs the ORIGINAL state to apply new suffixes.
-        saved = [(len(seq.token_ids), seq.num_tokens, seq.last_token, seq.num_draft_cached_tokens, seq.num_cached_tokens) for seq in seqs]
+        pr = self.profiler
+        _nvtx = None
+        if self._profiler_active() and pr.wants_kernel():
+            try:
+                import torch.cuda.nvtx as _nvtx_mod
+
+                _nvtx = _nvtx_mod
+                _nvtx.range_push("spec_decode")
+            except Exception:
+                _nvtx = None
+
+        hierarchical = getattr(self.scheduler, "hierarchical", False)
+        if hierarchical:
+            saved = [
+                (
+                    len(seq.token_ids),
+                    seq.num_tokens,
+                    seq.last_token,
+                    seq.num_draft_cached_tokens,
+                    seq.num_cached_tokens,
+                    seq.num_inter_cached_tokens,
+                )
+                for seq in seqs
+            ]
+        else:
+            saved = [
+                (len(seq.token_ids), seq.num_tokens, seq.last_token, seq.num_draft_cached_tokens, seq.num_cached_tokens)
+                for seq in seqs
+            ]
 
         eagle_sentinel = True if self.eagle else None
         in_verify_result = VerifyResult(
@@ -107,7 +170,12 @@ class SpecDecodeStep(InferenceStep):
             eagle_acts=eagle_sentinel,
         )
         #### STEP 1: SPECULATE ####
+        if self._profiler_active():
+            pr.bump_draft_requests(len(seqs))
+            pr.start_stage("draft")
         speculate_result = self.speculator.speculate(seqs, in_verify_result)
+        if self._profiler_active():
+            pr.finish_stage("draft")
 
         if _prof:
             torch.cuda.synchronize()
@@ -123,7 +191,12 @@ class SpecDecodeStep(InferenceStep):
                 print(f"[SpecDecodeStep] speculation {i}: {decoded_tokens}", flush=True)
 
         #### STEP 2: VERIFY ####
+        if self._profiler_active():
+            pr.start_stage("verify")
         out_verify_result = self.verifier.verify(seqs, speculate_result, eagle=self.eagle)
+        if self._profiler_active():
+            pr.finish_stage("verify")
+            pr.record_decode_verify_batch(seqs, out_verify_result)
 
         if _prof:
             torch.cuda.synchronize()
@@ -137,20 +210,48 @@ class SpecDecodeStep(InferenceStep):
                 print(f"[SpecDecodeStep] verification {i}: {decoded_tokens}", flush=True)
 
         # Restore original seq state before postprocess (undo speculate + verify modifications)
-        for seq, (orig_len, orig_nt, orig_lt, orig_ndc, orig_nct) in zip(seqs, saved):
-            del seq.token_ids[orig_len:]
-            seq.num_tokens = orig_nt
-            seq.last_token = orig_lt
-            seq.num_draft_cached_tokens = orig_ndc
-            seq.num_cached_tokens = orig_nct
+        if hierarchical:
+            for seq, (orig_len, orig_nt, orig_lt, orig_ndc, orig_nct, orig_nic) in zip(seqs, saved):
+                del seq.token_ids[orig_len:]
+                seq.num_tokens = orig_nt
+                seq.last_token = orig_lt
+                seq.num_draft_cached_tokens = orig_ndc
+                seq.num_cached_tokens = orig_nct
+                seq.num_inter_cached_tokens = orig_nic
+        else:
+            for seq, (orig_len, orig_nt, orig_lt, orig_ndc, orig_nct) in zip(seqs, saved):
+                del seq.token_ids[orig_len:]
+                seq.num_tokens = orig_nt
+                seq.last_token = orig_lt
+                seq.num_draft_cached_tokens = orig_ndc
+                seq.num_cached_tokens = orig_nct
 
         #### STEP 3: POSTPROCESS ####
-        self.scheduler.postprocess_speculate(
-            seqs,
-            out_verify_result.new_suffixes,
-            out_verify_result.recovery_tokens,
-            eagle_acts=out_verify_result.eagle_acts if self.eagle else None,
-        )
+        if self._profiler_active():
+            pr.start_stage("postprocess")
+        if hierarchical:
+            if out_verify_result.is_hv_intermediate:
+                self.scheduler.postprocess_hv_intermediate_round(
+                    seqs,
+                    out_verify_result.new_suffixes,
+                    out_verify_result.recovery_tokens,
+                )
+            else:
+                self.scheduler.postprocess_hv_target_round(
+                    seqs,
+                    out_verify_result.new_suffixes,
+                    out_verify_result.recovery_tokens,
+                    eagle_acts=out_verify_result.eagle_acts if self.eagle else None,
+                )
+        else:
+            self.scheduler.postprocess_speculate(
+                seqs,
+                out_verify_result.new_suffixes,
+                out_verify_result.recovery_tokens,
+                eagle_acts=out_verify_result.eagle_acts if self.eagle else None,
+            )
+        if self._profiler_active():
+            pr.finish_stage("postprocess")
 
         if _prof:
             torch.cuda.synchronize()
@@ -159,5 +260,59 @@ class SpecDecodeStep(InferenceStep):
             hits_str = f"hits={cache_hits.sum().item()}/{len(cache_hits)}" if cache_hits is not None else ""
             toks = sum(len(s) for s in out_verify_result.new_suffixes)
             print(f"[PROFILE target] handshake={(_t1-_t0)*1000:.2f}ms verify={(_t2-_t1)*1000:.2f}ms postprocess={(_t3-_t2)*1000:.2f}ms total={(_t3-_t0)*1000:.2f}ms {hits_str} toks={toks}", flush=True)
+
+        if self._profiler_active() and pr.wants_metadata_computation():
+            st = pr.current_step_state
+            if st is not None and speculate_result.logits_q is not None and speculate_result.logits_q.numel() > 0:
+                k = self.verifier.lookahead
+                f_ids, f_conf, d_ids, d_conf = draft_metadata_from_logits(
+                    speculate_result.logits_q, speculate_result.speculations, k
+                )
+                B = len(seqs)
+                step_wall = pr.current_step_elapsed_s()
+                nd = st.num_draft_requests_step or B
+                nv = st.num_verification_requests_step or B
+                draft_row_s = (
+                    float(st.draft_time_worker_s)
+                    if pr.draft_async and st.draft_time_worker_s > 0.0
+                    else float(st.draft_time_s)
+                )
+                rows = []
+                for bi, seq in enumerate(seqs):
+                    ch = None
+                    if speculate_result.cache_hits is not None:
+                        ch = int(speculate_result.cache_hits[bi].item())
+                    rows.append(
+                        trace_to_row_indexed(
+                            profiler=pr,
+                            seq=seq,
+                            batch_index=bi,
+                            batch_size=B,
+                            is_prefill=False,
+                            speculate_k=k,
+                            spec_policy=pr.spec_policy,
+                            draft_async=pr.draft_async,
+                            cache_hit=ch,
+                            trace=out_verify_result.profile_trace,
+                            first_draft_token_ids=f_ids[bi],
+                            first_draft_token_confidence=f_conf[bi],
+                            draft_token_ids_per_position=d_ids[bi],
+                            draft_token_confidence_per_position=d_conf[bi],
+                            step_wall_time_s=step_wall,
+                            draft_time_s=draft_row_s,
+                            verification_time_s=st.verification_time_s,
+                            sync_time_s=st.sync_time_s,
+                            num_draft=nd,
+                            num_verification=nv,
+                            cost_fields=(pr.mode == "cost_metadata"),
+                        )
+                    )
+                pr.flush_spec_decode_rows(seqs, False, rows)
+
+        if _nvtx is not None:
+            try:
+                _nvtx.range_pop()
+            except Exception:
+                pass
 
         return sum(len(s) for s in out_verify_result.new_suffixes)

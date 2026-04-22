@@ -1,0 +1,182 @@
+"""Assemble per-request profiler JSON rows (metadata / cost_metadata).
+
+Per-row ``num_draft`` / ``num_verification``: for decode steps, the profiler's
+per-step batch counts (typically ``batch_size`` when each sequence runs one draft
+and one verify in that step). Prefill rows use the same batch size for both.
+"""
+
+from __future__ import annotations
+
+from typing import Any
+
+import torch
+import torch.nn.functional as F
+
+
+def draft_metadata_from_logits(
+    logits_q: torch.Tensor,
+    speculations: torch.Tensor,
+    k: int,
+) -> tuple[
+    list[list[int]],
+    list[list[float]],
+    list[list[int]],
+    list[list[float]],
+]:
+    """Draft fields: raw-softmax top-5 at position 0; chosen-token conf per draft position (k rows)."""
+    device = logits_q.device
+    b, kq, v = logits_q.shape
+    assert kq == k, (kq, k)
+    probs0 = F.softmax(logits_q[:, 0, :].float(), dim=-1)
+    tk = min(5, v)
+    top5 = torch.topk(probs0, k=tk, dim=-1)
+    first_ids = top5.indices.cpu().tolist()
+    first_conf = top5.values.cpu().tolist()
+    pad = 5 - tk
+    if pad > 0:
+        first_ids = [row + [0] * pad for row in first_ids]
+        first_conf = [row + [0.0] * pad for row in first_conf]
+
+    probs_all = F.softmax(logits_q.float(), dim=-1)
+    chosen = speculations[:, 1 : k + 1].to(device).long().clamp(0, v - 1)
+    gather_idx = chosen.unsqueeze(-1)
+    conf_pos = probs_all.gather(2, gather_idx).squeeze(-1).cpu().tolist()
+    draft_ids = chosen.cpu().tolist()
+    draft_ids_out = [[int(draft_ids[i][j]) for j in range(k)] for i in range(b)]
+    conf_pos_out = [[float(conf_pos[i][j]) for j in range(k)] for i in range(b)]
+    return first_ids, first_conf, draft_ids_out, conf_pos_out
+
+
+def prefill_metadata_rows(
+    *,
+    profiler: Any,
+    seqs: list[Any],
+    speculate_k: int,
+    spec_policy: str,
+    draft_async: bool,
+    cost_fields: bool,
+) -> list[dict[str, Any]]:
+    """One JSON row per request for a speculative prefill step (no decode logits)."""
+    st = profiler.current_step_state
+    B = len(seqs)
+    step_wall = profiler.current_step_elapsed_s()
+    draft_s = float(st.draft_time_s) if st is not None else 0.0
+    ver_s = float(st.verification_time_s) if st is not None else 0.0
+    sync_s = float(st.sync_time_s) if st is not None else 0.0
+    nd, nv = B, B
+    rows = []
+    for bi, seq in enumerate(seqs):
+        rows.append(
+            trace_to_row_indexed(
+                profiler=profiler,
+                seq=seq,
+                batch_index=bi,
+                batch_size=B,
+                is_prefill=True,
+                speculate_k=speculate_k,
+                spec_policy=spec_policy,
+                draft_async=draft_async,
+                cache_hit=None,
+                trace=None,
+                first_draft_token_ids=[0, 0, 0, 0, 0],
+                first_draft_token_confidence=[0.0, 0.0, 0.0, 0.0, 0.0],
+                draft_token_ids_per_position=[0] * speculate_k,
+                draft_token_confidence_per_position=[0.0] * speculate_k,
+                step_wall_time_s=step_wall,
+                draft_time_s=draft_s,
+                verification_time_s=ver_s,
+                sync_time_s=sync_s,
+                num_draft=nd,
+                num_verification=nv,
+                cost_fields=cost_fields,
+            )
+        )
+    return rows
+
+
+def trace_to_row_indexed(
+    *,
+    profiler: Any,
+    seq: Any,
+    batch_index: int,
+    batch_size: int,
+    is_prefill: bool,
+    speculate_k: int,
+    spec_policy: str,
+    draft_async: bool,
+    cache_hit: int | None,
+    trace: Any | None,
+    first_draft_token_ids: list[int],
+    first_draft_token_confidence: list[float],
+    draft_token_ids_per_position: list[int],
+    draft_token_confidence_per_position: list[float],
+    step_wall_time_s: float,
+    draft_time_s: float,
+    verification_time_s: float,
+    sync_time_s: float,
+    num_draft: int,
+    num_verification: int,
+    cost_fields: bool,
+) -> dict[str, Any]:
+    inter_r, tgt_r = profiler.inter_target_counts_for_seq(seq.seq_id)
+    row: dict[str, Any] = {
+        "step_id": profiler.step_id,
+        "request_id": seq.seq_id,
+        "batch_size": batch_size,
+        "is_prefill": is_prefill,
+        "spec_policy": spec_policy,
+        "spec_mode": "async" if draft_async else "sync",
+        "intermediate_verification_round": inter_r,
+        "target_verification_round": tgt_r,
+        "num_speculative_token": speculate_k,
+        "first_draft_token_ids": first_draft_token_ids,
+        "first_draft_token_confidence": first_draft_token_confidence,
+        "draft_token_ids_per_position": draft_token_ids_per_position,
+        "draft_token_confidence_per_position": draft_token_confidence_per_position,
+        "cache_hit": cache_hit,
+    }
+    if trace is not None:
+        i = batch_index
+        row["verification_model"] = trace.verification_models[i]
+        row["target_token_ids_per_position"] = (
+            list(trace.token_ids_per_position[i]) if trace.token_ids_per_position[i] else None
+        )
+        row["target_token_confidence_per_position"] = (
+            list(trace.token_confidence_per_position[i]) if trace.token_confidence_per_position[i] else None
+        )
+        row["target_accept_len"] = trace.accept_len[i]
+        row["target_recovery_token"] = trace.recovery_tokens[i]
+        row["target_bonus_token"] = trace.bonus_tokens[i]
+        if trace.inter_token_ids_per_position is not None:
+            row["inter_token_ids_per_position"] = trace.inter_token_ids_per_position[i]
+            row["inter_token_confidence_per_position"] = trace.inter_token_confidence_per_position[i]
+            row["inter_accept_len"] = trace.inter_accept_len[i]
+            row["inter_recovery_token"] = trace.inter_recovery_token[i]
+            row["inter_bonus_token"] = trace.inter_bonus_token[i]
+        else:
+            row["inter_token_ids_per_position"] = None
+            row["inter_token_confidence_per_position"] = None
+            row["inter_accept_len"] = None
+            row["inter_recovery_token"] = None
+            row["inter_bonus_token"] = None
+    else:
+        row["verification_model"] = None
+        row["target_token_ids_per_position"] = None
+        row["target_token_confidence_per_position"] = None
+        row["target_accept_len"] = None
+        row["target_recovery_token"] = None
+        row["target_bonus_token"] = None
+        row["inter_token_ids_per_position"] = None
+        row["inter_token_confidence_per_position"] = None
+        row["inter_accept_len"] = None
+        row["inter_recovery_token"] = None
+        row["inter_bonus_token"] = None
+
+    if cost_fields:
+        row["step_wall_time_s"] = step_wall_time_s
+        row["draft_time_s"] = draft_time_s
+        row["verification_time_s"] = verification_time_s
+        row["sync_time_s"] = sync_time_s
+        row["num_draft"] = num_draft
+        row["num_verification"] = num_verification
+    return row

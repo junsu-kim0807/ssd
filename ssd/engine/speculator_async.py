@@ -1,5 +1,6 @@
 import torch
 import torch.distributed as dist
+from time import perf_counter
 from transformers import AutoTokenizer
 
 from ssd.engine.helpers.speculate_types import SpeculateResult, VerifyResult, SpeculatorBase
@@ -25,6 +26,8 @@ class SpeculatorAsync(SpeculatorBase):
         draft_runner_rank: int,
         tokenizer: AutoTokenizer,
         verbose: bool,
+        profiler: object | None = None,
+        enable_async_profile_wiring: bool = False,
     ):
         super().__init__(lookahead, device)
         self.async_fan_out = async_fan_out
@@ -38,6 +41,8 @@ class SpeculatorAsync(SpeculatorBase):
         self.tokenizer = tokenizer
         self.verbose = verbose
         self.K = lookahead
+        self._profiler = profiler
+        self._enable_async_profile_wiring = enable_async_profile_wiring
 
         # Pre-allocate handshake send/recv buffers (reused every step)
         self._alloc_handshake_bufs(1)
@@ -58,6 +63,8 @@ class SpeculatorAsync(SpeculatorBase):
         self._fused_response = torch.empty(B + B * self.K, dtype=torch.int64, device=d)
         self._logits_q = torch.empty(B, self.K, self.vocab_size, dtype=self.draft_dtype, device=d)
         self._extend_counts = torch.zeros(B, dtype=torch.int64, device=d)
+        self._draft_worker_wall_buf = torch.empty(1, dtype=torch.float32, device=d)
+        self._prefill_worker_wall_buf = torch.empty(1, dtype=torch.float32, device=d)
 
     def prefill(self, seqs: list[Sequence], verify_result: VerifyResult) -> SpeculateResult:
         eagle_acts = verify_result.eagle_acts
@@ -87,6 +94,11 @@ class SpeculatorAsync(SpeculatorBase):
                    input_ids, num_tokens, draft_block_table.to(torch.int64))
         if eagle_acts is not None:
             dist.send(eagle_acts, dst=self.draft_runner_rank, group=self.async_pg)
+        if self._enable_async_profile_wiring:
+            dist.recv(self._prefill_worker_wall_buf, src=self.draft_runner_rank, group=self.async_pg)
+            dt = float(self._prefill_worker_wall_buf.item())
+            if self._profiler is not None:
+                self._profiler.on_async_draft_prefill_worker_time_s(dt)
         return SpeculateResult([], [])
 
     def speculate(self, seqs: list[Sequence], verify_result: VerifyResult) -> SpeculateResult:
@@ -131,6 +143,8 @@ class SpeculatorAsync(SpeculatorBase):
         B = len(seqs)
         if B != self._hs_B:
             self._alloc_handshake_bufs(B)
+
+        t_rpc0 = perf_counter()
 
         # Fill send buffers in-place (avoids torch.tensor from Python lists)
         for i, seq in enumerate(seqs):
@@ -183,5 +197,23 @@ class SpeculatorAsync(SpeculatorBase):
         cache_hits = self._fused_response[:B]
         speculations = self._fused_response[B:].view(B, self.K)
         dist.recv(self._logits_q, src=self.draft_runner_rank, group=self.async_pg)
+
+        worker_wall_s = 0.0
+        if self._enable_async_profile_wiring:
+            dist.recv(self._draft_worker_wall_buf, src=self.draft_runner_rank, group=self.async_pg)
+            worker_wall_s = float(self._draft_worker_wall_buf.item())
+            if self._profiler is not None:
+                self._profiler.on_async_draft_worker_time_s(worker_wall_s)
+
+        rpc_dt = perf_counter() - t_rpc0
+        # Avoid double-counting draft GPU time: run-level draft_time uses worker_wall; sync_time_s
+        # should be rank0 RPC overhead (send/recv/protocol), not the full round-trip that waits on draft.
+        if self._profiler is not None:
+            add_sync = getattr(self._profiler, "add_step_async_spec_rpc_time_s", None)
+            if add_sync is not None:
+                if self._enable_async_profile_wiring and worker_wall_s > 0.0:
+                    add_sync(max(0.0, rpc_dt - worker_wall_s))
+                else:
+                    add_sync(rpc_dt)
 
         return speculations, self._logits_q, cache_hits

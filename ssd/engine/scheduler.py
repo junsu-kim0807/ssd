@@ -11,7 +11,13 @@ from ssd.utils.async_helpers.async_spec_helpers import compute_megaspec_lookahea
 
 class Scheduler:
 
-    def __init__(self, config: Config, draft_cfg: Config | None = None):
+    def __init__(
+        self,
+        config: Config,
+        draft_cfg: Config | None = None,
+        intermediate_cfg: Config | None = None,
+    ):
+        self.config = config
         self.max_num_seqs = config.max_num_seqs
         self.fan_out_list = config.fan_out_list
         self.fan_out_list_miss = config.fan_out_list_miss
@@ -26,6 +32,9 @@ class Scheduler:
         self.block_size = config.kvcache_block_size
         self.verbose = config.verbose
         self.draft_async = config.draft_async
+        self.hierarchical = bool(
+            config.speculate and getattr(config, "spec_policy", "") == "hierarchical"
+        )
         self.block_manager = BlockManager(
             config.num_kvcache_blocks, config.kvcache_block_size, is_draft=False, verbose=self.verbose, max_model_len=self.max_model_len)
 
@@ -36,8 +45,42 @@ class Scheduler:
             self.draft_block_manager = BlockManager(
                 draft_cfg.num_kvcache_blocks, draft_cfg.kvcache_block_size, is_draft=True, speculate_k=self.K, verbose=self.verbose, max_model_len=self.max_model_len)
 
+        self.intermediate_block_manager: BlockManager | None = None
+        if self.hierarchical:
+            assert intermediate_cfg is not None
+            self.intermediate_block_manager = BlockManager(
+                intermediate_cfg.num_kvcache_blocks,
+                intermediate_cfg.kvcache_block_size,
+                cache_role="intermediate",
+                speculate_k=self.K,
+                verbose=self.verbose,
+                max_model_len=self.max_model_len,
+            )
+
         self.waiting: deque[Sequence] = deque()
         self.running: deque[Sequence] = deque()
+
+    def hv_target_lookahead_upper(self) -> int:
+        """Worst-case target verify + speculate reservation (see hierarchical plan)."""
+        r = self.config.target_verify_interval
+        K = self.K
+        return (K + 1) * r + K + 1
+
+    def hv_seq_lookahead_budget(self, seq: Sequence) -> int:
+        """Per-sequence decode lookahead: depends on HV round and provisional depth."""
+        r = self.config.target_verify_interval
+        K = self.K
+        p = seq.hv_num_provisional_tokens
+        u = seq.hv_round_idx
+        steps_left = max(0, r - u)
+        return (K + 1) * steps_left + (p + K + 1)
+
+    def hv_target_round_lookahead(self, seq: Sequence) -> int:
+        """Target model: longest one-shot verify candidate on committed KV (provisional prefix + speculate row)."""
+        K = self.K
+        p = seq.hv_num_provisional_tokens
+        pr = 1 if seq.hv_provisional_recovery_token_id is not None else 0
+        return pr + p + (K + 1)
 
     def is_finished(self):
         return not self.waiting and not self.running
@@ -45,7 +88,13 @@ class Scheduler:
     def add(self, seq: Sequence):
         self.waiting.append(seq) # is the issue when f(k+1)>block_sz?
 
-    def bms_can_append(self, seq: Sequence, target_lookahead_len: int, draft_lookahead_len: int | None = None) -> bool:
+    def bms_can_append(
+        self,
+        seq: Sequence,
+        target_lookahead_len: int,
+        draft_lookahead_len: int | None = None,
+        inter_lookahead_len: int | None = None,
+    ) -> bool:
         target_can_append = self.block_manager.can_append(seq, target_lookahead_len)
         if self.speculate:
             draft_can_append = self.draft_block_manager.can_append(
@@ -54,10 +103,19 @@ class Scheduler:
             assert draft_lookahead_len is None, "ERROR in bms_can_append: draft_lookahead_len should be None if not speculate"
             draft_can_append = True
 
-        return target_can_append and draft_can_append
+        if self.intermediate_block_manager is not None:
+            assert inter_lookahead_len is not None
+            inter_ok = self.intermediate_block_manager.can_append(seq, inter_lookahead_len)
+        else:
+            inter_ok = True
+
+        return target_can_append and draft_can_append and inter_ok
 
     def bms_can_allocate(self, seq: Sequence) -> bool:
-        return self.block_manager.can_allocate(seq) and (not self.speculate or self.draft_block_manager.can_allocate(seq))
+        ok = self.block_manager.can_allocate(seq) and (not self.speculate or self.draft_block_manager.can_allocate(seq))
+        if self.intermediate_block_manager is not None:
+            ok = ok and self.intermediate_block_manager.can_allocate(seq)
+        return ok
 
     # what if we added an option to prefill jit
     def schedule(self) -> tuple[list[Sequence], bool]:
@@ -78,6 +136,8 @@ class Scheduler:
             self.block_manager.allocate(seq)
             if self.speculate:
                 self.draft_block_manager.allocate(seq)
+            if self.intermediate_block_manager is not None:
+                self.intermediate_block_manager.allocate(seq)
 
             num_batched_tokens += remain
 
@@ -98,18 +158,35 @@ class Scheduler:
             target_lookahead_len = self.K + 1
             # this will need to allow F_k strat as just sum(self.fan_out_list) when we add that 
             draft_lookahead_len = compute_megaspec_lookahead(self.MQ_LEN, self.K)
+            inter_lookahead_len = None
+        elif sync_spec and self.hierarchical:
+            target_lookahead_len = None
+            draft_lookahead_len = None
+            inter_lookahead_len = None
         elif sync_spec:
             target_lookahead_len = self.K + 1
             draft_lookahead_len = self.K + 1
+            inter_lookahead_len = None
         else: # draft doesn't matter 
             target_lookahead_len = 1
             draft_lookahead_len = None 
+            inter_lookahead_len = None
 
         while self.running and num_seqs_decoded < self.max_num_seqs:
             seq = self.running.popleft()
             # print(f"[scheduler] processing seq {seq.seq_id} for decode, num_tokens={seq.num_tokens}", flush=True)
-            
-            while not self.bms_can_append(seq, target_lookahead_len, draft_lookahead_len):
+
+            if sync_spec and self.hierarchical:
+                # Role-specific headroom: target needs one verify chain; draft/inter accumulate
+                # logical depth across HV rounds (see hierarchical plan / hv_seq_lookahead_budget).
+                draft_lookahead_len = self.hv_seq_lookahead_budget(seq)
+                inter_lookahead_len = self.hv_seq_lookahead_budget(seq)
+                target_lookahead_len = max(
+                    self.hv_target_round_lookahead(seq),
+                    self.K + 2,
+                )
+
+            while not self.bms_can_append(seq, target_lookahead_len, draft_lookahead_len, inter_lookahead_len):
                 if self.running:  # eject a running sequence if one exists
                     preempted_seq = self.running.pop()
                     self.preempt(preempted_seq)
@@ -122,6 +199,8 @@ class Scheduler:
                 self.block_manager.may_append(seq, target_lookahead_len)
                 if self.speculate:
                     self.draft_block_manager.may_append(seq, draft_lookahead_len)
+                if self.intermediate_block_manager is not None:
+                    self.intermediate_block_manager.may_append(seq, inter_lookahead_len)
                 scheduled_seqs.append(seq)
 
         self.running.extendleft(reversed(scheduled_seqs))
@@ -134,16 +213,28 @@ class Scheduler:
         self.block_manager.deallocate(seq)
         if self.speculate:
             self.draft_block_manager.deallocate(seq)
+        if self.intermediate_block_manager is not None:
+            self.intermediate_block_manager.deallocate(seq)
+        self._hv_discard_provisional(seq)
         self.waiting.appendleft(seq) # self.running handled in schedule() when preempt called
 
         # ── instead, absorb completions as "new prompt" so we re-cache them next prefill
         seq.num_prompt_tokens = seq.num_tokens
         # reinit like it's new, this can be a flag for "am on first spec step"
         seq.last_spec_step_accepted_len = -1
+        seq.intermediate_last_spec_step_accepted_len = -1
+        seq.target_last_spec_step_accepted_len = -1
+        seq.hv_round_idx = 0
         # Clear extend data so re-prefilled seq doesn't send stale extend to draft
         seq.extend_count = 0
         seq.extend_eagle_acts = None
         seq.extend_token_ids = None
+
+    def _hv_discard_provisional(self, seq: Sequence) -> None:
+        """Policy B on preempt: drop HV provisional state (tokens not in seq.token_ids)."""
+        seq.hv_provisional_token_ids.clear()
+        seq.hv_provisional_recovery_token_id = None
+        seq.hv_num_provisional_tokens = 0
 
     # non-speculative path, should handle completing a block here as well 
     def postprocess(self, seqs: list[Sequence], token_ids: list[int], is_prefill: bool):
@@ -324,5 +415,77 @@ class Scheduler:
                 seq.status = SequenceStatus.FINISHED
                 self.block_manager.deallocate(seq)
                 self.draft_block_manager.deallocate(seq)
+                if self.intermediate_block_manager is not None:
+                    self.intermediate_block_manager.deallocate(seq)
                 self.running.remove(seq)
-    
+
+    def postprocess_hv_intermediate_round(
+        self,
+        seqs: list[Sequence],
+        new_suffixes: list[list[int]],
+        recovery_tokens: list[int],
+    ) -> None:
+        """Update HV provisional state and draft frontier; no committed token_ids change."""
+        r = self.config.target_verify_interval
+        for seq, suffix, rec in zip(seqs, new_suffixes, recovery_tokens):
+            assert len(suffix) >= 1
+            body = suffix[1:]
+            seq.hv_provisional_token_ids.extend(body)
+            seq.hv_num_provisional_tokens = len(seq.hv_provisional_token_ids)
+            seq.hv_provisional_recovery_token_id = rec
+            seq.recovery_token_id = rec
+            seq.intermediate_last_spec_step_accepted_len = len(suffix)
+            if not seq.ignore_eos and self.eos in suffix:
+                seq.hv_round_idx = r - 1
+            else:
+                seq.hv_round_idx += 1
+            seq.num_draft_cached_tokens = len(seq) - 1 + seq.hv_num_provisional_tokens
+            seq.num_inter_cached_tokens += len(suffix)
+            self._hv_trim_block_tail(self.intermediate_block_manager, seq, seq.num_inter_cached_tokens)
+
+    def postprocess_hv_target_round(
+        self,
+        seqs: list[Sequence],
+        new_suffixes: list[list[int]],
+        next_recovery_tokens: list[int],
+        eagle_acts: torch.Tensor | None = None,
+    ) -> None:
+        """Final commit using target authority; clears HV provisional state."""
+        for seq in seqs:
+            self._hv_discard_provisional(seq)
+            seq.hv_round_idx = 0
+            # Provisional tokens are not in seq.token_ids; new_suffix will commit them once via
+            # postprocess_speculate. Reset draft/inter lengths to the committed tape so
+            # _update_sequence_metadata's += len(new_suffix) does not double-count provisional depth.
+            # Invariant: before postprocess_speculate, num_draft_cached_tokens == len(seq)-1 and
+            # num_inter_cached_tokens == num_cached_tokens so metadata += len(new_suffix) lands on
+            # the committed frontier only (provisional depth was tracked separately during HV).
+            seq.num_draft_cached_tokens = len(seq) - 1
+            if self.intermediate_block_manager is not None:
+                seq.num_inter_cached_tokens = seq.num_cached_tokens
+        self.postprocess_speculate(seqs, new_suffixes, next_recovery_tokens, eagle_acts=eagle_acts)
+        for seq in seqs:
+            seq.target_last_spec_step_accepted_len = seq.last_spec_step_accepted_len
+            if self.intermediate_block_manager is not None:
+                seq.num_inter_cached_tokens = seq.num_cached_tokens
+                self._hv_trim_block_tail(self.intermediate_block_manager, seq, seq.num_inter_cached_tokens)
+
+    def _hv_trim_block_tail(self, manager: BlockManager | None, seq: Sequence, required_tokens: int) -> None:
+        if manager is None:
+            return
+        required_blocks = (required_tokens + self.block_size - 1) // self.block_size
+        block_table = manager._block_table(seq)
+        if len(block_table) <= required_blocks:
+            return
+        excess = len(block_table) - required_blocks
+        for block_id in block_table[-excess:]:
+            block = manager.blocks[block_id]
+            block.ref_count -= 1
+            if block.ref_count == 0:
+                manager._deallocate_block(block_id)
+        if manager.cache_role == "intermediate":
+            seq.inter_block_table = block_table[:-excess]
+        elif manager.cache_role == "draft":
+            seq.draft_block_table = block_table[:-excess]
+        else:
+            seq.block_table = block_table[:-excess]

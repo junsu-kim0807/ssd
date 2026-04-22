@@ -1,5 +1,6 @@
 import os
 from dataclasses import dataclass
+from typing import Literal
 from transformers import AutoConfig
 import torch
 from ssd.paths import DEFAULT_TARGET, DEFAULT_DRAFT
@@ -38,6 +39,11 @@ class Config:
     threshold: float = 0.8
     expansion_pct: float = 1.0
 
+    # hierarchical verification (sync spec, single verify per step)
+    intermediate: str = ""  # HF model dir; empty => use same path as draft
+    intermediate_hf_config: AutoConfig | None = None
+    target_verify_interval: int = 2  # r: rounds 0..r-2 intermediate, r-1 target (0-indexed)
+
     # eagle3
     use_eagle: bool = False 
     eagle_layers: list[int] | None = None   
@@ -48,6 +54,12 @@ class Config:
     verbose: bool = False 
     debug_mode: bool = False 
     max_steps: int | None = None
+
+    # Profiling (disabled when profiler_output_dir is empty / None)
+    profiler_mode: Literal[
+        "cost_breakdown", "metadata", "cost_metadata", "kernel_breakdown"
+    ] = "cost_metadata"
+    profiler_output_dir: str | None = None
 
     @property
     def max_blocks(self): 
@@ -73,9 +85,10 @@ class Config:
                 if self.fan_out_list_miss is None:
                     self.fan_out_list_miss = self.fan_out_list 
                 assert sum(self.fan_out_list_miss) == sum(self.fan_out_list), "ERROR in Config: fan_out_list_miss must be the same as fan_out_list"
-            if self.spec_policy not in {"default", "pivot"}:
+            if self.spec_policy not in {"default", "pivot", "hierarchical"}:
                 raise ValueError(
-                    f"Unsupported spec_policy={self.spec_policy}. Use 'default' or 'pivot'.")
+                    f"Unsupported spec_policy={self.spec_policy}. "
+                    "Use 'default', 'pivot', or 'hierarchical'.")
             if self.interval < 0:
                 raise ValueError("interval must be >= 0")
             if not (0.0 <= self.threshold <= 1.0):
@@ -85,7 +98,33 @@ class Config:
             if self.spec_policy == "pivot":
                 assert self.draft_async, "pivot policy currently requires draft_async=True"
                 assert self.spec_hive, "pivot policy currently requires spec_hive=True"
-                
+            if self.spec_policy == "hierarchical":
+                assert not self.draft_async, "hierarchical policy requires draft_async=False (sync spec)"
+                assert not self.use_eagle, "hierarchical policy does not support EAGLE yet"
+                if self.target_verify_interval < 2:
+                    raise ValueError("target_verify_interval must be >= 2 for hierarchical (need >=1 intermediate round)")
+                im = self.intermediate or self.draft
+                self.intermediate_hf_config = AutoConfig.from_pretrained(im)
+                self.max_model_len = min(
+                    self.max_model_len, self.intermediate_hf_config.max_position_embeddings)
+
+        if self.profiler_output_dir and str(self.profiler_output_dir).strip():
+            if self.profiler_mode not in (
+                "cost_breakdown",
+                "metadata",
+                "cost_metadata",
+                "kernel_breakdown",
+            ):
+                raise ValueError(f"Unsupported profiler_mode={self.profiler_mode!r}")
+            if self.profiler_mode == "kernel_breakdown":
+                if not self.enforce_eager:
+                    print(
+                        "[Config] profiler_mode=kernel_breakdown: forcing enforce_eager=True "
+                        "for interpretable kernel traces.",
+                        flush=True,
+                    )
+                    self.enforce_eager = True
+
         if self.use_eagle:
             if self.eagle_layers is None:
                 L = self.hf_config.num_hidden_layers

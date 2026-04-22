@@ -4,7 +4,7 @@ from time import perf_counter
 import torch
 from transformers import AutoTokenizer
 
-from ssd.engine.helpers.speculate_types import SpeculateResult, VerifyResult, VerifierBase
+from ssd.engine.helpers.speculate_types import SpeculateResult, VerifyResult, VerifierBase, VerifyProfileTrace
 from ssd.engine.model_runner import ModelRunner
 from ssd.engine.sequence import Sequence
 from ssd.utils.verify import verify
@@ -30,6 +30,7 @@ class VerifierPivot(VerifierBase):
         interval: int = 0,
         threshold: float = 0.8,
         expansion_pct: float = 1.0,
+        enable_profile_trace: bool = False,
     ):
         super().__init__(lookahead, device)
         self.target_model_runner = target_model_runner
@@ -42,6 +43,7 @@ class VerifierPivot(VerifierBase):
         self.interval = interval
         self.threshold = threshold
         self.expansion_pct = expansion_pct
+        self.enable_profile_trace = enable_profile_trace
         self._intermediate_round_counters: dict[int, int] = {}
 
     def prefill(self, seqs: list[Sequence], eagle: bool = False) -> VerifyResult:
@@ -155,11 +157,13 @@ class VerifierPivot(VerifierBase):
         forced_target_rounds = 0
         intermediate_rounds = 0
         target_rounds = 0
+        use_target_flags: list[bool] = []
 
         for i, seq in enumerate(seqs):
             inter_rounds = self._intermediate_round_counters.get(seq.seq_id, 0)
             forced_target = self.interval > 0 and inter_rounds >= self.interval
             use_target = forced_target or bool(threshold_cross[i].item())
+            use_target_flags.append(use_target)
 
             if use_target:
                 final_suffixes.append(target_suffixes[i])
@@ -205,8 +209,59 @@ class VerifierPivot(VerifierBase):
         if eagle and eagle_acts_flat is not None:
             eagle_acts = eagle_acts_flat.view(batch_size, self.lookahead + 1, -1)
 
+        profile_trace: VerifyProfileTrace | None = None
+        if self.enable_profile_trace and not eagle:
+            from ssd.utils.verify import target_probs_p_batched
+
+            probs_p = target_probs_p_batched(logits_p, temps_target)
+            pred_ids = probs_p.argmax(dim=-1).cpu().tolist()
+            pred_conf = probs_p.max(dim=-1).values.cpu().tolist()
+            tgt_tok_ids = [[int(pred_ids[b][j]) for j in range(self.lookahead + 1)] for b in range(batch_size)]
+            tgt_tok_conf = [[float(pred_conf[b][j]) for j in range(self.lookahead + 1)] for b in range(batch_size)]
+            tgt_bonus = [int(logits_p[b, self.lookahead, :].argmax().item()) for b in range(batch_size)]
+            K = self.lookahead
+            v_models: list[str] = []
+            inter_ids_list: list[list[int] | None] = []
+            inter_conf_list: list[list[float] | None] = []
+            inter_accept: list[int | None] = []
+            inter_rec: list[int | None] = []
+            inter_bonus: list[int | None] = []
+            for i in range(batch_size):
+                use_target = use_target_flags[i]
+                if use_target:
+                    v_models.append("pivot_target")
+                    inter_ids_list.append(None)
+                    inter_conf_list.append(None)
+                    inter_accept.append(None)
+                    inter_rec.append(None)
+                    inter_bonus.append(None)
+                else:
+                    v_models.append("pivot_intermediate")
+                    n = int(inter_accept_lens[i].item())
+                    inter_ids_list.append([int(draft_tokens[i, j].item()) for j in range(K)])
+                    inter_conf_list.append(
+                        [float(probs_q[i, j, draft_tokens[i, j]].item()) for j in range(K)]
+                    )
+                    inter_accept.append(n)
+                    inter_rec.append(int(target_recovery_tokens[i]))
+                    inter_bonus.append(int(logits_p[i, K, :].argmax().item()))
+            profile_trace = VerifyProfileTrace(
+                verification_models=v_models,
+                token_ids_per_position=tgt_tok_ids,
+                token_confidence_per_position=tgt_tok_conf,
+                accept_len=[max(0, len(final_suffixes[b]) - 1) for b in range(batch_size)],
+                recovery_tokens=list(final_recovery),
+                bonus_tokens=tgt_bonus,
+                inter_token_ids_per_position=inter_ids_list,
+                inter_token_confidence_per_position=inter_conf_list,
+                inter_accept_len=inter_accept,
+                inter_recovery_token=inter_rec,
+                inter_bonus_token=inter_bonus,
+            )
+
         return VerifyResult(
             new_suffixes=final_suffixes,
             recovery_tokens=final_recovery,
             eagle_acts=eagle_acts,
+            profile_trace=profile_trace,
         )

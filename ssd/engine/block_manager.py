@@ -1,8 +1,11 @@
 from collections import deque
+from typing import Literal
 import xxhash
 import numpy as np
 
 from ssd.engine.sequence import Sequence
+
+CacheRole = Literal["target", "draft", "intermediate"]
 
 
 class Block:
@@ -26,13 +29,14 @@ class Block:
 class BlockManager:
 
     def __init__(
-        self, 
-        num_blocks: int, 
-        block_size: int, 
-        is_draft: bool = False, 
-        speculate_k: int = -1, 
+        self,
+        num_blocks: int,
+        block_size: int,
+        is_draft: bool | None = None,
+        cache_role: CacheRole = "target",
+        speculate_k: int = -1,
         max_model_len: int = -1,
-        verbose: bool = False
+        verbose: bool = False,
     ):
         assert num_blocks > 0
         self.block_size = block_size
@@ -40,10 +44,35 @@ class BlockManager:
         self.hash_to_block_id: dict[int, int] = dict()
         self.free_block_ids: deque[int] = deque(range(num_blocks))
         self.used_block_ids: set[int] = set()
-        self.is_draft: bool = is_draft
-        self.speculate_k: int = speculate_k 
+        if is_draft is not None:
+            cache_role = "draft" if is_draft else "target"
+        self.cache_role: CacheRole = cache_role
+        self.is_draft: bool = cache_role == "draft"
+        self.speculate_k: int = speculate_k
         self.verbose: bool = verbose
         self.max_model_len: int = max_model_len
+
+    def _block_table(self, seq: Sequence) -> list[int]:
+        if self.cache_role == "draft":
+            return seq.draft_block_table
+        if self.cache_role == "intermediate":
+            return seq.inter_block_table
+        return seq.block_table
+
+    def _num_cached_tokens(self, seq: Sequence) -> int:
+        if self.cache_role == "draft":
+            return seq.num_draft_cached_tokens
+        if self.cache_role == "intermediate":
+            return seq.num_inter_cached_tokens
+        return seq.num_cached_tokens
+
+    def _bump_cached_tokens(self, seq: Sequence, delta: int) -> None:
+        if self.cache_role == "draft":
+            seq.num_draft_cached_tokens += delta
+        elif self.cache_role == "intermediate":
+            seq.num_inter_cached_tokens += delta
+        else:
+            seq.num_cached_tokens += delta
 
         
     @classmethod
@@ -97,9 +126,9 @@ class BlockManager:
         return len(self.free_block_ids) >= seq.num_blocks
 
     def allocate(self, seq: Sequence):
-        block_table = seq.draft_block_table if self.is_draft else seq.block_table
-        assert not block_table 
-        h = -1 
+        block_table = self._block_table(seq)
+        assert not block_table
+        h = -1
         cache_miss = False
 
         for i in range(seq.num_blocks):
@@ -111,11 +140,8 @@ class BlockManager:
             if cache_miss:
                 block_id = self.free_block_ids[0]
                 block = self._allocate_block(block_id)
-            else: # cache hit 
-                if self.is_draft: 
-                    seq.num_draft_cached_tokens += self.block_size
-                else:
-                    seq.num_cached_tokens += self.block_size
+            else:  # cache hit
+                self._bump_cached_tokens(seq, self.block_size)
                 if block_id in self.used_block_ids:
                     block = self.blocks[block_id]
                     block.ref_count += 1
@@ -128,30 +154,35 @@ class BlockManager:
 
 
     def deallocate(self, seq: Sequence):
-        block_table = seq.draft_block_table if self.is_draft else seq.block_table
+        block_table = self._block_table(seq)
         for block_id in reversed(block_table):
             block = self.blocks[block_id]
             block.ref_count -= 1
             if block.ref_count == 0:
                 self._deallocate_block(block_id)
-        
-        if self.is_draft:
+
+        if self.cache_role == "draft":
             seq.num_draft_cached_tokens = 0
-        else: 
+        elif self.cache_role == "intermediate":
+            seq.num_inter_cached_tokens = 0
+        else:
             seq.num_cached_tokens = 0
 
         block_table.clear()
 
     def can_append(self, seq: Sequence, lookahead_num_tokens: int = 1) -> bool:
-        block_table = seq.draft_block_table if self.is_draft else seq.block_table
+        block_table = self._block_table(seq)
+        eff_tokens = seq.num_tokens
+        if self.cache_role == "intermediate":
+            eff_tokens = max(seq.num_tokens, seq.num_inter_cached_tokens)
 
         # Check if sequence length + lookahead would exceed max model length
-        if seq.num_tokens + lookahead_num_tokens > self.max_model_len:
+        if eff_tokens + lookahead_num_tokens > self.max_model_len:
             print(f'[block_manager] WARNING: Sequence length + lookahead would exceed max model length', flush=True)
             return False
 
         # How many blocks do we need in total to cover current tokens + lookahead?
-        target_blocks = (seq.num_tokens + lookahead_num_tokens +
+        target_blocks = (eff_tokens + lookahead_num_tokens +
                          self.block_size - 1) // self.block_size
         current_blocks = len(block_table)
 
@@ -162,10 +193,13 @@ class BlockManager:
             return True  # Current blocks are sufficient
 
     def may_append(self, seq: Sequence, lookahead_num_tokens: int = 1):
-        block_table = seq.draft_block_table if self.is_draft else seq.block_table
+        block_table = self._block_table(seq)
+        eff_tokens = seq.num_tokens
+        if self.cache_role == "intermediate":
+            eff_tokens = max(seq.num_tokens, seq.num_inter_cached_tokens)
 
         # How many blocks do we need in total to cover current tokens + lookahead?
-        target_blocks = (seq.num_tokens + lookahead_num_tokens +
+        target_blocks = (eff_tokens + lookahead_num_tokens +
                          self.block_size - 1) // self.block_size
         current_blocks = len(block_table)
 

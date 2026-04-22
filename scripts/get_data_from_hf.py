@@ -4,10 +4,14 @@ from datasets import load_dataset
 
 
 def get_base_output_dir():
-    """Get base output directory from HF_DATASETS_CACHE or default."""
-    hf_cache = os.environ.get('HF_DATASETS_CACHE', '/tmp/hf_datasets_cache')
-    print(f"Using HF_DATASETS_CACHE: {hf_cache}")
-    return os.path.join(hf_cache, 'processed_datasets')
+    """Root for processed JSONL files. Prefer SSD_DATASET_DIR (same as bench/ssd.paths)."""
+    ssd_ds = os.environ.get("SSD_DATASET_DIR", "").strip()
+    if ssd_ds:
+        print(f"Using SSD_DATASET_DIR: {ssd_ds}")
+        return ssd_ds
+    hf_cache = os.environ.get("HF_DATASETS_CACHE", "/tmp/hf_datasets_cache")
+    print(f"Using HF_DATASETS_CACHE (no SSD_DATASET_DIR): {hf_cache}")
+    return os.path.join(hf_cache, "processed_datasets")
 
 
 def download_gsm8k_data(num_samples=None):
@@ -280,6 +284,73 @@ def download_aime2025_data(num_samples=None):
     return output_file
 
 
+LIVECODEBENCH_LITE_CONFIG = "release_v5"
+LIVECODEBENCH_LITE_MAX = 10000
+
+
+def download_livecodebench_code_generation_lite_data(num_samples=None):
+    """Download livecodebench/code_generation_lite to JSONL with {\"text\": ...} per line."""
+    output_dir = os.path.join(get_base_output_dir(), "livecodebench_lite")
+    os.makedirs(output_dir, exist_ok=True)
+
+    max_samples = LIVECODEBENCH_LITE_MAX
+    if num_samples is None:
+        num_samples = max_samples
+    else:
+        num_samples = min(num_samples, max_samples)
+
+    output_file = os.path.join(output_dir, "livecodebench_lite_data_10000.jsonl")
+
+    if os.path.exists(output_file):
+        print(f"File {output_file} already exists. Skipping download.")
+        return output_file
+
+    print(
+        f"Loading livecodebench/code_generation_lite (config={LIVECODEBENCH_LITE_CONFIG})..."
+    )
+    dataset = None
+    last_err: Exception | None = None
+    for split in ("test", "train"):
+        try:
+            dataset = load_dataset(
+                "livecodebench/code_generation_lite",
+                LIVECODEBENCH_LITE_CONFIG,
+                split=split,
+                trust_remote_code=True,
+            )
+            print(f"Using split={split!r} ({len(dataset)} rows)")
+            break
+        except Exception as e:
+            last_err = e
+    if dataset is None:
+        raise RuntimeError("LiveCodeBench lite: could not load test or train split") from last_err
+
+    total_samples = len(dataset)
+    samples_to_process = min(num_samples, total_samples)
+
+    with open(output_file, "w", encoding="utf-8") as f:
+        for i in range(samples_to_process):
+            example = dataset[i]
+            title = example.get("question_title") or ""
+            body = example.get("question_content") or ""
+            starter = example.get("starter_code") or ""
+            parts = []
+            if title:
+                parts.append(title.strip())
+            if body:
+                parts.append(body.strip())
+            if starter.strip():
+                parts.append("Starter code:\n" + starter.strip())
+            text = "\n\n".join(parts) if parts else ""
+            sample = {"text": text}
+            f.write(json.dumps(sample, ensure_ascii=False) + "\n")
+            if i % 200 == 0:
+                print(f"Processed {i}/{samples_to_process} samples...")
+
+    print(f"Saved {samples_to_process} LiveCodeBench lite samples to {output_file}")
+    return output_file
+
+
 def download_all_datasets(num_samples=None):
     """Download all datasets."""
     print("Downloading all datasets...")
@@ -291,6 +362,7 @@ def download_all_datasets(num_samples=None):
         ("HumanEval", download_humaneval_data),
         ("Alpaca", download_alpaca_data),
         ("AIME2025", download_aime2025_data),
+        ("LiveCodeBenchLite", download_livecodebench_code_generation_lite_data),
     ]
     
     output_files = {}

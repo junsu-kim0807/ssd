@@ -28,6 +28,8 @@ class DraftRunner(ModelRunner):
             tokenizer_path=cfg.model if cfg.use_eagle else None,
             d_model_target=cfg.hf_config.hidden_size if cfg.use_eagle and cfg.hf_config else None,
             enforce_eager=cfg.enforce_eager,
+            profiler_mode=cfg.profiler_mode,
+            profiler_output_dir=cfg.profiler_output_dir,
         )
         return draft_cfg
 
@@ -50,6 +52,7 @@ class DraftRunner(ModelRunner):
 
     def draft_async_prefill(self):
         assert self.draft_async and self.is_draft
+        _t_pf0 = time.perf_counter()
 
         # 1) Receive metadata then individual tensors
         # First recv metadata to learn sizes
@@ -99,6 +102,11 @@ class DraftRunner(ModelRunner):
 
         # 7) clean up
         reset_context()
+
+        if self.config.profiler_output_dir and str(self.config.profiler_output_dir).strip():
+            dt = time.perf_counter() - _t_pf0
+            wall = torch.tensor([dt], dtype=torch.float32, device=self.device)
+            dist.send(wall, dst=0, group=self.async_pg)
 
     def _reset_tree_cache_tensors(self):
         """Reset tensor-backed tree cache to empty."""
@@ -905,6 +913,11 @@ class DraftRunner(ModelRunner):
                 # Populate the local cache so future spec-requests can hit
                 self._populate_tree_cache(tree_decode_args, tokens, logits, tree_decode_args["cache_hits"], activations)
                 self._draft_step_times.append(time.perf_counter() - _ds0)
+
+                if self.config.profiler_output_dir and str(self.config.profiler_output_dir).strip():
+                    dt = time.perf_counter() - _ds0
+                    wall = torch.tensor([dt], dtype=torch.float32, device=self.device)
+                    dist.send(wall, dst=0, group=self.async_pg)
 
                 if _prof or PROFILE_DRAFT:
                     torch.cuda.synchronize()

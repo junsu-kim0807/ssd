@@ -13,6 +13,9 @@ from ssd.engine.speculator_sync import SpeculatorSync
 from ssd.engine.step import InferenceStep, AutoRegressiveStep, SpecDecodeStep
 from ssd.engine.verifier import Verifier
 from ssd.engine.verifier_pivot import VerifierPivot
+from ssd.engine.verifier_hierarchical import VerifierHierarchical
+from ssd.engine.intermediate_runner import IntermediateRunner
+from ssd.utils.profiler import make_profiler, wants_profile_trace, SSDProfiler
 
 import atexit
 from dataclasses import fields
@@ -117,10 +120,24 @@ class LLMEngine:
             self.draft_cfg = self.draft_runner.draft_cfg
             print(f'Draft runner created on rank 0 (no async)', flush=True)
 
+        self.intermediate_runner = None
+        self.intermediate_cfg = None
+        if config.speculate and config.spec_policy == "hierarchical":
+            self.intermediate_runner = IntermediateRunner(config)
+            self.intermediate_cfg = self.intermediate_runner.config
+
         self.tokenizer = AutoTokenizer.from_pretrained(config.model, use_fast=True)
         config.eos = self.tokenizer.eos_token_id
-        self.scheduler = Scheduler(config, draft_cfg=self.draft_cfg if config.speculate else None)
+        self.scheduler = Scheduler(
+            config,
+            draft_cfg=self.draft_cfg if config.speculate else None,
+            intermediate_cfg=self.intermediate_cfg
+            if getattr(self, "intermediate_cfg", None) is not None
+            else None,
+        )
         assert config.max_model_len == self.scheduler.max_model_len
+
+        self.profiler = make_profiler(config)
 
         print(f"[LLMEngine] finished llm_engine init", flush=True)
 
@@ -197,7 +214,9 @@ class LLMEngine:
     def step(self, step: InferenceStep):
         t = perf_counter()
         seqs, is_prefill = self.scheduler.schedule()
+        self.profiler.start_step(seqs, is_prefill)
         ttl_tokens = step.prefill(seqs) if is_prefill else step.decode(seqs)
+        self.profiler.finish_step(ttl_tokens)
 
         time_taken = perf_counter() - t
 
@@ -282,6 +301,12 @@ class LLMEngine:
 
     def create_inference_step(self, config: Config) -> InferenceStep:
         if config.speculate:
+            _ptrace = isinstance(self.profiler, SSDProfiler) and wants_profile_trace(
+                config.profiler_mode
+            )
+            _async_wiring = bool(
+                config.profiler_output_dir and str(config.profiler_output_dir).strip()
+            )
             if config.draft_async:
                 speculator = SpeculatorAsync(
                     lookahead=config.speculate_k,
@@ -296,6 +321,8 @@ class LLMEngine:
                     draft_runner_rank=self.num_tp_gpus,
                     tokenizer=self.tokenizer,
                     verbose=config.verbose,
+                    profiler=self.profiler,
+                    enable_async_profile_wiring=_async_wiring,
                 )
             else:
                 speculator = SpeculatorSync(
@@ -304,28 +331,47 @@ class LLMEngine:
                     draft_model_runner=self.draft_runner,
                 )
 
-            verifier = Verifier(
-                lookahead=config.speculate_k,
-                device=config.device,
-                target_model_runner=self.model_runner,
-                sampler_x=config.sampler_x,
-                async_fan_out=config.async_fan_out,
-                jit_speculate=config.jit_speculate,
-                tokenizer=self.tokenizer,
-                metrics=METRICS,
-            ) if config.spec_policy != "pivot" else VerifierPivot(
-                lookahead=config.speculate_k,
-                device=config.device,
-                target_model_runner=self.model_runner,
-                sampler_x=config.sampler_x,
-                async_fan_out=config.async_fan_out,
-                jit_speculate=config.jit_speculate,
-                tokenizer=self.tokenizer,
-                metrics=METRICS,
-                interval=config.interval,
-                threshold=config.threshold,
-                expansion_pct=config.expansion_pct,
-            )
+            if config.spec_policy == "hierarchical":
+                verifier = VerifierHierarchical(
+                    lookahead=config.speculate_k,
+                    device=config.device,
+                    target_model_runner=self.model_runner,
+                    intermediate_runner=self.intermediate_runner,
+                    target_verify_interval=config.target_verify_interval,
+                    sampler_x=config.sampler_x,
+                    async_fan_out=config.async_fan_out,
+                    jit_speculate=config.jit_speculate,
+                    tokenizer=self.tokenizer,
+                    metrics=METRICS,
+                    enable_profile_trace=_ptrace,
+                )
+            elif config.spec_policy == "pivot":
+                verifier = VerifierPivot(
+                    lookahead=config.speculate_k,
+                    device=config.device,
+                    target_model_runner=self.model_runner,
+                    sampler_x=config.sampler_x,
+                    async_fan_out=config.async_fan_out,
+                    jit_speculate=config.jit_speculate,
+                    tokenizer=self.tokenizer,
+                    metrics=METRICS,
+                    interval=config.interval,
+                    threshold=config.threshold,
+                    expansion_pct=config.expansion_pct,
+                    enable_profile_trace=_ptrace,
+                )
+            else:
+                verifier = Verifier(
+                    lookahead=config.speculate_k,
+                    device=config.device,
+                    target_model_runner=self.model_runner,
+                    sampler_x=config.sampler_x,
+                    async_fan_out=config.async_fan_out,
+                    jit_speculate=config.jit_speculate,
+                    tokenizer=self.tokenizer,
+                    metrics=METRICS,
+                    enable_profile_trace=_ptrace,
+                )
             return SpecDecodeStep(
                 scheduler=self.scheduler,
                 speculator=speculator,
@@ -333,6 +379,7 @@ class LLMEngine:
                 eagle=config.use_eagle,
                 tokenizer=self.tokenizer,
                 async_spec=config.draft_async,
+                profiler=self.profiler,
             )
         else:
             return AutoRegressiveStep(
@@ -361,42 +408,46 @@ class LLMEngine:
 
         outputs = {}
         inference_step = self.create_inference_step(self.config)
-        i = 0
-        max_steps = self.config.max_steps if self.config.max_steps is not None else float('inf')
-        _stream_lens = {}
-        while not self.is_finished() and i < max_steps:
-            if self.config.verbose:
-                print(f"[generate] step {i+1}" +
-                    f" of {max_steps}" if max_steps != float('inf') else "",
-                    flush=True,
-                )
-            i += 1
-            t = perf_counter()
-            output = self.step(inference_step)
-            time_taken = perf_counter() - t
-            METRICS["target_step_times"].append(time_taken)
+        self.profiler.start_run(self.config, self.tokenizer)
+        try:
+            i = 0
+            max_steps = self.config.max_steps if self.config.max_steps is not None else float('inf')
+            _stream_lens = {}
+            while not self.is_finished() and i < max_steps:
+                if self.config.verbose:
+                    print(f"[generate] step {i+1}" +
+                        f" of {max_steps}" if max_steps != float('inf') else "",
+                        flush=True,
+                    )
+                i += 1
+                t = perf_counter()
+                output = self.step(inference_step)
+                time_taken = perf_counter() - t
+                METRICS["target_step_times"].append(time_taken)
 
-            if stream_callback:
-                for seq in self.scheduler.running:
-                    cur = seq.num_completion_tokens
-                    prev = _stream_lens.get(seq.seq_id, 0)
-                    if cur > prev:
-                        stream_callback(seq.seq_id, seq.completion_token_ids[prev:cur])
-                        _stream_lens[seq.seq_id] = cur
-
-            for seq_id, token_ids in output:
                 if stream_callback:
-                    prev = _stream_lens.get(seq_id, 0)
-                    if len(token_ids) > prev:
-                        stream_callback(seq_id, token_ids[prev:])
-                outputs[seq_id] = token_ids
-                if use_tqdm:
-                    pbar.update(1)
-        outputs = [outputs[seq_id] for seq_id in sorted(outputs)]
-        outputs = [{"text": self.tokenizer.decode(
-            token_ids), "token_ids": token_ids} for token_ids in outputs]
-        if use_tqdm:
-            pbar.close()
+                    for seq in self.scheduler.running:
+                        cur = seq.num_completion_tokens
+                        prev = _stream_lens.get(seq.seq_id, 0)
+                        if cur > prev:
+                            stream_callback(seq.seq_id, seq.completion_token_ids[prev:cur])
+                            _stream_lens[seq.seq_id] = cur
+
+                for seq_id, token_ids in output:
+                    if stream_callback:
+                        prev = _stream_lens.get(seq_id, 0)
+                        if len(token_ids) > prev:
+                            stream_callback(seq_id, token_ids[prev:])
+                    outputs[seq_id] = token_ids
+                    if use_tqdm:
+                        pbar.update(1)
+            outputs = [outputs[seq_id] for seq_id in sorted(outputs)]
+            outputs = [{"text": self.tokenizer.decode(
+                token_ids), "token_ids": token_ids} for token_ids in outputs]
+            if use_tqdm:
+                pbar.close()
+        finally:
+            self.profiler.finish_run()
 
         if not stream_callback:
             self.log_metrics()

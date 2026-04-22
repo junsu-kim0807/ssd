@@ -2,6 +2,32 @@ import torch
 from ssd.utils.async_helpers.async_spec_helpers import apply_sampler_x_rescaling
 from ssd.config import Config
 
+
+def target_probs_p_batched(
+    logits_p: torch.Tensor,
+    temperatures_target: torch.Tensor,
+) -> torch.Tensor:
+    """Match ``verify()`` target-side ``probs_p`` construction for temp>0 / temp==0 rows.
+
+    Returns a float tensor ``[B, K+1, V]`` suitable for argmax / max-prob profiling fields.
+    """
+    device = logits_p.device
+    B, Kp1, V = logits_p.shape
+    temps_t = temperatures_target
+    probs_p = torch.zeros(B, Kp1, V, device=device, dtype=torch.float32)
+    nz_p = temps_t > 0
+    if nz_p.any():
+        t = temps_t[nz_p].unsqueeze(1).unsqueeze(2).clamp(min=1e-8)
+        probs_p[nz_p] = torch.softmax((logits_p[nz_p] / t).to(torch.float32), dim=-1)
+    z_p = ~nz_p
+    if z_p.any():
+        argmax_p = logits_p[z_p].argmax(dim=-1)
+        one_hot_p = torch.zeros_like(logits_p[z_p], dtype=torch.float32)
+        one_hot_p.scatter_(2, argmax_p.unsqueeze(-1), 1.0)
+        probs_p[z_p] = one_hot_p
+    return probs_p
+
+
 def verify(
     logits_p: torch.Tensor,
     logits_q: torch.Tensor,
@@ -179,3 +205,33 @@ def verify(
         accepted_suffixes.append(suffix)
 
     return accepted_suffixes, rec_final.tolist()
+
+
+def verify_greedy_chain_variable(
+    logits_p: torch.Tensor,
+    candidate_tokens: list[int],
+) -> tuple[list[int], int]:
+    """Greedy speculative acceptance for one sequence (temperature 0 semantics).
+
+    ``logits_p`` has shape ``[L, V]`` where ``L == len(candidate_tokens)``.
+    Row ``j`` predicts the token after the prefix ending at candidate ``j``;
+    we compare ``candidate_tokens[j + 1]`` to ``argmax(logits_p[j])`` for
+    ``j = 0 .. L-2``, matching the fixed-length ``verify()`` layout.
+
+    Returns ``(accepted_suffix, recovery_token)`` where ``accepted_suffix`` includes
+    the leading recovery token and accepted speculative tokens (length >= 1).
+    """
+    L = len(candidate_tokens)
+    assert L >= 1
+    assert logits_p.shape[0] == L, (
+        f"logits_p rows {logits_p.shape[0]} != len(candidate_tokens)={L}"
+    )
+    preds = logits_p.argmax(dim=-1)
+    if L == 1:
+        return [candidate_tokens[0]], int(preds[0].item())
+    n = 0
+    while n < L - 1 and candidate_tokens[n + 1] == int(preds[n].item()):
+        n += 1
+    suffix = candidate_tokens[: n + 1]
+    recovery = int(preds[n].item())
+    return suffix, recovery

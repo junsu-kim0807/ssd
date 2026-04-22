@@ -17,9 +17,11 @@ from ssd.layers.sampler import Sampler
 from ssd.utils.context import set_context, reset_context, get_context
 from ssd.utils.loader import load_model
 from ssd.engine.helpers.runner_helpers import (
-    prepare_decode_tensors_from_seqs, 
-    prepare_block_tables_from_seqs, 
-    prepare_prefill_tensors_from_seqs
+    prepare_decode_tensors_from_seqs,
+    prepare_block_tables_from_seqs,
+    prepare_prefill_tensors_from_seqs,
+    prepare_verify_tensors_varlen,
+    prepare_intermediate_verify_suffix_tensors,
 )
 from ssd.engine.helpers.cudagraph_helpers import (
     run_verify_cudagraph,
@@ -36,12 +38,23 @@ from ssd.engine.helpers.cudagraph_helpers import (
 
 class ModelRunner:
 
-    def __init__(self, config: Config, rank: int, event: Event | list[Event], is_draft: bool = False, num_tp_gpus: int = -1, init_q = None):
+    def __init__(
+        self,
+        config: Config,
+        rank: int,
+        event: Event | list[Event],
+        is_draft: bool = False,
+        num_tp_gpus: int = -1,
+        init_q=None,
+        is_intermediate: bool = False,
+    ):
         if config.verbose: print(f'ModelRunner init got args: rank={rank}, is_draft={is_draft}, num_tp_gpus={num_tp_gpus}', flush=True)
         self.config = config
-        
+
         assert is_draft in [True, False], "ERROR in ModelRunner: is_draft must be True or False"
+        assert not (is_draft and is_intermediate), "is_draft and is_intermediate are mutually exclusive"
         self.is_draft = is_draft
+        self.intermediate_mode = is_intermediate
         if self.is_draft: 
             if config.draft_hf_config.torch_dtype != config.hf_config.torch_dtype:
                 if self.verbose:
@@ -505,23 +518,28 @@ class ModelRunner:
     
     def prepare_prefill(self, seqs: list[Sequence]):
         input_ids, positions, cu_seqlens_q, cu_seqlens_k, max_seqlen_q, max_seqlen_k, slot_mapping = \
-            prepare_prefill_tensors_from_seqs(seqs, self.block_size, self.is_draft) # if one big input ids, how is attn mask handled? via cu_seqlens_q/k? 
+            prepare_prefill_tensors_from_seqs(
+                seqs, self.block_size, self.is_draft, is_intermediate=self.intermediate_mode)
 
         block_tables = None
         if cu_seqlens_k[-1] > cu_seqlens_q[-1]:    # prefix cache
             block_tables = prepare_block_tables_from_seqs(
-                seqs, self.is_draft)
+                seqs, self.is_draft, is_intermediate=self.intermediate_mode)
         
         set_context(is_prefill=True, cu_seqlens_q=cu_seqlens_q, cu_seqlens_k=cu_seqlens_k, max_seqlen_q=max_seqlen_q,
                     max_seqlen_k=max_seqlen_k, slot_mapping=slot_mapping, context_lens=None, block_tables=block_tables)
         return input_ids, positions
     
-    def prepare_decode(self, seqs: list[Sequence], verify: bool = False): 
+    def prepare_decode(self, seqs: list[Sequence], verify: bool = False):
         input_ids, positions, slot_mapping, context_lens = \
-            prepare_decode_tensors_from_seqs(seqs, self.block_size, self.is_draft, verify, self.config.speculate_k if verify else -1)
+            prepare_decode_tensors_from_seqs(
+                seqs, self.block_size, self.is_draft, verify,
+                self.config.speculate_k if verify else -1,
+                is_intermediate=self.intermediate_mode,
+            )
 
-        
-        block_tables = prepare_block_tables_from_seqs(seqs, self.is_draft) # if verify, set cu_seqlens_q as well
+        block_tables = prepare_block_tables_from_seqs(
+            seqs, self.is_draft, is_intermediate=self.intermediate_mode)
 
         if verify: ### what path does glue decode take? trace it. 
             # this had [not draft and draft_async] condn before
@@ -538,6 +556,66 @@ class ModelRunner:
                        context_lens=context_lens, block_tables=block_tables)
         
         return input_ids, positions
+
+    def prepare_verify_varlen(
+        self,
+        seqs: list[Sequence],
+        verify_tokens_per_seq: list[list[int]],
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        input_ids, positions, slot_mapping, context_lens, cu_seqlens_q, max_seqlen_q = (
+            prepare_verify_tensors_varlen(seqs, self.block_size, verify_tokens_per_seq)
+        )
+        block_tables = prepare_block_tables_from_seqs(
+            seqs, self.is_draft, is_intermediate=self.intermediate_mode)
+        set_context(
+            is_prefill=False,
+            cu_seqlens_q=cu_seqlens_q,
+            cu_seqlens_k=None,
+            max_seqlen_q=int(max_seqlen_q),
+            max_seqlen_k=0,
+            slot_mapping=slot_mapping,
+            context_lens=context_lens,
+            block_tables=block_tables,
+        )
+        return input_ids, positions
+
+    def run_verify_varlen(self, seqs: list[Sequence], verify_tokens_per_seq: list[list[int]]) -> torch.Tensor:
+        """Eager variable-length target verify forward (hierarchical target round)."""
+        eager_was = self.enforce_eager
+        self.enforce_eager = True
+        try:
+            input_ids, positions = self.prepare_verify_varlen(seqs, verify_tokens_per_seq)
+            logits = self.run_model(input_ids, positions, False, last_only=False)
+            return logits
+        finally:
+            self.enforce_eager = eager_was
+            reset_context()
+
+    def run_intermediate_verify_suffix(self, seqs: list[Sequence], k: int) -> torch.Tensor:
+        """Single eager forward: extend intermediate KV along ``token_ids[c:c+k+1]`` (sync spec tail)."""
+        assert getattr(self, "intermediate_mode", False), "run_intermediate_verify_suffix requires intermediate_mode"
+        eager_was = self.enforce_eager
+        self.enforce_eager = True
+        try:
+            input_ids, positions, slot_mapping, context_lens, cu_seqlens_q, max_seqlen_q = (
+                prepare_intermediate_verify_suffix_tensors(seqs, self.block_size, k)
+            )
+            block_tables = prepare_block_tables_from_seqs(
+                seqs, self.is_draft, is_intermediate=True)
+            set_context(
+                is_prefill=False,
+                cu_seqlens_q=cu_seqlens_q,
+                cu_seqlens_k=None,
+                max_seqlen_q=int(max_seqlen_q),
+                max_seqlen_k=0,
+                slot_mapping=slot_mapping,
+                context_lens=context_lens,
+                block_tables=block_tables,
+            )
+            return self.run_model(input_ids, positions, False, last_only=False)
+        finally:
+            self.enforce_eager = eager_was
+            reset_context()
 
     def prepare_sample(self, seqs: list[Sequence]):
         temperatures = []

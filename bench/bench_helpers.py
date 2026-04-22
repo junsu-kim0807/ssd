@@ -1,5 +1,7 @@
 import os
 import sys
+import importlib.util
+from pathlib import Path
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
 import json
 from random import randint
@@ -40,6 +42,87 @@ def _get_snapshot_path(base_path: str) -> str:
 
     raise FileNotFoundError(
         f"No snapshot (config.json) found under {base_path}")
+
+
+_get_data_from_hf_mod = None
+
+
+def _load_get_data_from_hf():
+    global _get_data_from_hf_mod
+    if _get_data_from_hf_mod is not None:
+        return _get_data_from_hf_mod
+    script_path = Path(__file__).resolve().parent.parent / "scripts" / "get_data_from_hf.py"
+    spec = importlib.util.spec_from_file_location("ssd_get_data_from_hf", script_path)
+    if spec is None or spec.loader is None:
+        raise ImportError(f"Cannot load {script_path}")
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    _get_data_from_hf_mod = mod
+    return mod
+
+
+def benchmark_dataset_label(args) -> str:
+    """Stable dataset id for logging / JSONL rows."""
+    if getattr(args, "example", False):
+        return "example"
+    if getattr(args, "random", False):
+        return "random"
+    if getattr(args, "all", False):
+        return "all_union"
+    if getattr(args, "humaneval", False):
+        return "humaneval"
+    if getattr(args, "alpaca", False):
+        return "alpaca"
+    if getattr(args, "c4", False):
+        return "c4"
+    if getattr(args, "ultrafeedback", False):
+        return "ultrafeedback"
+    if getattr(args, "aime2025", False):
+        return "aime2025"
+    if getattr(args, "livecodebench", False):
+        return "livecodebench_lite"
+    return "gsm"
+
+
+def ensure_benchmark_dataset(args) -> None:
+    """If --prepare_data, download missing JSONL for the selected dataset(s)."""
+    if not getattr(args, "prepare_data", False):
+        return
+    m = _load_get_data_from_hf()
+    if getattr(args, "all", False):
+        for name in ("humaneval", "alpaca", "gsm", "ultrafeedback"):
+            _ensure_single_dataset_file(name, m)
+        return
+    key = benchmark_dataset_label(args)
+    if key == "example" or key == "random":
+        return
+    if key == "all_union":
+        return
+    _ensure_single_dataset_file(key, m)
+
+
+def _ensure_single_dataset_file(dataset_key: str, m) -> None:
+    if dataset_key not in DATASET_PATHS:
+        print(f"[prepare_data] Unknown dataset key {dataset_key!r}, skip.")
+        return
+    path = DATASET_PATHS[dataset_key]
+    if os.path.exists(path):
+        print(f"[prepare_data] Found {path}")
+        return
+    fn = {
+        "gsm": m.download_gsm8k_data,
+        "humaneval": m.download_humaneval_data,
+        "alpaca": m.download_alpaca_data,
+        "c4": m.download_c4_data,
+        "ultrafeedback": m.download_ultrafeedback_data,
+        "aime2025": m.download_aime2025_data,
+        "livecodebench_lite": m.download_livecodebench_code_generation_lite_data,
+    }.get(dataset_key)
+    if fn is None:
+        print(f"[prepare_data] No downloader for {dataset_key!r}")
+        return
+    print(f"[prepare_data] Missing {path}, downloading...")
+    fn(None)
 
 
 def _get_draft_model_path(args, cache_dir: str) -> str:
@@ -170,8 +253,11 @@ def load_dataset_token_ids(
                 if len(prompts) >= num_prompts:
                     break
                 data = json.loads(line.strip())
-                # AIME 2025 uses "problem" instead of "text"
-                text: str = data.get("problem", data.get("text", ""))
+                # AIME 2025 uses "problem"; LiveCodeBench exports use "text" or raw "question_content"
+                text: str = data.get(
+                    "problem",
+                    data.get("text", data.get("question_content", "")),
+                )
                 if use_chat_template and hasattr(tokenizer, 'apply_chat_template'):
                     tokens = tokenizer.apply_chat_template(
                         [{"role": "system", "content": "You are a helpful assistant."}, {"role": "user", "content": text}],
@@ -278,6 +364,10 @@ def generate_benchmark_inputs(
         dataset_name = "c4"
     elif getattr(args, "ultrafeedback", False):
         dataset_name = "ultrafeedback"
+    elif getattr(args, "aime2025", False):
+        dataset_name = "aime2025"
+    elif getattr(args, "livecodebench", False):
+        dataset_name = "livecodebench_lite"
     else:
         dataset_name = "gsm"
 

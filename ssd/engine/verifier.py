@@ -5,8 +5,13 @@ from transformers import AutoTokenizer
 
 from ssd.engine.sequence import Sequence
 from ssd.engine.model_runner import ModelRunner
-from ssd.utils.verify import verify
-from ssd.engine.helpers.speculate_types import SpeculateResult, VerifyResult, VerifierBase
+from ssd.utils.verify import verify, target_probs_p_batched
+from ssd.engine.helpers.speculate_types import (
+    SpeculateResult,
+    VerifyResult,
+    VerifierBase,
+    VerifyProfileTrace,
+)
 
 
 class Verifier(VerifierBase):
@@ -20,6 +25,7 @@ class Verifier(VerifierBase):
         jit_speculate: bool = False,
         tokenizer: AutoTokenizer = None,
         metrics: dict = None,
+        enable_profile_trace: bool = False,
     ):
         super().__init__(lookahead, device)
         self.target_model_runner = target_model_runner
@@ -28,6 +34,7 @@ class Verifier(VerifierBase):
         self.jit_speculate = jit_speculate
         self.tokenizer = tokenizer
         self.metrics = metrics
+        self.enable_profile_trace = enable_profile_trace
 
     def prefill(self, seqs: list[Sequence], eagle: bool = False) -> VerifyResult:
         result = self.target_model_runner.call("run", seqs, True)
@@ -93,6 +100,18 @@ class Verifier(VerifierBase):
         temperatures_target = torch.tensor(temps_target, dtype=torch.float32, device=self.device)
         temperatures_draft = torch.tensor(temps_draft, dtype=torch.float32, device=self.device)
 
+        profile_trace: VerifyProfileTrace | None = None
+        if self.enable_profile_trace and not eagle:
+            probs_p = target_probs_p_batched(logits_p, temperatures_target)
+            pred_ids = probs_p.argmax(dim=-1)
+            token_ids_per_position = pred_ids.cpu().tolist()
+            token_confidence_per_position = probs_p.max(dim=-1).values.cpu().tolist()
+            token_ids_per_position = [[int(token_ids_per_position[b][j]) for j in range(self.lookahead + 1)] for b in range(batch_size)]
+            token_confidence_per_position = [
+                [float(token_confidence_per_position[b][j]) for j in range(self.lookahead + 1)]
+                for b in range(batch_size)
+            ]
+
         new_suffixes, recovery_tokens = verify(
             logits_p=logits_p,
             logits_q=speculate_result.logits_q,
@@ -104,6 +123,18 @@ class Verifier(VerifierBase):
             async_fan_out=self.async_fan_out,
             jit_speculate=self.jit_speculate,
         )
+
+        if self.enable_profile_trace and not eagle:
+            accept_len = [max(0, len(s) - 1) for s in new_suffixes]
+            bonus_tokens = [int(logits_p[b, self.lookahead, :].argmax().item()) for b in range(batch_size)]
+            profile_trace = VerifyProfileTrace(
+                verification_models=["target"] * batch_size,
+                token_ids_per_position=token_ids_per_position,
+                token_confidence_per_position=token_confidence_per_position,
+                accept_len=accept_len,
+                recovery_tokens=list(recovery_tokens),
+                bonus_tokens=bonus_tokens,
+            )
 
         self.metrics["target_verify_times"].append(perf_counter() - _tv0)
 
@@ -150,4 +181,5 @@ class Verifier(VerifierBase):
             new_suffixes=new_suffixes,
             recovery_tokens=recovery_tokens,
             eagle_acts=eagle_acts,
+            profile_trace=profile_trace if self.enable_profile_trace and not eagle else None,
         )

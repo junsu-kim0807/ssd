@@ -28,6 +28,8 @@ DATASET_PATHS = {
     "c4":            f"{DATASET_DIR}/c4/c4_data_10000.jsonl",
     "gsm":           f"{DATASET_DIR}/gsm8k/gsm8k_data_10000.jsonl",
     "ultrafeedback": f"{DATASET_DIR}/ultrafeedback/ultrafeedback_data_10000.jsonl",
+    "aime2025":      f"{DATASET_DIR}/aime2025/aime2025_test.jsonl",
+    "livecodebench_lite": f"{DATASET_DIR}/livecodebench_lite/livecodebench_lite_data_10000.jsonl",
 }
 
 EAGLE3_SPECFORGE_70B = os.environ.get(

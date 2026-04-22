@@ -22,6 +22,10 @@ class Sequence:
         'num_draft_cached_tokens', 'temperature', 'draft_temperature', 'max_new_tokens',
         'ignore_eos', 'recovery_token_id', 'last_target_hidden_state',
         'extend_eagle_acts', 'extend_token_ids', 'extend_count',
+        # hierarchical verification (HV)
+        'hv_round_idx', 'hv_provisional_token_ids', 'hv_provisional_recovery_token_id',
+        'hv_num_provisional_tokens', 'inter_block_table', 'num_inter_cached_tokens',
+        'intermediate_last_spec_step_accepted_len', 'target_last_spec_step_accepted_len',
     ]
 
     def __init__(self, token_ids: list[int], sampling_params = SamplingParams()):
@@ -49,6 +53,16 @@ class Sequence:
         self.extend_eagle_acts = None
         self.extend_token_ids = None
         self.extend_count = 0
+
+        # HV: round 0..r-2 => intermediate, r-1 => target (see Scheduler / VerifierHierarchical)
+        self.hv_round_idx = 0
+        self.hv_provisional_token_ids: list[int] = []
+        self.hv_provisional_recovery_token_id: int | None = None
+        self.hv_num_provisional_tokens = 0
+        self.inter_block_table: list[int] = []
+        self.num_inter_cached_tokens = 0
+        self.intermediate_last_spec_step_accepted_len = -1
+        self.target_last_spec_step_accepted_len = -1
 
     def __len__(self):
         return self.num_tokens
@@ -91,6 +105,10 @@ class Sequence:
     @property
     def last_block_num_tokens_draft(self):
         return self.num_tokens - (self.num_draft_cached_blocks - 1) * self.block_size
+
+    def draft_context_len(self) -> int:
+        """Tokens covered by draft KV: committed prefix minus one, plus HV provisional body."""
+        return self.num_tokens - 1 + self.hv_num_provisional_tokens
 
     def block(self, i):
         assert 0 <= i < self.num_blocks

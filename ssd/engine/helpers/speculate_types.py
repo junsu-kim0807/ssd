@@ -12,10 +12,31 @@ class SpeculateResult:
 
 
 @dataclass
+class VerifyProfileTrace:
+    """Batch-shaped verification metadata for profiling (one list entry per request)."""
+
+    verification_models: list[str]
+    token_ids_per_position: list[list[int]]
+    token_confidence_per_position: list[list[float]]
+    accept_len: list[int]
+    recovery_tokens: list[int]
+    bonus_tokens: list[int | None]
+    # Optional hierarchical / pivot intermediate columns (per batch row; None if N/A)
+    inter_token_ids_per_position: list[list[int] | None] | None = None
+    inter_token_confidence_per_position: list[list[float] | None] | None = None
+    inter_accept_len: list[int | None] | None = None
+    inter_recovery_token: list[int | None] | None = None
+    inter_bonus_token: list[int | None] | None = None
+
+
+@dataclass
 class VerifyResult:
     new_suffixes: list[list[int]]
     recovery_tokens: list[int]
     eagle_acts: torch.Tensor | None = None  # Is this a tensor?
+    # hierarchical: intermediate round uses scheduler.postprocess_hv_intermediate_round
+    is_hv_intermediate: bool = False
+    profile_trace: VerifyProfileTrace | None = None
 
 
 class SpeculatorBase(ABC):

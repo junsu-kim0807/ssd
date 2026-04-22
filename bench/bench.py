@@ -9,7 +9,12 @@ from ssd import LLM, SamplingParams
 from ssd.engine.llm_engine import METRICS
 from transformers import AutoTokenizer
 import wandb
-from bench_helpers import get_model_paths, generate_benchmark_inputs
+from bench_helpers import (
+    benchmark_dataset_label,
+    ensure_benchmark_dataset,
+    generate_benchmark_inputs,
+    get_model_paths,
+)
 
 
 def parse_arguments():
@@ -68,10 +73,39 @@ def parse_arguments():
     parser.add_argument("--alpaca", action="store_true", help="Use Alpaca prompts")
     parser.add_argument("--c4", action="store_true", help="Use C4 prompts")
     parser.add_argument("--ultrafeedback", action="store_true", help="Use UltraFeedback prompts")
+    parser.add_argument("--aime2025", action="store_true", help="Use AIME 2025 (math-ai/aime25) prompts from SSD_DATASET_DIR")
+    parser.add_argument(
+        "--livecodebench",
+        "--lcb_lite",
+        action="store_true",
+        dest="livecodebench",
+        help="Use LiveCodeBench code_generation_lite (release_v5) prompts from SSD_DATASET_DIR",
+    )
     parser.add_argument("--random", action="store_true", help="Use random tokens instead of dataset prompts")
     parser.add_argument("--prompt_offset", type=int, default=0, help="Skip first N prompts per dataset (for variance testing)")
     parser.add_argument("--all", action="store_true", help="Use numseqs from each dataset (union dataset with numseqs*4 total)")
     parser.add_argument("--chat_template", action="store_true", help="Wrap dataset prompts in chat template before tokenizing")
+    parser.add_argument(
+        "--prepare_data",
+        action="store_true",
+        help="Download missing JSONL for the selected dataset into SSD_DATASET_DIR (via scripts/get_data_from_hf.py)",
+    )
+
+    # Profiling (same semantics as ssd.config.Config; inactive unless profiler_output_dir is set)
+    parser.add_argument(
+        "--profiler_mode",
+        type=str,
+        default=None,
+        choices=["cost_breakdown", "metadata", "cost_metadata", "kernel_breakdown"],
+        help="Profiler mode when --profiler_output_dir is set (default: cost_metadata). "
+        "kernel_breakdown forces eager execution in the engine.",
+    )
+    parser.add_argument(
+        "--profiler_output_dir",
+        type=str,
+        default=None,
+        help="Directory for profiler JSONL / cost_breakdown.json; unset disables profiling.",
+    )
 
     # Debugging and logging
     parser.add_argument("--verbose", action="store_true", help="Enable verbose output")
@@ -85,6 +119,20 @@ def parse_arguments():
     parser.add_argument("--sweep", type=str, default=None,
                         help="JSON list of override dicts. Sweepable keys: temp, b. "
                              "Each dict also supports 'name' for wandb run name.")
+    parser.add_argument(
+        "--output_jsonl",
+        type=str,
+        default=None,
+        help="Write one JSON object per sequence with run metadata. "
+        "With --sweep: if this is a directory (or ends with /), writes <dir>/<run_name>.jsonl per sweep; "
+        "if a file path, writes <stem>_sweep{idx}_t{temp}_b{b}.jsonl per sweep. Default: bench_runs/<run_name>.jsonl",
+    )
+    parser.add_argument(
+        "--output_jsonl_dir",
+        type=str,
+        default=None,
+        help="Directory for per-sweep JSONL files named <cur_run_name>.jsonl (overrides default bench_runs layout).",
+    )
 
     args = parser.parse_args()
     assert not (args.qwen and '--llama' in sys.argv), "--llama and --qwen are mutually exclusive"
@@ -95,6 +143,23 @@ def parse_arguments():
         assert args.llama, "Eagle currently only supports llama models"
         assert args.temp == 0.0 and args.dtemp is None, "Eagle currently only supports greedy decoding (temp=0)"
         assert getattr(args, 'async', False), "Eagle currently only supports async speculative decoding"
+
+    _n_ds = sum(
+        bool(x)
+        for x in (
+            args.humaneval,
+            args.alpaca,
+            args.c4,
+            args.ultrafeedback,
+            args.aime2025,
+            args.livecodebench,
+        )
+    )
+    if _n_ds > 1:
+        parser.error(
+            "Choose at most one dataset flag among "
+            "--humaneval --alpaca --c4 --ultrafeedback --aime2025 --livecodebench"
+        )
     return args
 
 
@@ -109,10 +174,32 @@ def create_run_name(args):
     alpaca_str = "_alpaca" if args.alpaca else ""
     c4_str = "_c4" if args.c4 else ""
     ultrafeedback_str = "_ultrafeedback" if args.ultrafeedback else ""
+    aime_str = "_aime2025" if getattr(args, "aime2025", False) else ""
+    lcb_str = "_livecodebench" if getattr(args, "livecodebench", False) else ""
     random_str = "_random" if args.random else ""
     all_str = "_all" if args.all else ""
-    gsm_str = "_gsm" if not args.example and not args.humaneval and not args.alpaca and not args.c4 and not args.ultrafeedback and not args.random and not args.all else ""
+    _non_gsm = (
+        args.example
+        or args.humaneval
+        or args.alpaca
+        or args.c4
+        or args.ultrafeedback
+        or args.random
+        or args.all
+        or getattr(args, "aime2025", False)
+        or getattr(args, "livecodebench", False)
+    )
+    gsm_str = "" if _non_gsm else "_gsm"
     sampler_x_str = f"_sampler_x{args.x}" if args.x else ""
+
+    _pod = getattr(args, "profiler_output_dir", None) or ""
+    prof_short = ""
+    if str(_pod).strip():
+        pm = getattr(args, "profiler_mode", None) or "cost_metadata"
+        prof_token = {"cost_breakdown": "cb", "metadata": "md", "cost_metadata": "cm", "kernel_breakdown": "kb"}.get(
+            pm, "prof"
+        )
+        prof_short = f"_prof_{prof_token}"
 
     temp_str = f"_temp{args.temp}"
     if args.dtemp is not None:
@@ -122,7 +209,11 @@ def create_run_name(args):
     k_str = f"_k{args.k}"
     f_str = f"_f{args.f}"
 
-    return args.name if args.name else f"{model_type}_size{args.size}_{spec_mode_str}{async_mode_str}{jit_mode_str}_b{args.b}{k_str}{f_str}{draft_str}{temp_str}{sampler_x_str}{example_str}{humaneval_str}{alpaca_str}{c4_str}{ultrafeedback_str}{random_str}{all_str}{gsm_str}"
+    return args.name if args.name else (
+        f"{model_type}_size{args.size}_{spec_mode_str}{async_mode_str}{jit_mode_str}_b{args.b}{k_str}{f_str}{draft_str}"
+        f"{temp_str}{sampler_x_str}{prof_short}{example_str}{humaneval_str}{alpaca_str}{c4_str}{ultrafeedback_str}"
+        f"{aime_str}{lcb_str}{random_str}{all_str}{gsm_str}"
+    )
 
 
 def initialize_wandb(args, run_name):
@@ -158,9 +249,19 @@ def initialize_wandb(args, run_name):
             "alpaca_mode": args.alpaca,
             "c4_mode": args.c4,
             "ultrafeedback_mode": args.ultrafeedback,
+            "aime2025_mode": getattr(args, "aime2025", False),
+            "livecodebench_mode": getattr(args, "livecodebench", False),
+            "benchmark_dataset": benchmark_dataset_label(args),
             "random_mode": args.random,
             "all_mode": args.all,
             "sampler_x": args.x,
+            "profiler_mode": getattr(args, "profiler_mode", None),
+            "profiler_enabled": bool(getattr(args, "profiler_output_dir", None) and str(args.profiler_output_dir).strip()),
+            "profiler_output_dir_basename": (
+                os.path.basename(str(args.profiler_output_dir).rstrip(os.sep))
+                if getattr(args, "profiler_output_dir", None) and str(args.profiler_output_dir).strip()
+                else None
+            ),
             "implementation": "ssd",
             "max_steps": args.max_steps,
             "spec_policy": args.spec_policy,
@@ -201,7 +302,103 @@ def create_llm_kwargs(args, draft_path):
     if args.flm is not None:
         llm_kwargs["fan_out_list_miss"] = args.flm
 
+    _pod = getattr(args, "profiler_output_dir", None)
+    if _pod and str(_pod).strip():
+        llm_kwargs["profiler_output_dir"] = str(_pod).strip()
+        llm_kwargs["profiler_mode"] = getattr(args, "profiler_mode", None) or "cost_metadata"
+
     return llm_kwargs
+
+
+def _sanitize_run_filename(name: str) -> str:
+    bad = '/\\:*?"<>|'
+    s = "".join(c if c not in bad else "_" for c in name)
+    return s[:220] if len(s) > 220 else s
+
+
+def resolve_bench_output_jsonl_path(
+    args,
+    si: int,
+    temp: float,
+    b: int,
+    cur_run_name: str,
+    n_sweeps: int,
+) -> str:
+    has_sweep = n_sweeps > 1
+    out_dir = getattr(args, "output_jsonl_dir", None)
+    if out_dir and str(out_dir).strip():
+        base = str(out_dir).strip().rstrip(os.sep)
+        os.makedirs(base, exist_ok=True)
+        return os.path.join(base, _sanitize_run_filename(cur_run_name) + ".jsonl")
+
+    user_path = getattr(args, "output_jsonl", None)
+    if user_path and str(user_path).strip():
+        p = str(user_path).strip()
+        is_dir = p.endswith(os.sep) or p.endswith("/") or (os.path.exists(p) and os.path.isdir(p))
+        if has_sweep and is_dir:
+            base = p.rstrip(os.sep).rstrip("/")
+            os.makedirs(base, exist_ok=True)
+            return os.path.join(base, _sanitize_run_filename(cur_run_name) + ".jsonl")
+        if has_sweep and not is_dir:
+            root, ext = os.path.splitext(p)
+            if not ext:
+                ext = ".jsonl"
+            return f"{root}_sweep{si}_t{temp}_b{b}{ext}"
+        return p
+
+    os.makedirs("bench_runs", exist_ok=True)
+    return os.path.join("bench_runs", _sanitize_run_filename(cur_run_name) + ".jsonl")
+
+
+def write_bench_outputs_jsonl(
+    *,
+    path: str,
+    prompts,
+    outputs,
+    tokenizer,
+    run_name: str,
+    sweep_idx: int,
+    temperature: float,
+    max_num_seqs: int,
+    dataset: str,
+    profiler_mode,
+    profiler_enabled: bool,
+    original_prompts,
+) -> None:
+    """One JSON object per sequence; always includes sweep / temp / b / dataset for downstream merges."""
+    parent = os.path.dirname(os.path.abspath(path))
+    if parent:
+        os.makedirs(parent, exist_ok=True)
+
+    pm = profiler_mode if profiler_enabled else None
+    with open(path, "w", encoding="utf-8") as f:
+        for i, (prompt, output) in enumerate(zip(prompts, outputs)):
+            if isinstance(prompt, list):
+                prompt_text = tokenizer.decode(prompt, skip_special_tokens=True)
+                prompt_token_ids = prompt
+            else:
+                prompt_text = str(prompt)
+                prompt_token_ids = None
+            if original_prompts and i < len(original_prompts):
+                display_prompt = original_prompts[i]
+            else:
+                display_prompt = prompt_text
+            row = {
+                "run_name": run_name,
+                "sweep_idx": sweep_idx,
+                "temperature": temperature,
+                "max_num_seqs": max_num_seqs,
+                "dataset": dataset,
+                "profiler_mode": pm,
+                "profiler_enabled": profiler_enabled,
+                "request_index": i,
+                "prompt_text": prompt_text,
+                "prompt_token_ids": prompt_token_ids,
+                "display_prompt": display_prompt,
+                "completion_text": output.get("text", ""),
+                "completion_token_ids": output.get("token_ids", []),
+            }
+            f.write(json.dumps(row, ensure_ascii=False) + "\n")
 
 
 def log_wandb_metrics(args, metrics, total_tokens, total_time, throughput, model_name, mode, run_name):
@@ -285,6 +482,8 @@ def main():
         print("Warning: --example mode supports up to 8 sequences, reducing numseqs from {} to 8".format(args.numseqs))
         args.numseqs = 8
 
+    ensure_benchmark_dataset(args)
+
     model_name, model_path, draft_path = get_model_paths(args)
 
     string_prompts, prompt_token_ids, original_prompts = generate_benchmark_inputs(args, model_path)
@@ -312,6 +511,13 @@ def main():
             else:
                 raise ValueError(f"Invalid prompt type: {type(prompt)}")
 
+    if args.sweep:
+        sweep_configs = json.loads(args.sweep)
+        assert isinstance(sweep_configs, list), "--sweep must be a JSON list of dicts"
+    else:
+        sweep_configs = [{}]
+    n_sweeps = len(sweep_configs)
+
     # Create LLM (once, reused across sweep configs)
     llm_kwargs = create_llm_kwargs(args, draft_path)
     if args.eagle:
@@ -320,13 +526,7 @@ def main():
         llm_kwargs['debug_mode'] = True
 
     llm = LLM(model_path, **llm_kwargs)
-
-    # Build sweep configs
-    if args.sweep:
-        sweep_configs = json.loads(args.sweep)
-        assert isinstance(sweep_configs, list), "--sweep must be a JSON list of dicts"
-    else:
-        sweep_configs = [{}]
+    bench_jsonl_tokenizer = AutoTokenizer.from_pretrained(model_path)
 
     for si, sweep_cfg in enumerate(sweep_configs):
         bad_keys = {"backup", "flh", "flm"} & set(sweep_cfg.keys())
@@ -363,7 +563,7 @@ def main():
 
         try:
             print(f"\n{'='*60}")
-            print(f"SWEEP [{si+1}/{len(sweep_configs)}] temp={temp} b={b}")
+            print(f"SWEEP [{si+1}/{n_sweeps}] temp={temp} b={b}")
             print(f"{'='*60}")
 
             outputs, total_time, metrics = run_benchmark(args, llm, prompts, cur_sampling_params)
@@ -385,13 +585,11 @@ def main():
                 print("GENERATIONS:")
                 print("="*80)
 
-                tokenizer = AutoTokenizer.from_pretrained(model_path)
-
                 for i, (prompt, output) in enumerate(zip(prompts, outputs)):
                     if i >= 10:
                         break
                     if isinstance(prompt, list):
-                        decoded_prompt = tokenizer.decode(prompt, skip_special_tokens=True)
+                        decoded_prompt = bench_jsonl_tokenizer.decode(prompt, skip_special_tokens=True)
                     else:
                         decoded_prompt = prompt
                     if original_prompts and i < len(original_prompts):
@@ -403,6 +601,34 @@ def main():
                     print("-" * 40)
 
             log_wandb_metrics(args, metrics, total_tokens, total_time, throughput, model_name, full_mode, cur_run_name)
+
+            out_jsonl_path = resolve_bench_output_jsonl_path(
+                args, si, temp, b, cur_run_name, n_sweeps
+            )
+            prof_enabled = bool(
+                getattr(args, "profiler_output_dir", None)
+                and str(args.profiler_output_dir).strip()
+            )
+            prof_mode = (
+                (getattr(args, "profiler_mode", None) or "cost_metadata")
+                if prof_enabled
+                else None
+            )
+            write_bench_outputs_jsonl(
+                path=out_jsonl_path,
+                prompts=prompts,
+                outputs=outputs,
+                tokenizer=bench_jsonl_tokenizer,
+                run_name=cur_run_name,
+                sweep_idx=si,
+                temperature=float(temp),
+                max_num_seqs=int(b),
+                dataset=benchmark_dataset_label(args),
+                profiler_mode=prof_mode,
+                profiler_enabled=prof_enabled,
+                original_prompts=original_prompts,
+            )
+            print(f"Wrote outputs JSONL: {out_jsonl_path}")
 
             if args.wandb:
                 wandb.finish()
