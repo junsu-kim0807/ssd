@@ -6,7 +6,10 @@ Layout for ``--profiler_output_dir`` when ``bench.py`` is run with ``--profile``
 
     ./results/<profile_mode>/<method>/b<batch>/k<k|na>/<target>+<draft>/<temp_tag>[/r<R>/][<dataset_slug>/]
 
-For ``--spec_policy hierarchical``, ``r<R>`` is always present (``R`` = ``bench.py --round`` / ``target_verify_interval``, default 1). Job scripts and Slurm logs use the same ``.../<temp_tag>/r<R>/`` segment under ``--job-root`` / log roots.
+For ``--spec_policy hierarchical``, ``r<R>`` is always present (``R`` = ``bench.py --round`` /
+``Config.target_verify_interval``): intermediate verify while ``hv_round_idx < R``, target verify
+when ``hv_round_idx == R``. If ``--hv-rounds`` is omitted, generated jobs sweep ``R`` in
+``{1, 2, 3}``. Job scripts and Slurm logs use ``.../<temp_tag>/r<R>/`` under ``--job-root`` / log roots.
 
 ``--batch`` and ``--length`` are independent sweep dimensions (batch sizes vs speculative ``k``).
 
@@ -70,6 +73,9 @@ DEFAULT_CPUS_PER_TASK = 16
 BATCH_SWEEP = (1, 4, 16, 64, 256)
 K_SWEEP = (3, 5, 7, 9)
 TEMP_SWEEP = (0.0, 0.3, 0.7, 1.0)
+
+# Hierarchical: default sweep for ``bench.py --round`` when ``--hv-rounds`` is not passed.
+HV_ROUND_SWEEP_DEFAULT = (1, 2, 3)
 
 FIXED_NUMSEQS = 512
 FIXED_OUTPUT_LEN = 2048
@@ -227,7 +233,7 @@ METHOD_REGISTRY: dict[str, BenchMethodSpec] = {
     ),
     "hierarchical": BenchMethodSpec(
         id="hierarchical",
-        description="Sync spec with hierarchical verification (intermediate + target rounds)",
+        description="Sync spec with hierarchical verification (intermediate until hv_round_idx==R, then target)",
         uses_spec_k=True,
         default_k=3,
         extra_bench_args=_args_hierarchical,
@@ -305,8 +311,8 @@ def profiler_rel_dir(
 ) -> str:
     """Path relative to bench cwd (``profile_mode``: cost | metadata | cost_metadata).
 
-    When ``hv_round`` is set (hierarchical jobs), insert ``r<hv_round>/`` after the temperature tag
-    and before the optional dataset slug.
+    When ``hv_round`` is set (hierarchical jobs), insert ``r<hv_round>/`` (``--round`` value) after
+    the temperature tag and before the optional dataset slug.
     """
     parts = [
         "results",
@@ -687,8 +693,8 @@ def main() -> None:
         "--hv-rounds",
         type=str,
         default="",
-        help="Hierarchical method only: comma-separated --round values (>=2). Each R adds .../t<tag>/r<R>/ to "
-        "job, log, and profiler paths and passes bench.py --round R. Default when empty: 2.",
+        help="Hierarchical method only: comma-separated bench.py --round values (>=1). Each R adds "
+        ".../t<tag>/r<R>/ to job, log, and profiler paths. Default when empty: sweep 1,2,3.",
     )
 
     p.add_argument(
@@ -717,7 +723,7 @@ def main() -> None:
         if any(r < 1 for r in hv_rounds_parsed):
             p.error("--hv-rounds values must be >= 1")
     else:
-        hv_rounds_parsed = (1,)
+        hv_rounds_parsed = HV_ROUND_SWEEP_DEFAULT
 
     model_families = normalize_model_families(args.models)
     methods = normalize_methods(args.methods)

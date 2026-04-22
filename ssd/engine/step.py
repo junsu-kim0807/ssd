@@ -98,6 +98,9 @@ class SpecDecodeStep(InferenceStep):
                 "intermediate_verify_accepted_token_ids": out_verify_result.new_suffixes[bi]
                 if out_verify_result.is_hv_intermediate
                 else None,
+                "target_verify_accepted_token_ids": out_verify_result.new_suffixes[bi]
+                if not out_verify_result.is_hv_intermediate
+                else None,
                 "target_verify_input_token_ids": dbg_target_cands[bi] if dbg_target_cands is not None else None,
                 "verify_recovery_token_id": out_verify_result.recovery_tokens[bi],
                 "output_new_completion_token_ids": list(
