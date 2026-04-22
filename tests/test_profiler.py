@@ -42,6 +42,32 @@ def test_draft_metadata_from_logits_shapes():
     assert len(d_ids[0]) == k
 
 
+def test_prefill_step_only_prefill_wall_not_draft(tmp_path):
+    p = SSDProfiler(
+        _prof_cfg(
+            profiler_mode="cost_breakdown",
+            profiler_output_dir=str(tmp_path),
+        )
+    )
+
+    class S:
+        seq_id = 0
+
+    p.start_run(SimpleNamespace(), None)
+    p.start_step([S()], is_prefill=True)
+    p.start_stage("draft_prefill")
+    p.finish_stage("draft_prefill")
+    p.start_stage("target_prefill")
+    p.finish_stage("target_prefill")
+    p.finish_step(1)
+    p.finish_run()
+    data = json.loads((tmp_path / "cost_breakdown.json").read_text())
+    assert data["num_prefill_engine_steps"] == 1
+    assert data["prefill_wall_time_s"] > 0
+    assert data["draft_time_s"] == 0.0
+    assert data["verification_time_s"] == 0.0
+
+
 def test_cost_breakdown_finish_run_writes_json(tmp_path):
     p = SSDProfiler(
         _prof_cfg(

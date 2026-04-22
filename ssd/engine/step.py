@@ -10,11 +10,7 @@ from ssd.engine.scheduler import Scheduler
 from ssd.engine.helpers.speculate_types import SpeculatorBase, VerifierBase, VerifyResult
 from ssd.utils.misc import decode_tokens
 from ssd.utils.profiler import SSDProfiler
-from ssd.utils.profiler_metadata import (
-    draft_metadata_from_logits,
-    prefill_metadata_rows,
-    trace_to_row_indexed,
-)
+from ssd.utils.profiler_metadata import draft_metadata_from_logits, trace_to_row_indexed
 
 
 class InferenceStep(ABC):
@@ -82,41 +78,16 @@ class SpecDecodeStep(InferenceStep):
         return isinstance(self.profiler, SSDProfiler)
 
     def prefill(self, seqs: list[Sequence]) -> int:
-        pr = self.profiler
-        if self._profiler_active():
-            if not self.eagle and self.async_spec:
-                pr.start_stage("draft_prefill")
-            else:
-                pr.start_stage("target_prefill")
+        # Prefill timing: only the outer engine step wall (LLMEngine start_step/finish_step).
+        # No inner draft_prefill/target_prefill stages and no per-request JSONL rows — all profiler modes.
 
         if not self.eagle and self.async_spec:
             empty_verify_result = VerifyResult([], [], None)
             self.speculator.prefill(seqs, empty_verify_result)
-            if self._profiler_active():
-                pr.finish_stage("draft_prefill")
-                pr.start_stage("target_prefill")
             verify_result = self.verifier.prefill(seqs, eagle=False)
-            if self._profiler_active():
-                pr.finish_stage("target_prefill")
         else:
             verify_result = self.verifier.prefill(seqs, eagle=self.eagle)
-            if self._profiler_active():
-                pr.finish_stage("target_prefill")
-                pr.start_stage("draft_prefill")
             self.speculator.prefill(seqs, verify_result)
-            if self._profiler_active():
-                pr.finish_stage("draft_prefill")
-
-        if self._profiler_active() and pr.wants_metadata_computation():
-            rows_pf = prefill_metadata_rows(
-                profiler=pr,
-                seqs=seqs,
-                speculate_k=self.verifier.lookahead,
-                spec_policy=pr.spec_policy,
-                draft_async=pr.draft_async,
-                cost_fields=(pr.mode == "cost_metadata"),
-            )
-            pr.flush_spec_decode_rows(seqs, True, rows_pf)
 
         for seq in seqs:
             assert seq.recovery_token_id is not None

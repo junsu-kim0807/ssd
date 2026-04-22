@@ -3,6 +3,10 @@
 See project plan: disabled when ``profiler_output_dir`` is unset; strict no-op
 on hot paths. Run-level JSON is written only in ``finish_run()``; per-step
 JSONL rows are appended in ``finish_step()`` only.
+
+Prefill engine steps contribute only ``prefill_wall_time_s`` (outer step wall).
+They do not add to draft/verify/sync/postprocess run totals and do not emit
+prefill JSONL rows, in any ``profiler_mode``.
 """
 
 from __future__ import annotations
@@ -193,6 +197,7 @@ class SSDProfiler:
 
         # Run-level (finish_run only)
         self._run_execution_wall_s = 0.0
+        self._run_prefill_wall_s = 0.0  # sum of engine-step walls where is_prefill=True (decode breakdown excluded)
         self._run_draft_s = 0.0
         self._run_verify_s = 0.0
         self._run_sync_s = 0.0
@@ -246,6 +251,7 @@ class SSDProfiler:
         if wants_cost_aggregates(self._mode):
             payload = {
                 "execution_wall_time_s": self._run_execution_wall_s,
+                "prefill_wall_time_s": self._run_prefill_wall_s,
                 "draft_time_s": self._run_draft_s,
                 "verification_time_s": self._run_verify_s,
                 "sync_time_s": self._run_sync_s,
@@ -261,7 +267,11 @@ class SSDProfiler:
                     "num_draft": "cumulative count of requests entering draft stage",
                     "num_verification": "cumulative count of requests entering verification stage",
                     "num_decode_engine_steps": "LLMEngine.step calls where is_prefill=False",
-                    "draft_worker_wall_time_s": "async: sum of draft-process wall tensors per step",
+                    "prefill_wall_time_s": (
+                        "sum of outer prefill step wall times only; prefill does not contribute to "
+                        "draft_time_s / verification_time_s / sync_time_s / postprocess_time_s below"
+                    ),
+                    "draft_worker_wall_time_s": "async decode steps: sum of draft-process wall tensors per step",
                     "draft_time_s": "async: same as draft_worker_wall_time_s; sync: rank0 draft stage wall",
                     "sync_time_s": (
                         "async: rank0 speculate RPC wall minus draft_worker_wall (protocol/wait overhead); "
@@ -295,18 +305,18 @@ class SSDProfiler:
         self._run_execution_wall_s += wall
         if st.is_prefill:
             self._num_prefill_engine_steps += 1
+            self._run_prefill_wall_s += wall
         else:
             self._num_decode_engine_steps += 1
-
-        # Async: draft compute wall comes from draft worker payload; sync: rank0 draft stage.
-        if self._draft_async:
-            self._run_draft_s += st.draft_time_worker_s
-        else:
-            self._run_draft_s += st.draft_time_s
-        self._run_verify_s += st.verification_time_s
-        self._run_sync_s += st.sync_time_s
-        self._run_postprocess_s += st.postprocess_time_s
-        self._run_draft_worker_s += st.draft_time_worker_s
+            # Decode steps only: stage timers and async worker scalars (prefill uses outer wall only).
+            if self._draft_async:
+                self._run_draft_s += st.draft_time_worker_s
+            else:
+                self._run_draft_s += st.draft_time_s
+            self._run_verify_s += st.verification_time_s
+            self._run_sync_s += st.sync_time_s
+            self._run_postprocess_s += st.postprocess_time_s
+            self._run_draft_worker_s += st.draft_time_worker_s
 
         if wants_metadata_rows(self._mode):
             # Rows require merge from step — SpecDecodeStep calls _flush_spec_decode_rows
@@ -342,8 +352,8 @@ class SSDProfiler:
             self._state.draft_time_worker_s += dt
 
     def on_async_draft_prefill_worker_time_s(self, dt: float) -> None:
-        self._run_draft_worker_s += dt
-        self._run_draft_s += dt
+        """Prefill is accounted only via outer step wall in finish_step; do not fold worker wall into draft totals."""
+        return
 
     def add_step_async_spec_rpc_time_s(self, dt: float) -> None:
         if self._state is not None:
