@@ -11,6 +11,9 @@ Sweep flags (optional, Cartesian product with other dimensions):
   --length  → speculative k 3, 5, 7, 9 (methods with ``uses_spec_k``; AR keeps path segment ``kna``)
   --temp    → temperatures 0, 0.3, 0.7, 1.0
 
+Default ``--methods`` includes ``hierarchical`` (sync spec + ``--spec_policy hierarchical``); ``pivot`` is
+opt-in (async + extra flags). Override with ``--methods ar,sync`` etc.
+
 Adding a method
     1. Define ``extra_bench_args(k, async_fan_out) -> list[str]`` (tokens only; no ``--gpus``).
     2. Append ``BenchMethodSpec(...)`` to ``METHOD_REGISTRY`` with a unique ``id``.
@@ -456,7 +459,13 @@ def main() -> None:
     )
 
     p.add_argument("--models", type=str, default="qwen,gemma", help="Comma-separated model families")
-    p.add_argument("--methods", type=str, default="ar,sync,async", help="Comma-separated method ids")
+    p.add_argument(
+        "--methods",
+        type=str,
+        default="ar,sync,async,hierarchical",
+        help="Comma-separated method ids: ar | sync | async | hierarchical | pivot "
+        "(pivot needs async + 3 GPUs in the default GPU table; override with --gpus).",
+    )
     p.add_argument(
         "--dataset",
         type=str,
@@ -465,7 +474,11 @@ def main() -> None:
     )
 
     p.add_argument("--batch", action="store_true", help=f"Sweep batch sizes {BATCH_SWEEP}")
-    p.add_argument("--length", action="store_true", help=f"Sweep speculative k {K_SWEEP} (sync/async)")
+    p.add_argument(
+        "--length",
+        action="store_true",
+        help=f"Sweep speculative k {K_SWEEP} (methods with uses_spec_k: sync, async, hierarchical, pivot)",
+    )
     p.add_argument("--temp", action="store_true", help=f"Sweep temperatures {TEMP_SWEEP}")
 
     p.add_argument("--batch-sizes", type=str, default="", help="Override batch sweep, e.g. '1,8,32'")
