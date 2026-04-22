@@ -20,7 +20,7 @@ MODELS = {
     "gemma": [
         "google/gemma-4-31B-it",
         "google/gemma-4-E2B-it",
-        "google/gemma-4-E4B-it,
+        "google/gemma-4-E4B-it",
     ],
     "vicuna": [
         "lmsys/vicuna-13b-v1.3",
