@@ -90,6 +90,16 @@ def parse_arguments():
                         help="Enable spec_hive mode for pivot policy")
     parser.add_argument("--interval", type=int, default=0,
                         help="Pivot interval to force target verification")
+    parser.add_argument(
+        "--round",
+        type=int,
+        default=None,
+        metavar="R",
+        dest="target_verify_interval",
+        help="Hierarchical spec only (--spec --spec_policy hierarchical): verification depth r (>=2). "
+        "Rounds 0..r-2 verify with the intermediate model; round r-1 verifies with the target. "
+        "Sets Config.target_verify_interval (default when omitted: 2).",
+    )
     parser.add_argument("--threshold", type=float, default=0.8,
                         help="Pivot confidence threshold")
     parser.add_argument("--expansion_pct", type=float, default=1.0,
@@ -266,6 +276,12 @@ def parse_arguments():
                 file=sys.stderr,
             )
 
+    if getattr(args, "target_verify_interval", None) is not None:
+        if not args.spec or args.spec_policy != "hierarchical":
+            parser.error("--round requires --spec and --spec_policy hierarchical")
+        if int(args.target_verify_interval) < 2:
+            parser.error("--round must be >= 2 (at least one intermediate verify round before target)")
+
     return args
 
 
@@ -327,11 +343,16 @@ def create_run_name(args):
         temp_str += f"_dtemp{args.dtemp}"
 
     draft_str = f"_draft{args.draft}" if args.draft is not None else "_nodraft"
+    hv_r_str = (
+        f"_r{args.target_verify_interval}"
+        if getattr(args, "target_verify_interval", None) is not None
+        else ""
+    )
     k_str = f"_k{args.k}"
     f_str = f"_f{args.f}"
 
     return args.name if args.name else (
-        f"{model_type}_size{size_part}_{spec_mode_str}{async_mode_str}{jit_mode_str}_b{args.b}{k_str}{f_str}{draft_str}"
+        f"{model_type}_size{size_part}_{spec_mode_str}{async_mode_str}{jit_mode_str}_b{args.b}{hv_r_str}{k_str}{f_str}{draft_str}"
         f"{temp_str}{sampler_x_str}{prof_short}{example_str}{humaneval_str}{alpaca_str}{c4_str}{ultrafeedback_str}"
         f"{aime_str}{lcb_str}{codeelo_str}{math500_str}{govreport_str}{random_str}{all_str}{gsm_str}"
     )
@@ -405,6 +426,7 @@ def initialize_wandb(args, run_name):
             "spec_policy": args.spec_policy,
             "spec_hive": args.spec_hive,
             "interval": args.interval,
+            "target_verify_interval": getattr(args, "target_verify_interval", None),
             "threshold": args.threshold,
             "expansion_pct": args.expansion_pct,
             "gpu_memory_utilization_arg": getattr(args, "gpu_memory_utilization", None),
@@ -435,6 +457,9 @@ def create_llm_kwargs(args, draft_path):
         threshold=args.threshold,
         expansion_pct=args.expansion_pct,
     )
+
+    if getattr(args, "target_verify_interval", None) is not None:
+        llm_kwargs["target_verify_interval"] = int(args.target_verify_interval)
 
     if args.flh is not None:
         llm_kwargs["fan_out_list"] = args.flh
