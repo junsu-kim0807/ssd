@@ -211,11 +211,11 @@ class VerifierPivot(VerifierBase):
 
         profile_trace: VerifyProfileTrace | None = None
         if self.enable_profile_trace and not eagle:
-            from ssd.utils.verify import target_probs_p_batched
+            from ssd.utils.profiler_metadata import profile_greedy_token_confidence
 
-            probs_p = target_probs_p_batched(logits_p, temps_target)
-            pred_ids = probs_p.argmax(dim=-1).cpu().tolist()
-            pred_conf = probs_p.max(dim=-1).values.cpu().tolist()
+            pred_ids_t, conf_t = profile_greedy_token_confidence(logits_p)
+            pred_ids = pred_ids_t.cpu().tolist()
+            pred_conf = conf_t.cpu().tolist()
             tgt_tok_ids = [[int(pred_ids[b][j]) for j in range(self.lookahead + 1)] for b in range(batch_size)]
             tgt_tok_conf = [[float(pred_conf[b][j]) for j in range(self.lookahead + 1)] for b in range(batch_size)]
             tgt_bonus = [int(logits_p[b, self.lookahead, :].argmax().item()) for b in range(batch_size)]

@@ -5,7 +5,8 @@ from transformers import AutoTokenizer
 
 from ssd.engine.sequence import Sequence
 from ssd.engine.model_runner import ModelRunner
-from ssd.utils.verify import verify, target_probs_p_batched
+from ssd.utils.verify import verify
+from ssd.utils.profiler_metadata import profile_greedy_token_confidence
 from ssd.engine.helpers.speculate_types import (
     SpeculateResult,
     VerifyResult,
@@ -102,11 +103,10 @@ class Verifier(VerifierBase):
 
         profile_trace: VerifyProfileTrace | None = None
         if self.enable_profile_trace and not eagle:
-            probs_p = target_probs_p_batched(logits_p, temperatures_target)
-            pred_ids = probs_p.argmax(dim=-1)
-            token_ids_per_position = pred_ids.cpu().tolist()
-            token_confidence_per_position = probs_p.max(dim=-1).values.cpu().tolist()
+            pred_ids_t, conf_t = profile_greedy_token_confidence(logits_p)
+            token_ids_per_position = pred_ids_t.cpu().tolist()
             token_ids_per_position = [[int(token_ids_per_position[b][j]) for j in range(self.lookahead + 1)] for b in range(batch_size)]
+            token_confidence_per_position = conf_t.cpu().tolist()
             token_confidence_per_position = [
                 [float(token_confidence_per_position[b][j]) for j in range(self.lookahead + 1)]
                 for b in range(batch_size)

@@ -2,9 +2,9 @@
 """
 Generate Slurm job scripts that run ``bench/bench.py`` with profiling output paths.
 
-Layout for ``--profiler_output_dir`` (relative to the bench working directory)::
+Layout for ``--profiler_output_dir`` when ``bench.py`` is run with ``--profile`` (relative to the bench cwd)::
 
-    ./results/<profiler_mode>/<method>/<batch_size>/k<k|na>/<target>+<draft>/<temp_tag>/
+    ./results/<profile_mode>/<method>/<batch_size>/k<k|na>/<target>+<draft>/<temp_tag>/
 
 Sweep flags (optional, Cartesian product with other dimensions):
   --batch   → batch sizes 1, 4, 16, 64, 256
@@ -53,7 +53,7 @@ TEMP_SWEEP = (0.0, 0.3, 0.7, 1.0)
 FIXED_NUMSEQS = 512
 FIXED_OUTPUT_LEN = 2048
 
-PROFILER_MODE_CHOICES = ("cost_breakdown", "metadata", "cost_metadata", "kernel_breakdown")
+PROFILE_MODE_CHOICES = ("cost", "metadata", "cost_metadata")
 
 MODEL_PRESETS: dict[str, tuple[str, str, str]] = {
     # family -> (bench flag name, target hub id, draft hub id)
@@ -204,6 +204,9 @@ def dataset_bench_flags(dataset: str) -> list[str]:
         "ultrafeedback": ["--ultrafeedback"],
         "aime2025": ["--aime2025"],
         "livecodebench": ["--livecodebench"],
+        "codeelo": ["--codeelo"],
+        "math500": ["--math500"],
+        "govreport": ["--govreport"],
         "random": ["--random"],
         "all": ["--all"],
     }
@@ -214,17 +217,17 @@ def dataset_bench_flags(dataset: str) -> list[str]:
 
 def profiler_rel_dir(
     *,
-    profiler_mode: str,
+    profile_mode: str,
     method_id: str,
     batch_size: int,
     k_path_token: str,
     pair_slug: str,
     temp: float,
 ) -> str:
-    """Path relative to bench cwd, with leading ./ as in the user spec."""
+    """Path relative to bench cwd (``profile_mode``: cost | metadata | cost_metadata)."""
     return os.path.join(
         "results",
-        profiler_mode,
+        profile_mode,
         method_id,
         str(batch_size),
         k_path_token,
@@ -245,7 +248,7 @@ def build_bench_argv(
     numseqs: int,
     output_len: int,
     gpus: int,
-    profiler_mode: str,
+    profile_mode: str,
     profiler_output_dir: str,
     extra_bench_args: Sequence[str],
 ) -> list[str]:
@@ -266,8 +269,9 @@ def build_bench_argv(
         str(output_len),
         *dataset_flags,
         *method.extra_bench_args(k, async_fan_out),
-        "--profiler_mode",
-        profiler_mode,
+        "--profile",
+        "--profile_mode",
+        profile_mode,
         "--profiler_output_dir",
         profiler_output_dir,
         *list(extra_bench_args),
@@ -417,7 +421,12 @@ def main() -> None:
 
     p.add_argument("--models", type=str, default="qwen,gemma", help="Comma-separated model families")
     p.add_argument("--methods", type=str, default="ar,sync,async", help="Comma-separated method ids")
-    p.add_argument("--dataset", type=str, default="humaneval", help="humaneval|alpaca|c4|gsm|...")
+    p.add_argument(
+        "--dataset",
+        type=str,
+        default="humaneval",
+        help="humaneval|alpaca|c4|gsm|ultrafeedback|aime2025|livecodebench|codeelo|math500|govreport|random|all",
+    )
 
     p.add_argument("--batch", action="store_true", help=f"Sweep batch sizes {BATCH_SWEEP}")
     p.add_argument("--length", action="store_true", help=f"Sweep speculative k {K_SWEEP} (sync/async)")
@@ -427,7 +436,13 @@ def main() -> None:
     p.add_argument("--ks", type=str, default="", help="Override k sweep, e.g. '4,6,8'")
     p.add_argument("--temps", type=str, default="", help="Override temp sweep, e.g. '0,0.5,1'")
 
-    p.add_argument("--profiler-mode", type=str, default="cost_metadata", choices=PROFILER_MODE_CHOICES)
+    p.add_argument(
+        "--profile-mode",
+        type=str,
+        default="cost_metadata",
+        choices=PROFILE_MODE_CHOICES,
+        help="bench.py --profile_mode (cost | metadata | cost_metadata)",
+    )
     p.add_argument("--async-fan-out", type=int, default=3, help="Async method: bench.py --f (default 3)")
     p.add_argument(
         "--gpus",
@@ -481,7 +496,7 @@ def main() -> None:
         k_for_bench = int(spec.default_k) if not spec.uses_spec_k else int(k_val)
 
         prof_rel = profiler_rel_dir(
-            profiler_mode=args.profiler_mode,
+            profile_mode=args.profile_mode,
             method_id=spec.id,
             batch_size=b_val,
             k_path_token=k_path,
@@ -503,7 +518,7 @@ def main() -> None:
             numseqs=int(args.numseqs),
             output_len=int(args.output_len),
             gpus=gpu_n,
-            profiler_mode=args.profiler_mode,
+            profile_mode=args.profile_mode,
             profiler_output_dir=prof_rel,
             extra_bench_args=tuple(args.extra_bench_arg),
         )
@@ -511,7 +526,7 @@ def main() -> None:
         temp_tag = temp_path_tag(temp_val)
         job_name = f"bench_{fam}_{spec.id}_b{b_val}_{k_path}_{temp_tag}"[:64]
 
-        rel_bits = Path(args.profiler_mode) / fam / spec.id / f"b{b_val}" / k_path / pair_slug / temp_tag
+        rel_bits = Path(args.profile_mode) / fam / spec.id / f"b{b_val}" / k_path / pair_slug / temp_tag
         job_dir = job_root / rel_bits
         out_log_dir = out_log_root / rel_bits
         err_log_dir = err_log_root / rel_bits

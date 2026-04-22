@@ -205,6 +205,8 @@ class SSDProfiler:
         self._run_draft_worker_s = 0.0
         self._num_prefill_engine_steps = 0
         self._num_decode_engine_steps = 0
+        self._run_prefill_tokens = 0
+        self._run_decode_tokens = 0
         self._num_draft_requests = 0
         self._num_verification_requests = 0
         self._num_intermediate_verification_requests = 0
@@ -249,9 +251,15 @@ class SSDProfiler:
             self._kernel_prof = None
 
         if wants_cost_aggregates(self._mode):
+            wall = float(self._run_execution_wall_s)
+            decode_toks = int(self._run_decode_tokens)
+            throughput = (decode_toks / wall) if wall > 0.0 else 0.0
             payload = {
                 "execution_wall_time_s": self._run_execution_wall_s,
                 "prefill_wall_time_s": self._run_prefill_wall_s,
+                "num_prefill_token": int(self._run_prefill_tokens),
+                "num_decode_tokens": decode_toks,
+                "throughput": throughput,
                 "draft_time_s": self._run_draft_s,
                 "verification_time_s": self._run_verify_s,
                 "sync_time_s": self._run_sync_s,
@@ -264,6 +272,9 @@ class SSDProfiler:
                 "num_intermediate_verification": self._num_intermediate_verification_requests,
                 "num_target_verification": self._num_target_verification_requests,
                 "notes": {
+                    "num_prefill_token": "sum of per-prefill-engine-step token counts passed to finish_step",
+                    "num_decode_tokens": "sum of per-decode-engine-step token counts passed to finish_step",
+                    "throughput": "num_decode_tokens / execution_wall_time_s (decode tokens over total step wall)",
                     "num_draft": "cumulative count of requests entering draft stage",
                     "num_verification": "cumulative count of requests entering verification stage",
                     "num_decode_engine_steps": "LLMEngine.step calls where is_prefill=False",
@@ -306,8 +317,10 @@ class SSDProfiler:
         if st.is_prefill:
             self._num_prefill_engine_steps += 1
             self._run_prefill_wall_s += wall
+            self._run_prefill_tokens += int(num_output_tokens)
         else:
             self._num_decode_engine_steps += 1
+            self._run_decode_tokens += int(num_output_tokens)
             # Decode steps only: stage timers and async worker scalars (prefill uses outer wall only).
             if self._draft_async:
                 self._run_draft_s += st.draft_time_worker_s

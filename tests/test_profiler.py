@@ -63,6 +63,8 @@ def test_prefill_step_only_prefill_wall_not_draft(tmp_path):
     p.finish_run()
     data = json.loads((tmp_path / "cost_breakdown.json").read_text())
     assert data["num_prefill_engine_steps"] == 1
+    assert data["num_prefill_token"] == 1
+    assert data["num_decode_tokens"] == 0
     assert data["prefill_wall_time_s"] > 0
     assert data["draft_time_s"] == 0.0
     assert data["verification_time_s"] == 0.0
@@ -87,6 +89,20 @@ def test_cost_breakdown_finish_run_writes_json(tmp_path):
     assert out.is_file()
     data = json.loads(out.read_text())
     assert data["num_decode_engine_steps"] == 1
+    assert data["num_decode_tokens"] == 1
+    assert data["num_prefill_token"] == 0
+    assert data["throughput"] > 0
+
+
+def test_profile_greedy_token_confidence_not_all_ones():
+    from ssd.utils.profiler_metadata import profile_greedy_token_confidence
+
+    g = torch.Generator().manual_seed(0)
+    logits = torch.randn(2, 4, 128, generator=g)
+    greedy, conf = profile_greedy_token_confidence(logits)
+    assert greedy.shape == (2, 4)
+    assert conf.shape == (2, 4)
+    assert not torch.allclose(conf, torch.ones_like(conf))
 
 
 def test_trace_to_row_indexed_cost_fields(tmp_path):

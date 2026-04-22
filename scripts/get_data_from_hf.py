@@ -351,6 +351,135 @@ def download_livecodebench_code_generation_lite_data(num_samples=None):
     return output_file
 
 
+def _select_split(ds, preferred=("train", "test", "validation")):
+    """Pick a split from a DatasetDict (or return a single Dataset)."""
+    if not hasattr(ds, "keys"):
+        return ds
+    for k in preferred:
+        if k in ds:
+            return ds[k]
+    return next(iter(ds.values()))
+
+
+def download_math500_data(num_samples=None):
+    """HuggingFaceH4/MATH-500 → JSONL with {\"text\": problem} per line."""
+    output_dir = os.path.join(get_base_output_dir(), "math500")
+    os.makedirs(output_dir, exist_ok=True)
+    max_samples = 10000
+    if num_samples is None:
+        num_samples = max_samples
+    else:
+        num_samples = min(num_samples, max_samples)
+    output_file = os.path.join(output_dir, "math500_data_10000.jsonl")
+    if os.path.exists(output_file):
+        print(f"File {output_file} already exists. Skipping download.")
+        return output_file
+    print("Loading HuggingFaceH4/MATH-500...")
+    try:
+        raw = load_dataset("HuggingFaceH4/MATH-500", trust_remote_code=True)
+    except Exception as e:
+        print(f"Error loading MATH-500: {e}")
+        raise
+    dataset = _select_split(raw, ("test", "train", "validation"))
+    total = len(dataset)
+    n = min(num_samples, total)
+    print(f"Processing {n} samples from {total} total...")
+    with open(output_file, "w", encoding="utf-8") as f:
+        for i in range(n):
+            ex = dataset[i]
+            problem = ex.get("problem") or ex.get("question") or ""
+            f.write(json.dumps({"text": str(problem).strip()}, ensure_ascii=False) + "\n")
+            if i % 100 == 0:
+                print(f"Processed {i}/{n}...")
+    print(f"Saved {n} MATH-500 samples to {output_file}")
+    return output_file
+
+
+def download_codeelo_data(num_samples=None):
+    """Qwen/CodeElo → JSONL with {\"text\": ...} per line (description + optional input)."""
+    output_dir = os.path.join(get_base_output_dir(), "codeelo")
+    os.makedirs(output_dir, exist_ok=True)
+    max_samples = 10000
+    if num_samples is None:
+        num_samples = max_samples
+    else:
+        num_samples = min(num_samples, max_samples)
+    output_file = os.path.join(output_dir, "codeelo_data_10000.jsonl")
+    if os.path.exists(output_file):
+        print(f"File {output_file} already exists. Skipping download.")
+        return output_file
+    print("Loading Qwen/CodeElo...")
+    try:
+        raw = load_dataset("Qwen/CodeElo", trust_remote_code=True)
+    except Exception as e:
+        print(f"Error loading CodeElo: {e}")
+        raise
+    dataset = _select_split(raw, ("train", "test", "validation"))
+    total = len(dataset)
+    n = min(num_samples, total)
+    print(f"Processing {n} samples from {total} total...")
+    with open(output_file, "w", encoding="utf-8") as f:
+        for i in range(n):
+            ex = dataset[i]
+            parts = []
+            desc = ex.get("description")
+            if desc is not None and str(desc).strip():
+                parts.append(str(desc).strip())
+            inp = ex.get("input")
+            if inp is not None and str(inp).strip():
+                parts.append(str(inp).strip())
+            text = "\n\n".join(parts) if parts else str(ex.get("description") or ex.get("title") or "")
+            f.write(json.dumps({"text": text}, ensure_ascii=False) + "\n")
+            if i % 50 == 0:
+                print(f"Processed {i}/{n}...")
+    print(f"Saved {n} CodeElo samples to {output_file}")
+    return output_file
+
+
+GOVREPORT_MAX_REPORT_CHARS = 48000
+
+
+def download_govreport_data(num_samples=None):
+    """ccdv/govreport-summarization → JSONL summarization prompts (truncated report body)."""
+    output_dir = os.path.join(get_base_output_dir(), "govreport")
+    os.makedirs(output_dir, exist_ok=True)
+    max_samples = 10000
+    if num_samples is None:
+        num_samples = max_samples
+    else:
+        num_samples = min(num_samples, max_samples)
+    output_file = os.path.join(output_dir, "govreport_data_10000.jsonl")
+    if os.path.exists(output_file):
+        print(f"File {output_file} already exists. Skipping download.")
+        return output_file
+    print("Loading ccdv/govreport-summarization (train split)...")
+    try:
+        raw = load_dataset("ccdv/govreport-summarization", trust_remote_code=True)
+    except Exception as e:
+        print(f"Error loading govreport-summarization: {e}")
+        raise
+    dataset = _select_split(raw, ("train", "test", "validation"))
+    total = len(dataset)
+    n = min(num_samples, total)
+    prefix = (
+        "Summarize the following government report in clear, structured prose. "
+        "Focus on main findings and policy implications.\n\n---\n\n"
+    )
+    print(f"Processing {n} samples from {total} total...")
+    with open(output_file, "w", encoding="utf-8") as f:
+        for i in range(n):
+            ex = dataset[i]
+            report = str(ex.get("report") or "").strip()
+            if len(report) > GOVREPORT_MAX_REPORT_CHARS:
+                report = report[:GOVREPORT_MAX_REPORT_CHARS] + "\n\n[... document truncated ...]"
+            text = prefix + report
+            f.write(json.dumps({"text": text}, ensure_ascii=False) + "\n")
+            if i % 500 == 0:
+                print(f"Processed {i}/{n}...")
+    print(f"Saved {n} GovReport samples to {output_file}")
+    return output_file
+
+
 def download_all_datasets(num_samples=None):
     """Download all datasets."""
     print("Downloading all datasets...")
@@ -363,6 +492,9 @@ def download_all_datasets(num_samples=None):
         ("Alpaca", download_alpaca_data),
         ("AIME2025", download_aime2025_data),
         ("LiveCodeBenchLite", download_livecodebench_code_generation_lite_data),
+        ("MATH500", download_math500_data),
+        ("CodeElo", download_codeelo_data),
+        ("GovReport", download_govreport_data),
     ]
     
     output_files = {}
@@ -382,16 +514,57 @@ def download_all_datasets(num_samples=None):
     return output_files
 
 
+DOWNLOADERS_BY_KEY = {
+    "gsm8k": download_gsm8k_data,
+    "gsm": download_gsm8k_data,
+    "c4": download_c4_data,
+    "ultrafeedback": download_ultrafeedback_data,
+    "humaneval": download_humaneval_data,
+    "alpaca": download_alpaca_data,
+    "aime2025": download_aime2025_data,
+    "livecodebench": download_livecodebench_code_generation_lite_data,
+    "livecodebench_lite": download_livecodebench_code_generation_lite_data,
+    "math500": download_math500_data,
+    "codeelo": download_codeelo_data,
+    "govreport": download_govreport_data,
+}
+
+
 if __name__ == "__main__":
     import argparse
     
     parser = argparse.ArgumentParser(description="Download datasets from Hugging Face")
     parser.add_argument("--num-samples", type=int, default=None, 
                        help="Number of samples to download (default: all)")
+    parser.add_argument(
+        "--datasets",
+        type=str,
+        default="all",
+        help="Comma-separated keys to download, or 'all'. Keys: "
+        + ", ".join(sorted(set(DOWNLOADERS_BY_KEY.keys())))
+        + " (plus aliases).",
+    )
     
     args = parser.parse_args()
-    
-    output_files = download_all_datasets(args.num_samples)
+    sel = args.datasets.strip().lower()
+    if sel in ("", "all"):
+        output_files = download_all_datasets(args.num_samples)
+    else:
+        output_files = {}
+        keys = [x.strip().lower() for x in args.datasets.split(",") if x.strip()]
+        for k in keys:
+            fn = DOWNLOADERS_BY_KEY.get(k)
+            if fn is None:
+                print(f"Unknown dataset key {k!r}, skip. Known: {sorted(set(DOWNLOADERS_BY_KEY.keys()))}")
+                output_files[k] = None
+                continue
+            print(f"\n{'='*50}\nDownloading {k}...\n{'='*50}")
+            try:
+                output_files[k] = fn(args.num_samples)
+                print(f"✓ {k}: {output_files[k]}")
+            except Exception as e:
+                print(f"✗ {k}: {e}")
+                output_files[k] = None
     
     print(f"\n{'='*60}")
     print("Download Summary:")

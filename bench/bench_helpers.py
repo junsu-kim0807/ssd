@@ -97,6 +97,12 @@ def benchmark_dataset_label(args) -> str:
         return "aime2025"
     if getattr(args, "livecodebench", False):
         return "livecodebench_lite"
+    if getattr(args, "codeelo", False):
+        return "codeelo"
+    if getattr(args, "math500", False):
+        return "math500"
+    if getattr(args, "govreport", False):
+        return "govreport"
     return "gsm"
 
 
@@ -106,7 +112,15 @@ def ensure_benchmark_dataset(args) -> None:
         return
     m = _load_get_data_from_hf()
     if getattr(args, "all", False):
-        for name in ("humaneval", "alpaca", "gsm", "ultrafeedback"):
+        for name in (
+            "humaneval",
+            "alpaca",
+            "gsm",
+            "ultrafeedback",
+            "codeelo",
+            "math500",
+            "govreport",
+        ):
             _ensure_single_dataset_file(name, m)
         return
     key = benchmark_dataset_label(args)
@@ -133,6 +147,9 @@ def _ensure_single_dataset_file(dataset_key: str, m) -> None:
         "ultrafeedback": m.download_ultrafeedback_data,
         "aime2025": m.download_aime2025_data,
         "livecodebench_lite": m.download_livecodebench_code_generation_lite_data,
+        "codeelo": m.download_codeelo_data,
+        "math500": m.download_math500_data,
+        "govreport": m.download_govreport_data,
     }.get(dataset_key)
     if fn is None:
         print(f"[prepare_data] No downloader for {dataset_key!r}")
@@ -277,7 +294,13 @@ def load_dataset_token_ids(
                 # AIME 2025 uses "problem"; LiveCodeBench exports use "text" or raw "question_content"
                 text: str = data.get(
                     "problem",
-                    data.get("text", data.get("question_content", "")),
+                    data.get(
+                        "text",
+                        data.get(
+                            "question_content",
+                            data.get("instruction", ""),
+                        ),
+                    ),
                 )
                 if use_chat_template and hasattr(tokenizer, 'apply_chat_template'):
                     tokens = tokenizer.apply_chat_template(
@@ -389,6 +412,12 @@ def generate_benchmark_inputs(
         dataset_name = "aime2025"
     elif getattr(args, "livecodebench", False):
         dataset_name = "livecodebench_lite"
+    elif getattr(args, "codeelo", False):
+        dataset_name = "codeelo"
+    elif getattr(args, "math500", False):
+        dataset_name = "math500"
+    elif getattr(args, "govreport", False):
+        dataset_name = "govreport"
     else:
         dataset_name = "gsm"
 

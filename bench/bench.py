@@ -95,6 +95,21 @@ def parse_arguments():
         dest="livecodebench",
         help="Use LiveCodeBench code_generation_lite (release_v5) prompts from SSD_DATASET_DIR",
     )
+    parser.add_argument(
+        "--codeelo",
+        action="store_true",
+        help="Use Qwen/CodeElo prompts (JSONL from SSD_DATASET_DIR; see scripts/get_data_from_hf.py)",
+    )
+    parser.add_argument(
+        "--math500",
+        action="store_true",
+        help="Use HuggingFaceH4/MATH-500 prompts (JSONL from SSD_DATASET_DIR)",
+    )
+    parser.add_argument(
+        "--govreport",
+        action="store_true",
+        help="Use ccdv/govreport-summarization prompts (JSONL from SSD_DATASET_DIR)",
+    )
     parser.add_argument("--random", action="store_true", help="Use random tokens instead of dataset prompts")
     parser.add_argument("--prompt_offset", type=int, default=0, help="Skip first N prompts per dataset (for variance testing)")
     parser.add_argument("--all", action="store_true", help="Use numseqs from each dataset (union dataset with numseqs*4 total)")
@@ -105,20 +120,25 @@ def parse_arguments():
         help="Download missing JSONL for the selected dataset into SSD_DATASET_DIR (via scripts/get_data_from_hf.py)",
     )
 
-    # Profiling (same semantics as ssd.config.Config; inactive unless profiler_output_dir is set)
+    # Profiling (ssd.config.Config; active only with --profile)
     parser.add_argument(
-        "--profiler_mode",
+        "--profile",
+        action="store_true",
+        help="Enable profiling (requires --profiler_output_dir).",
+    )
+    parser.add_argument(
+        "--profile_mode",
         type=str,
-        default=None,
-        choices=["cost_breakdown", "metadata", "cost_metadata", "kernel_breakdown"],
-        help="Profiler mode when --profiler_output_dir is set (default: cost_metadata). "
-        "kernel_breakdown forces eager execution in the engine.",
+        default="cost_metadata",
+        choices=["cost", "metadata", "cost_metadata"],
+        help="When --profile: cost → cost_breakdown JSON; metadata → metadata.jsonl; "
+        "cost_metadata → cost_metadata.jsonl (default: cost_metadata).",
     )
     parser.add_argument(
         "--profiler_output_dir",
         type=str,
         default=None,
-        help="Directory for profiler JSONL / cost_breakdown.json; unset disables profiling.",
+        help="Output directory for profiler artifacts; used only when --profile is set.",
     )
 
     # Debugging and logging
@@ -180,13 +200,32 @@ def parse_arguments():
             args.ultrafeedback,
             args.aime2025,
             args.livecodebench,
+            getattr(args, "codeelo", False),
+            getattr(args, "math500", False),
+            getattr(args, "govreport", False),
         )
     )
     if _n_ds > 1:
         parser.error(
             "Choose at most one dataset flag among "
-            "--humaneval --alpaca --c4 --ultrafeedback --aime2025 --livecodebench"
+            "--humaneval --alpaca --c4 --ultrafeedback --aime2025 --livecodebench "
+            "--codeelo --math500 --govreport"
         )
+
+    _profile_engine = {"cost": "cost_breakdown", "metadata": "metadata", "cost_metadata": "cost_metadata"}
+    _pod_raw = getattr(args, "profiler_output_dir", None) or ""
+    if getattr(args, "profile", False):
+        if not str(_pod_raw).strip():
+            parser.error("--profiler_output_dir is required when using --profile")
+        args.profiler_mode = _profile_engine[args.profile_mode]
+    else:
+        args.profiler_mode = None
+        if str(_pod_raw).strip():
+            print(
+                "Warning: --profiler_output_dir is set without --profile; profiling stays disabled.",
+                file=sys.stderr,
+            )
+
     return args
 
 
@@ -211,6 +250,9 @@ def create_run_name(args):
     ultrafeedback_str = "_ultrafeedback" if args.ultrafeedback else ""
     aime_str = "_aime2025" if getattr(args, "aime2025", False) else ""
     lcb_str = "_livecodebench" if getattr(args, "livecodebench", False) else ""
+    codeelo_str = "_codeelo" if getattr(args, "codeelo", False) else ""
+    math500_str = "_math500" if getattr(args, "math500", False) else ""
+    govreport_str = "_govreport" if getattr(args, "govreport", False) else ""
     random_str = "_random" if args.random else ""
     all_str = "_all" if args.all else ""
     _non_gsm = (
@@ -223,13 +265,15 @@ def create_run_name(args):
         or args.all
         or getattr(args, "aime2025", False)
         or getattr(args, "livecodebench", False)
+        or getattr(args, "codeelo", False)
+        or getattr(args, "math500", False)
+        or getattr(args, "govreport", False)
     )
     gsm_str = "" if _non_gsm else "_gsm"
     sampler_x_str = f"_sampler_x{args.x}" if args.x else ""
 
-    _pod = getattr(args, "profiler_output_dir", None) or ""
     prof_short = ""
-    if str(_pod).strip():
+    if getattr(args, "profile", False):
         pm = getattr(args, "profiler_mode", None) or "cost_metadata"
         prof_token = {"cost_breakdown": "cb", "metadata": "md", "cost_metadata": "cm", "kernel_breakdown": "kb"}.get(
             pm, "prof"
@@ -247,7 +291,7 @@ def create_run_name(args):
     return args.name if args.name else (
         f"{model_type}_size{size_part}_{spec_mode_str}{async_mode_str}{jit_mode_str}_b{args.b}{k_str}{f_str}{draft_str}"
         f"{temp_str}{sampler_x_str}{prof_short}{example_str}{humaneval_str}{alpaca_str}{c4_str}{ultrafeedback_str}"
-        f"{aime_str}{lcb_str}{random_str}{all_str}{gsm_str}"
+        f"{aime_str}{lcb_str}{codeelo_str}{math500_str}{govreport_str}{random_str}{all_str}{gsm_str}"
     )
 
 
@@ -292,15 +336,22 @@ def initialize_wandb(args, run_name):
             "ultrafeedback_mode": args.ultrafeedback,
             "aime2025_mode": getattr(args, "aime2025", False),
             "livecodebench_mode": getattr(args, "livecodebench", False),
+            "codeelo_mode": getattr(args, "codeelo", False),
+            "math500_mode": getattr(args, "math500", False),
+            "govreport_mode": getattr(args, "govreport", False),
             "benchmark_dataset": benchmark_dataset_label(args),
             "random_mode": args.random,
             "all_mode": args.all,
             "sampler_x": args.x,
+            "profile": bool(getattr(args, "profile", False)),
+            "profile_mode": getattr(args, "profile_mode", None),
             "profiler_mode": getattr(args, "profiler_mode", None),
-            "profiler_enabled": bool(getattr(args, "profiler_output_dir", None) and str(args.profiler_output_dir).strip()),
+            "profiler_enabled": bool(getattr(args, "profile", False)),
             "profiler_output_dir_basename": (
                 os.path.basename(str(args.profiler_output_dir).rstrip(os.sep))
-                if getattr(args, "profiler_output_dir", None) and str(args.profiler_output_dir).strip()
+                if getattr(args, "profile", False)
+                and getattr(args, "profiler_output_dir", None)
+                and str(args.profiler_output_dir).strip()
                 else None
             ),
             "implementation": "ssd",
@@ -343,10 +394,11 @@ def create_llm_kwargs(args, draft_path):
     if args.flm is not None:
         llm_kwargs["fan_out_list_miss"] = args.flm
 
-    _pod = getattr(args, "profiler_output_dir", None)
-    if _pod and str(_pod).strip():
-        llm_kwargs["profiler_output_dir"] = str(_pod).strip()
-        llm_kwargs["profiler_mode"] = getattr(args, "profiler_mode", None) or "cost_metadata"
+    if getattr(args, "profile", False):
+        _pod = getattr(args, "profiler_output_dir", None)
+        if _pod and str(_pod).strip():
+            llm_kwargs["profiler_output_dir"] = str(_pod).strip()
+            llm_kwargs["profiler_mode"] = getattr(args, "profiler_mode", None) or "cost_metadata"
 
     return llm_kwargs
 
@@ -646,15 +698,8 @@ def main():
             out_jsonl_path = resolve_bench_output_jsonl_path(
                 args, si, temp, b, cur_run_name, n_sweeps
             )
-            prof_enabled = bool(
-                getattr(args, "profiler_output_dir", None)
-                and str(args.profiler_output_dir).strip()
-            )
-            prof_mode = (
-                (getattr(args, "profiler_mode", None) or "cost_metadata")
-                if prof_enabled
-                else None
-            )
+            prof_enabled = bool(getattr(args, "profile", False))
+            prof_mode = (getattr(args, "profiler_mode", None) or "cost_metadata") if prof_enabled else None
             write_bench_outputs_jsonl(
                 path=out_jsonl_path,
                 prompts=prompts,
@@ -670,6 +715,25 @@ def main():
                 original_prompts=original_prompts,
             )
             print(f"Wrote outputs JSONL: {out_jsonl_path}")
+            if prof_enabled:
+                _pod = str(getattr(args, "profiler_output_dir", "") or "").strip()
+                if _pod:
+                    response_path = os.path.join(os.path.abspath(_pod), "response.jsonl")
+                    write_bench_outputs_jsonl(
+                        path=response_path,
+                        prompts=prompts,
+                        outputs=outputs,
+                        tokenizer=bench_jsonl_tokenizer,
+                        run_name=cur_run_name,
+                        sweep_idx=si,
+                        temperature=float(temp),
+                        max_num_seqs=int(b),
+                        dataset=benchmark_dataset_label(args),
+                        profiler_mode=prof_mode,
+                        profiler_enabled=prof_enabled,
+                        original_prompts=original_prompts,
+                    )
+                    print(f"Wrote profiler response JSONL: {response_path}")
 
             if args.wandb:
                 wandb.finish()

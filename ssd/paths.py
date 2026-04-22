@@ -62,4 +62,7 @@ DATASET_PATHS = {
     "ultrafeedback": f"{DATASET_DIR}/ultrafeedback/ultrafeedback_data_10000.jsonl",
     "aime2025":      f"{DATASET_DIR}/aime2025/aime2025_test.jsonl",
     "livecodebench_lite": f"{DATASET_DIR}/livecodebench_lite/livecodebench_lite_data_10000.jsonl",
+    "codeelo":       f"{DATASET_DIR}/codeelo/codeelo_data_10000.jsonl",
+    "math500":       f"{DATASET_DIR}/math500/math500_data_10000.jsonl",
+    "govreport":     f"{DATASET_DIR}/govreport/govreport_data_10000.jsonl",
 }

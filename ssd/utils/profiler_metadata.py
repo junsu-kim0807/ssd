@@ -19,6 +19,18 @@ import torch
 import torch.nn.functional as F
 
 
+def profile_greedy_token_confidence(logits_p: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    """Greedy token id per slot and its probability under ``softmax(logits)`` (T=1).
+
+    Used for profiler traces when ``temperature==0`` would otherwise use a one-hot
+    ``target_probs_p_batched`` view, making ``max(dim=-1)`` always ``1.0``.
+    """
+    greedy = logits_p.argmax(dim=-1)
+    probs = torch.softmax(logits_p.to(torch.float32), dim=-1)
+    conf = probs.gather(2, greedy.unsqueeze(-1)).squeeze(-1)
+    return greedy, conf
+
+
 def draft_metadata_from_logits(
     logits_q: torch.Tensor,
     speculations: torch.Tensor,
