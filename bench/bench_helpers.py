@@ -12,6 +12,22 @@ try:
 except ImportError:
     from bench_paths import DATASET_PATHS, HF_CACHE_DIR, EAGLE3_SPECFORGE_70B, EAGLE3_YUHUILI_8B, EAGLE3_QWEN_32B
 
+# HuggingFace hub repo ids → default bench targets/drafts (--size ignored for these presets).
+BENCH_PRESET_QWEN_TARGET = "Qwen/Qwen3-32B"
+BENCH_PRESET_QWEN_DRAFT = "Qwen/Qwen3-0.6B"
+BENCH_PRESET_GEMMA_TARGET = "google/gemma-4-31B-it"
+BENCH_PRESET_GEMMA_DRAFT = "google/gemma-4-E4B-it"
+BENCH_PRESET_VICUNA_TARGET = "lmsys/vicuna-13b-v1.3"
+BENCH_PRESET_VICUNA_DRAFT = "double7/vicuna-68m"
+
+
+def hf_hub_cache_dir(cache_dir: str, repo_id: str) -> str:
+    """Map ``org/name`` hub id to a HuggingFace hub cache directory name under ``cache_dir``."""
+    if "/" not in repo_id or repo_id.count("/") != 1:
+        raise ValueError(f"Expected HF repo id 'org/name', got {repo_id!r}")
+    org, name = repo_id.split("/", 1)
+    return os.path.join(cache_dir, f"models--{org}--{name}")
+
 
 def _get_snapshot_path(base_path: str) -> str:
     """Resolve a model directory to an actual snapshot directory containing config.json.
@@ -129,7 +145,15 @@ def _get_draft_model_path(args, cache_dir: str) -> str:
     """Get draft model path based on size or explicit directory."""
     if args.draft is not None and os.path.isdir(args.draft):
         return args.draft
-    
+
+    if getattr(args, "spec", False) and args.draft is None:
+        if getattr(args, "gemma", False):
+            return _get_snapshot_path(hf_hub_cache_dir(cache_dir, BENCH_PRESET_GEMMA_DRAFT))
+        if getattr(args, "vicuna", False):
+            return _get_snapshot_path(hf_hub_cache_dir(cache_dir, BENCH_PRESET_VICUNA_DRAFT))
+        if args.qwen:
+            return _get_snapshot_path(hf_hub_cache_dir(cache_dir, BENCH_PRESET_QWEN_DRAFT))
+
     # Handle EAGLE auto-selection
     if getattr(args, "eagle", False):
         if args.llama:
@@ -176,7 +200,19 @@ def _get_draft_model_path(args, cache_dir: str) -> str:
 
 def get_model_paths(args, cache_dir: str = HF_CACHE_DIR) -> Tuple[str, str, Optional[str]]:
     """Resolve model and draft paths (pointing to snapshot dirs with config.json)."""
-    if args.llama:
+    if getattr(args, "gemma", False):
+        model_name = BENCH_PRESET_GEMMA_TARGET
+        model_base = hf_hub_cache_dir(cache_dir, BENCH_PRESET_GEMMA_TARGET)
+        default_draft_base = hf_hub_cache_dir(cache_dir, BENCH_PRESET_GEMMA_DRAFT)
+    elif getattr(args, "vicuna", False):
+        model_name = BENCH_PRESET_VICUNA_TARGET
+        model_base = hf_hub_cache_dir(cache_dir, BENCH_PRESET_VICUNA_TARGET)
+        default_draft_base = hf_hub_cache_dir(cache_dir, BENCH_PRESET_VICUNA_DRAFT)
+    elif args.qwen:
+        model_name = BENCH_PRESET_QWEN_TARGET
+        model_base = hf_hub_cache_dir(cache_dir, BENCH_PRESET_QWEN_TARGET)
+        default_draft_base = hf_hub_cache_dir(cache_dir, BENCH_PRESET_QWEN_DRAFT)
+    elif args.llama:
         size_to_model = {
             "1": "Llama-3.2-1B-Instruct",
             "3": "Llama-3.2-3B-Instruct",
@@ -193,22 +229,7 @@ def get_model_paths(args, cache_dir: str = HF_CACHE_DIR) -> Tuple[str, str, Opti
         default_draft_base = os.path.join(
             cache_dir, "models--meta-llama--Llama-3.2-1B-Instruct")
     else:
-        size_to_model = {
-            "0.6": "Qwen3-0.6B",
-            "1.7": "Qwen3-1.7B",
-            "4": "Qwen3-4B",
-            "8": "Qwen3-8B",
-            "14": "Qwen3-14B",
-            "32": "Qwen3-32B",
-        }
-        if args.size not in size_to_model:
-            raise ValueError(
-                f"Size {args.size} not available for Qwen models. Available sizes: {list(size_to_model.keys())}"
-            )
-        model_name = size_to_model[args.size]
-        model_base = os.path.join(cache_dir, f"models--Qwen--{model_name}")
-        default_draft_base = os.path.join(
-            cache_dir, "models--Qwen--Qwen3-0.6B")
+        raise ValueError("Expected --llama (default), --qwen, --gemma, or --vicuna for model selection")
 
     model_path = _get_snapshot_path(model_base)
 

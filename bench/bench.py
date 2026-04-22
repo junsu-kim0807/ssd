@@ -25,7 +25,21 @@ def parse_arguments():
     parser.add_argument("--size", type=str, choices=["0.6", "1.7", "4", "8", "14", "32", "1", "3", "70"], default="70",
                         help="Model size in billions of parameters (0.6, 1.7, 4, 8, 14, 32, 1, 3, 70)")
     parser.add_argument("--llama", action="store_true", default=True, help="Use Llama models (default)")
-    parser.add_argument("--qwen", action="store_true", help="Use Qwen models instead of Llama")
+    parser.add_argument(
+        "--qwen",
+        action="store_true",
+        help="Bench preset: Qwen/Qwen3-32B target (ignores --size). With --spec, default draft Qwen/Qwen3-0.6B unless --draft is set.",
+    )
+    parser.add_argument(
+        "--gemma",
+        action="store_true",
+        help="Bench preset: google/gemma-4-31B-it (ignores --size). With --spec, default draft google/gemma-4-E4B-it unless --draft is set.",
+    )
+    parser.add_argument(
+        "--vicuna",
+        action="store_true",
+        help="Bench preset: lmsys/vicuna-13b-v1.3 (ignores --size). With --spec, default draft double7/vicuna-68m unless --draft is set.",
+    )
     parser.add_argument("--draft", type=str, default=None,
                         help="Draft model size (0.6 for Qwen-0.6B, 1 for Llama-1B) or path to draft model")
 
@@ -135,9 +149,22 @@ def parse_arguments():
     )
 
     args = parser.parse_args()
-    assert not (args.qwen and '--llama' in sys.argv), "--llama and --qwen are mutually exclusive"
+    _n_hf_preset = int(bool(args.qwen)) + int(bool(getattr(args, "gemma", False))) + int(
+        bool(getattr(args, "vicuna", False))
+    )
+    if _n_hf_preset > 1:
+        parser.error("Use at most one of --qwen --gemma --vicuna")
+    if getattr(args, "gemma", False):
+        args.llama = False
+    if getattr(args, "vicuna", False):
+        args.llama = False
     if args.qwen:
         args.llama = False
+    assert not (args.qwen and "--llama" in sys.argv), "--llama and --qwen are mutually exclusive"
+    if getattr(args, "gemma", False) and "--llama" in sys.argv:
+        parser.error("--gemma and explicit --llama are mutually exclusive")
+    if getattr(args, "vicuna", False) and "--llama" in sys.argv:
+        parser.error("--vicuna and explicit --llama are mutually exclusive")
     if args.eagle:
         args.spec = True
         assert args.llama, "Eagle currently only supports llama models"
@@ -168,7 +195,15 @@ def create_run_name(args):
     spec_mode_str = "spec" if args.spec else "normal"
     async_mode_str = "_async" if getattr(args, 'async', False) else ""
     jit_mode_str = "_jit" if args.backup == "jit" else ""
-    model_type = "llama" if args.llama else "qwen"
+    if getattr(args, "gemma", False):
+        model_type = "gemma"
+    elif getattr(args, "vicuna", False):
+        model_type = "vicuna"
+    elif args.llama:
+        model_type = "llama"
+    else:
+        model_type = "qwen"
+    size_part = args.size if args.llama else "hub"
     example_str = "_example" if args.example else ""
     humaneval_str = "_humaneval" if args.humaneval else ""
     alpaca_str = "_alpaca" if args.alpaca else ""
@@ -210,7 +245,7 @@ def create_run_name(args):
     f_str = f"_f{args.f}"
 
     return args.name if args.name else (
-        f"{model_type}_size{args.size}_{spec_mode_str}{async_mode_str}{jit_mode_str}_b{args.b}{k_str}{f_str}{draft_str}"
+        f"{model_type}_size{size_part}_{spec_mode_str}{async_mode_str}{jit_mode_str}_b{args.b}{k_str}{f_str}{draft_str}"
         f"{temp_str}{sampler_x_str}{prof_short}{example_str}{humaneval_str}{alpaca_str}{c4_str}{ultrafeedback_str}"
         f"{aime_str}{lcb_str}{random_str}{all_str}{gsm_str}"
     )
@@ -236,6 +271,12 @@ def initialize_wandb(args, run_name):
             "fan_out_list": args.flh,
             "fan_out_list_miss": args.flm,
             "llama": args.llama,
+            "gemma_preset": getattr(args, "gemma", False),
+            "vicuna_preset": getattr(args, "vicuna", False),
+            "qwen_hub_preset": bool(args.qwen),
+            "bench_cli_size_ignored_for_hf_preset": bool(
+                args.qwen or getattr(args, "gemma", False) or getattr(args, "vicuna", False)
+            ),
             "max_model_len": args.max_model_len,
             "input_len": args.input_len,
             "output_len": args.output_len,
