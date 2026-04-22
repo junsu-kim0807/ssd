@@ -72,7 +72,8 @@ class VerifierHierarchical(VerifierBase):
         # One autoregressive forward over the full speculative tail (same tokens as draft).
         # ``num_inter_cached_tokens`` is authoritative (restored after prior steps); do not
         # reset to ``num_cached_tokens`` or prior-round intermediate KV is discarded.
-        logits_flat = self.intermediate_runner.run_intermediate_verify_suffix(seqs, K)
+        # Use ``call`` so TP follower ranks run the same forward (``intermediate_run`` already does).
+        logits_flat = self.intermediate_runner.call("run_intermediate_verify_suffix", seqs, K)
         for seq in seqs:
             seq.num_inter_cached_tokens += K + 1
 
@@ -156,7 +157,7 @@ class VerifierHierarchical(VerifierBase):
         candidates = self._build_target_candidates(seqs, speculate_result)
         # prepare_verify_tensors_varlen uses seq.num_cached_tokens as the KV frontier.
         # Do not bump num_cached_tokens before the call (that would shift positions/slots).
-        logits_flat = self.target_model_runner.run_verify_varlen(seqs, candidates)
+        logits_flat = self.target_model_runner.call("run_verify_varlen", seqs, candidates)
 
         new_suffixes: list[list[int]] = []
         recovery_tokens: list[int] = []

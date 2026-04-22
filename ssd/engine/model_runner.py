@@ -764,20 +764,25 @@ class ModelRunner:
             reset_context()
 
     def intermediate_run(self, seqs: list[Sequence], is_prefill: bool):
-        """Hierarchical intermediate prefill when intermediate shards use the same TP group as target."""
-        if not self._hierarchical_intermediate_parallel:
-            raise RuntimeError("intermediate_run requires hierarchical multi-GPU intermediate setup")
+        """Hierarchical intermediate prefill: TP-colocated shards or standalone ``IntermediateRunner``."""
         assert is_prefill, "intermediate_run only supports prefill for hierarchical intermediate"
-        try:
-            input_ids, positions = self._prepare_prefill_intermediate(seqs)
-            temperatures = self.prepare_sample(seqs) if self.rank == 0 else None
-            logits = self.run_model(
-                input_ids, positions, True, last_only=True, model=self.intermediate_model
-            )
-            token_ids = self.sampler(logits, temperatures).tolist() if self.rank == 0 else None
-            return token_ids
-        finally:
-            reset_context()
+        if getattr(self, "_hierarchical_intermediate_parallel", False):
+            try:
+                input_ids, positions = self._prepare_prefill_intermediate(seqs)
+                temperatures = self.prepare_sample(seqs) if self.rank == 0 else None
+                logits = self.run_model(
+                    input_ids, positions, True, last_only=True, model=self.intermediate_model
+                )
+                token_ids = self.sampler(logits, temperatures).tolist() if self.rank == 0 else None
+                return token_ids
+            finally:
+                reset_context()
+        if self.intermediate_mode:
+            # Standalone runner: ``self.model`` is the intermediate model (single GPU).
+            return self.run(seqs, is_prefill)
+        raise RuntimeError(
+            "intermediate_run requires TP-colocated hierarchical intermediate or intermediate_mode runner"
+        )
 
     def run_intermediate_verify_suffix(self, seqs: list[Sequence], k: int) -> torch.Tensor:
         """Extend intermediate KV along ``token_ids[c:c+k+1]`` (sync spec tail).

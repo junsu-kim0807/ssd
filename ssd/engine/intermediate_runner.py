@@ -16,7 +16,3 @@ class IntermediateRunner(ModelRunner):
         icfg = self.create_intermediate_config(cfg)
         super().__init__(
             icfg, rank=0, event=None, is_draft=False, num_tp_gpus=1, is_intermediate=True)
-
-    def intermediate_run(self, seqs, is_prefill: bool):
-        """Standalone colocated intermediate (single GPU): same as ``run``."""
-        return self.run(seqs, is_prefill)
