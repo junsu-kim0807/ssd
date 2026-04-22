@@ -6,9 +6,12 @@ Layout for ``--profiler_output_dir`` when ``bench.py`` is run with ``--profile``
 
     ./results/<profile_mode>/<method>/b<batch>/k<k|na>/<target>+<draft>/<temp_tag>[/dataset_slug]/
 
-When **both** ``--batch`` and ``--length`` are set (multids mode), profiler output uses ``.../b<b>/k.../t0/<dataset>/``.
+``--batch`` and ``--length`` are independent sweep dimensions (batch sizes vs speculative ``k``).
+
+**Multids** (profiler paths ``.../b<b>/k.../t0/<dataset>/`` for alpaca, humaneval, gsm8k, math500, codeelo):
+enable with ``--multids``, or for backward compatibility when **both** ``--batch`` and ``--length`` are set.
 By default, **one Slurm script per dataset** (job name ``<dataset>_<family>_<method>_b<b>_<kpath>_<temp_tag>``).
-With ``--all``, a **single** Slurm script runs all profile datasets in a ``for`` loop (previous combined behaviour).
+With ``--all``, one Slurm script runs every multids dataset in a ``for`` loop.
 
 Sweep flags (optional, Cartesian product with other dimensions):
   --batch   → batch sizes 1, 4, 16, 64, 256
@@ -637,19 +640,25 @@ def main() -> None:
     p.add_argument(
         "--batch",
         action="store_true",
-        help=f"Sweep batch sizes {BATCH_SWEEP}. With --length: multids mode (per-dataset Slurm scripts by default; "
-        f"--all for one script looping datasets). Profiler dirs …/t0/<dataset>/.",
+        help=f"Sweep batch sizes {BATCH_SWEEP} (orthogonal to --length). Does not imply multids by itself.",
     )
     p.add_argument(
         "--length",
         action="store_true",
-        help=f"Sweep speculative k {K_SWEEP} (methods with uses_spec_k). With --batch: multids scripts as above.",
+        help=f"Sweep speculative k {K_SWEEP} (methods with uses_spec_k; orthogonal to --batch).",
+    )
+    p.add_argument(
+        "--multids",
+        action="store_true",
+        help="Emit multids profile jobs (alpaca, humaneval, gsm8k, math500, codeelo): one Slurm script per "
+        "dataset by default, or one loop script with --all. Ignores --dataset. "
+        "If omitted, the same behaviour still activates when both --batch and --length are set (legacy).",
     )
     p.add_argument(
         "--all",
         action="store_true",
         dest="multids_all_in_one",
-        help="With --batch and --length: emit one Slurm script that loops all multids datasets. "
+        help="With multids (--multids or --batch+--length): emit one Slurm script that loops all multids datasets. "
         "Default (omit --all): one Slurm script per dataset.",
     )
     p.add_argument("--temp", action="store_true", help=f"Sweep temperatures {TEMP_SWEEP}")
@@ -681,8 +690,13 @@ def main() -> None:
 
     model_families = normalize_model_families(args.models)
     methods = normalize_methods(args.methods)
-    multi_dataset_sweep = bool(args.batch and args.length)
+    multi_dataset_sweep = bool(args.multids or (args.batch and args.length))
     if multi_dataset_sweep:
+        if not args.multids and args.batch and args.length:
+            print(
+                "multids enabled via --batch and --length (legacy). Prefer --multids with either or both sweeps.",
+                file=sys.stderr,
+            )
         if args.multids_all_in_one:
             print(
                 "multids + --all: one Slurm script per sweep cell runs "
