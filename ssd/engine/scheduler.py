@@ -442,10 +442,13 @@ class Scheduler:
         r = self.config.target_verify_interval
         for seq, suffix, rec in zip(seqs, new_suffixes, recovery_tokens):
             assert len(suffix) >= 1
-            # Store the full accepted intermediate suffix (including suffix[0], the stem
-            # before body). Dropping suffix[0] loses the first accepted token for target verify
-            # and undercounts ``hv_num_provisional_tokens`` / draft logical depth.
-            seq.hv_provisional_token_ids.extend(suffix)
+            # ``suffix[0]`` is the speculative column-0 recovery, which already matches
+            # ``hv_provisional_token_ids[-1]`` after the previous round's ``append(rec)``.
+            # Extending the full ``suffix`` would duplicate that stem on the provisional tape.
+            suf_to_extend = suffix
+            if seq.hv_provisional_token_ids and suf_to_extend[0] == seq.hv_provisional_token_ids[-1]:
+                suf_to_extend = suf_to_extend[1:]
+            seq.hv_provisional_token_ids.extend(suf_to_extend)
             # Intermediate recovery belongs at the end of the provisional tape (distinct from
             # ``recovery_token_id`` used for sync-spec draft column 0 / target bookkeeping).
             seq.hv_provisional_token_ids.append(rec)
