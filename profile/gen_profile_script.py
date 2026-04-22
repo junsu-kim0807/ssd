@@ -24,9 +24,12 @@ from __future__ import annotations
 import argparse
 import os
 import re
+import shlex
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable, Iterable, Sequence
+
+
 
 # Repo imports (profile/ → bench_helpers)
 _REPO_ROOT = Path(__file__).resolve().parent.parent
