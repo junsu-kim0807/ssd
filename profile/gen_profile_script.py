@@ -319,14 +319,50 @@ def build_bench_argv(
 
 
 def format_multiline_cmd(argv: Sequence[str]) -> str:
-    """Bash-safe continuation lines."""
-    lines: list[str] = [f"  {shell_quote_single(argv[0])} \\"]
-    for tok in argv[1:-1]:
-        lines.append(f"  {shell_quote_single(tok)} \\")
-    if len(argv) > 1:
-        lines.append(f"  {shell_quote_single(argv[-1])}")
-    else:
-        lines[-1] = lines[-1].rstrip(" \\")
+    """Render bash command with '\' continuations.
+
+    Style:
+      python -O bench.py \
+        --qwen \
+        --gpus 2 \
+        --b 1 \
+        --temp 0.0 \
+        --numseqs 512 \
+        --output_len 2048 \
+        --humaneval
+    """
+    if not argv:
+        return ""
+
+    def _fmt(tok: str) -> str:
+        q = shlex.quote(str(tok))
+        return tok if q == tok else q
+
+    lines: list[str] = []
+
+    i = 0
+    first = True
+    while i < len(argv):
+        tok = argv[i]
+
+        if first and len(argv) >= 3:
+            head = " ".join(_fmt(x) for x in argv[:3])
+            lines.append(head + (" \\" if len(argv) > 3 else ""))
+            i = 3
+            first = False
+            continue
+
+        if tok.startswith("--") and i + 1 < len(argv) and not argv[i + 1].startswith("--"):
+            part = f"  {_fmt(tok)} {_fmt(argv[i + 1])}"
+            i += 2
+        else:
+            part = f"  {_fmt(tok)}"
+            i += 1
+
+        if i < len(argv):
+            part += " \\"
+        lines.append(part)
+
     return "\n".join(lines)
 
 
