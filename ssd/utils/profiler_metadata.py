@@ -3,6 +3,12 @@
 Per-row ``num_draft`` / ``num_verification``: for decode steps, the profiler's
 per-step batch counts (typically ``batch_size`` when each sequence runs one draft
 and one verify in that step). Prefill rows use the same batch size for both.
+
+Hierarchical intermediate rounds (``verification_model == "intermediate"``): the
+verify trace's shared ``token_ids_per_position`` / ``token_confidence_per_position``
+fields hold the **intermediate** model chain (length K+1), not the target verifier
+chain. They are written as ``intermediate_verify_chain_*``; ``target_*`` columns
+are null. Per-position accept/recovery/bonus for that round remain in ``inter_*``.
 """
 
 from __future__ import annotations
@@ -137,16 +143,34 @@ def trace_to_row_indexed(
     }
     if trace is not None:
         i = batch_index
-        row["verification_model"] = trace.verification_models[i]
-        row["target_token_ids_per_position"] = (
-            list(trace.token_ids_per_position[i]) if trace.token_ids_per_position[i] else None
-        )
-        row["target_token_confidence_per_position"] = (
-            list(trace.token_confidence_per_position[i]) if trace.token_confidence_per_position[i] else None
-        )
-        row["target_accept_len"] = trace.accept_len[i]
-        row["target_recovery_token"] = trace.recovery_tokens[i]
-        row["target_bonus_token"] = trace.bonus_tokens[i]
+        vm = trace.verification_models[i]
+        row["verification_model"] = vm
+        # Hierarchical intermediate: VerifyProfileTrace shared fields are intermediate-model
+        # K+1 chain, not target; do not map them into target_*.
+        if vm == "intermediate":
+            row["target_token_ids_per_position"] = None
+            row["target_token_confidence_per_position"] = None
+            row["target_accept_len"] = None
+            row["target_recovery_token"] = None
+            row["target_bonus_token"] = None
+            tid = trace.token_ids_per_position[i]
+            tcf = trace.token_confidence_per_position[i]
+            row["intermediate_verify_chain_token_ids_per_position"] = list(tid) if tid else None
+            row["intermediate_verify_chain_token_confidence_per_position"] = (
+                list(tcf) if tcf else None
+            )
+        else:
+            row["intermediate_verify_chain_token_ids_per_position"] = None
+            row["intermediate_verify_chain_token_confidence_per_position"] = None
+            row["target_token_ids_per_position"] = (
+                list(trace.token_ids_per_position[i]) if trace.token_ids_per_position[i] else None
+            )
+            row["target_token_confidence_per_position"] = (
+                list(trace.token_confidence_per_position[i]) if trace.token_confidence_per_position[i] else None
+            )
+            row["target_accept_len"] = trace.accept_len[i]
+            row["target_recovery_token"] = trace.recovery_tokens[i]
+            row["target_bonus_token"] = trace.bonus_tokens[i]
         if trace.inter_token_ids_per_position is not None:
             row["inter_token_ids_per_position"] = trace.inter_token_ids_per_position[i]
             row["inter_token_confidence_per_position"] = trace.inter_token_confidence_per_position[i]
@@ -166,6 +190,8 @@ def trace_to_row_indexed(
         row["target_accept_len"] = None
         row["target_recovery_token"] = None
         row["target_bonus_token"] = None
+        row["intermediate_verify_chain_token_ids_per_position"] = None
+        row["intermediate_verify_chain_token_confidence_per_position"] = None
         row["inter_token_ids_per_position"] = None
         row["inter_token_confidence_per_position"] = None
         row["inter_accept_len"] = None

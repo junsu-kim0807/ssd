@@ -144,6 +144,65 @@ def test_trace_to_row_indexed_cost_fields(tmp_path):
     assert row["verification_model"] == "target"
 
 
+def test_trace_to_row_indexed_hierarchical_intermediate_chain_columns(tmp_path):
+    """Intermediate verify trace must not populate target_*; chain goes to intermediate_verify_chain_*."""
+    p = SSDProfiler(
+        _prof_cfg(
+            profiler_mode="cost_metadata",
+            profiler_output_dir=str(tmp_path),
+            spec_policy="hierarchical",
+        )
+    )
+    p.start_run(SimpleNamespace(), None)
+
+    class S:
+        seq_id = 1
+
+    p.start_step([S()], is_prefill=False)
+    tr = SimpleNamespace(
+        verification_models=["intermediate"],
+        token_ids_per_position=[[10, 11, 12]],
+        token_confidence_per_position=[[0.5, 0.6, 0.7]],
+        accept_len=[0],
+        recovery_tokens=[99],
+        bonus_tokens=[88],
+        inter_token_ids_per_position=[[10, 11]],
+        inter_token_confidence_per_position=[[0.5, 0.6]],
+        inter_accept_len=[1],
+        inter_recovery_token=[99],
+        inter_bonus_token=[88],
+    )
+    row = trace_to_row_indexed(
+        profiler=p,
+        seq=S(),
+        batch_index=0,
+        batch_size=1,
+        is_prefill=False,
+        speculate_k=2,
+        spec_policy="hierarchical",
+        draft_async=False,
+        cache_hit=None,
+        trace=tr,
+        first_draft_token_ids=[0, 0, 0, 0, 0],
+        first_draft_token_confidence=[0.0, 0.0, 0.0, 0.0, 0.0],
+        draft_token_ids_per_position=[0, 0],
+        draft_token_confidence_per_position=[0.0, 0.0],
+        step_wall_time_s=0.01,
+        draft_time_s=0.0,
+        verification_time_s=0.0,
+        sync_time_s=0.0,
+        num_draft=1,
+        num_verification=1,
+        cost_fields=True,
+    )
+    assert row["verification_model"] == "intermediate"
+    assert row["target_token_ids_per_position"] is None
+    assert row["target_accept_len"] is None
+    assert row["intermediate_verify_chain_token_ids_per_position"] == [10, 11, 12]
+    assert row["intermediate_verify_chain_token_confidence_per_position"] == [0.5, 0.6, 0.7]
+    assert row["inter_accept_len"] == 1
+
+
 def test_prefill_metadata_rows(tmp_path):
     p = SSDProfiler(
         _prof_cfg(

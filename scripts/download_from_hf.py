@@ -14,15 +14,29 @@ MODELS = {
     "qwen": [
         "Qwen/Qwen3-0.6B",
         "Qwen/Qwen3-1.7B",
-        "Qwen/Qwen3-4B",
+        # "Qwen/Qwen3-4B",
         "Qwen/Qwen3-8B",
-        "Qwen/Qwen3-14B",
+        # "Qwen/Qwen3-14B",
         "Qwen/Qwen3-32B",
+    ],
+
+    "gemma": [
+        "google/gemma-4-31B-it",
+        "google/gemma-4-E2B-it",
+        "google/gemma-4-E4B-it,
+    ],
+
+    "vicuna": [
+        "lmsys/vicuna-13b-v1.3",
+        "lmsys/vicuna-7b-v1.3",
+        "double7/vicuna-68m",
+        "double7/vicuna-160m",
     ],
     "eagle": [
         "yuhuili/EAGLE3-LLaMA3.3-Instruct-70B",
         "yuhuili/EAGLE3-LLaMA3.1-Instruct-8B",
         "RedHatAI/Qwen3-32B-speculator.eagle3",
+        "RedHatAI/gemma-4-31B-it-speculator.eagle3",
     ],
 }
 
