@@ -1,30 +1,97 @@
+import math
+from typing import Any
+
 import torch
 from torch import nn
 import torch.distributed as dist
-from transformers import Qwen3Config
+import torch.nn.functional as F
 
-from ssd.layers.activation import SiluAndMul
 from ssd.layers.attention import Attention
-from ssd.layers.layernorm import RMSHeadNorm, RMSDNorm
+from ssd.layers.layernorm import RMSDNorm
 from ssd.layers.linear import QKVParallelLinear, MergedColumnParallelLinear, RowParallelLinear
 from ssd.layers.rotary_embedding import get_rope
 from ssd.layers.embed_head import VocabParallelEmbedding, ParallelLMHead
 
 
-class Qwen3Attention(nn.Module):
+class GemmaRMSNorm(nn.Module):
+    """Simple RMSNorm for q_norm / k_norm.
 
-    def __init__( 
+    We keep the repo's fused residual-stream RMSDNorm for block pre/post norms,
+    but use this local variant for per-head q/k normalization where no residual
+    fusion is needed.
+    """
+
+    def __init__(self, hidden_size: int, eps: float = 1e-6) -> None:
+        super().__init__()
+        self.weight = nn.Parameter(torch.ones(hidden_size))
+        self.eps = eps
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        x_fp32 = x.float()
+        var = x_fp32.pow(2).mean(dim=-1, keepdim=True)
+        x_norm = x_fp32 * torch.rsqrt(var + self.eps)
+        return (x_norm * self.weight.float()).to(dtype=x.dtype)
+
+
+def _hidden_act_name(config: Any) -> str:
+    return getattr(config, "hidden_act", getattr(config, "hidden_activation", "gelu_pytorch_tanh"))
+
+
+def _apply_hidden_act(name: str, x: torch.Tensor) -> torch.Tensor:
+    name = name.lower()
+    if name == "silu":
+        return F.silu(x)
+    if name in {"gelu", "gelu_new"}:
+        return F.gelu(x)
+    if name == "gelu_pytorch_tanh":
+        return F.gelu(x, approximate="tanh")
+    raise ValueError(f"Unsupported Gemma hidden activation: {name}")
+
+
+def _rope_theta_from_config(config: Any) -> float:
+    # Gemma/Gemma2/Gemma3 usually expose rope_theta directly.
+    rope_theta = getattr(config, "rope_theta", None)
+    if rope_theta is not None:
+        return float(rope_theta)
+
+    # Gemma4 text keeps per-layer rope parameters. Current SSD attention path
+    # does not support heterogeneous layer-wise RoPE, so we pick the sliding
+    # attention theta as the closest causal-text approximation.
+    rope_parameters = getattr(config, "rope_parameters", None)
+    if isinstance(rope_parameters, dict):
+        if "sliding_attention" in rope_parameters:
+            return float(rope_parameters["sliding_attention"].get("rope_theta", 10000.0))
+        if "full_attention" in rope_parameters:
+            return float(rope_parameters["full_attention"].get("rope_theta", 10000.0))
+        if "rope_theta" in rope_parameters:
+            return float(rope_parameters["rope_theta"])
+
+    return 10000.0
+
+
+def _use_qk_norm(config: Any) -> bool:
+    # Gemma-family checkpoints commonly expose q_norm / k_norm weights.
+    # Keeping them always-on makes weight loading much safer for Gemma 2/3/4.
+    return True
+
+
+def _final_logit_softcap(config: Any) -> float | None:
+    val = getattr(config, "final_logit_softcapping", None)
+    return None if val is None else float(val)
+
+
+class GemmaAttention(nn.Module):
+
+    def __init__(
         self,
         hidden_size: int,
         num_heads: int,
         num_kv_heads: int,
         max_position: int = 4096 * 32,
         head_dim: int | None = None,
-        rms_norm_eps: float = 1e-06,
-        qkv_bias: bool = False,
-        rope_theta: float = 10000,
-        rope_scaling: tuple | None = None,
-        # speculation args 
+        rms_norm_eps: float = 1e-6,
+        rope_theta: float = 10000.0,
+        rope_scaling: dict | None = None,
         draft: bool = False,
         speculate: bool = False,
         spec_k: int = 1,
@@ -32,6 +99,7 @@ class Qwen3Attention(nn.Module):
         draft_async: bool = False,
         tp_group: dist.ProcessGroup | None = None,
         tp_size: int = 1,
+        use_qk_norm: bool = True,
     ) -> None:
         super().__init__()
         self.draft = draft
@@ -40,26 +108,25 @@ class Qwen3Attention(nn.Module):
         self.tp_size = tp_size
 
         self.total_num_heads = num_heads
-        self.num_heads = self.total_num_heads // tp_size 
+        self.num_heads = self.total_num_heads // tp_size
         self.total_num_kv_heads = num_kv_heads
-        assert self.total_num_heads % tp_size == 0  
-        assert self.total_num_kv_heads % tp_size == 0
         self.num_kv_heads = self.total_num_kv_heads // tp_size
         self.head_dim = head_dim or hidden_size // self.total_num_heads
         self.q_size = self.num_heads * self.head_dim
         self.kv_size = self.num_kv_heads * self.head_dim
-        self.scaling = self.head_dim**-0.5
-
-        if rope_scaling is not None:
-            rope_scaling = None
+        self.use_qk_norm = use_qk_norm
+        # Gemma4 uses q/k norm and scaling=1.0 in the official implementation.
+        # For older Gemma-family text models this is also a safer default once
+        # q_norm / k_norm weights are loaded.
+        self.scaling = 1.0 if self.use_qk_norm else self.head_dim ** -0.5
 
         self.qkv_proj = QKVParallelLinear(
             hidden_size,
             self.head_dim,
             self.total_num_heads,
             self.total_num_kv_heads,
-            bias=qkv_bias,
-            tp_group=self.tp_group, 
+            bias=False,
+            tp_group=self.tp_group,
             tp_size=self.tp_size,
         )
         self.o_proj = RowParallelLinear(
@@ -69,6 +136,13 @@ class Qwen3Attention(nn.Module):
             tp_group=self.tp_group,
             tp_size=self.tp_size,
         )
+
+        self.q_norm = GemmaRMSNorm(self.head_dim, eps=rms_norm_eps) if self.use_qk_norm else None
+        self.k_norm = GemmaRMSNorm(self.head_dim, eps=rms_norm_eps) if self.use_qk_norm else None
+
+        # Current SSD rope helper supports a single RoPE policy for all layers.
+        # We therefore pass a single base theta even for Gemma4 text configs.
+        rope_scaling = None if rope_scaling is not None else rope_scaling
         self.rotary_emb = get_rope(
             self.head_dim,
             rotary_dim=self.head_dim,
@@ -87,31 +161,24 @@ class Qwen3Attention(nn.Module):
             F=async_fan_out,
             K=spec_k,
         )
-        self.q_norm = RMSHeadNorm(self.head_dim, eps=rms_norm_eps)
-        self.k_norm = RMSHeadNorm(self.head_dim, eps=rms_norm_eps)
 
     def forward(
-            self,
-            positions: torch.Tensor,
-            hidden_states: torch.Tensor,
-        ) -> torch.Tensor:
+        self,
+        positions: torch.Tensor,
+        hidden_states: torch.Tensor,
+    ) -> torch.Tensor:
         qkv = self.qkv_proj(hidden_states)
         q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
-        q_by_head = q.reshape(-1, self.head_dim) # [num_tokens, D] = [b*s, nh*hd] -> [b*s*nh, hd]
-        q_by_head = self.q_norm(q_by_head)
-        q = q_by_head.reshape(q.shape) # back to [b*s, nh*hd]
-
-        k_by_head = k.reshape(-1, self.head_dim)
-        k_by_head = self.k_norm(k_by_head)
-        k = k_by_head.reshape(k.shape)
-
+        if self.q_norm is not None:
+            q = self.q_norm(q.view(-1, self.num_heads, self.head_dim)).view(-1, self.q_size)
+            k = self.k_norm(k.view(-1, self.num_kv_heads, self.head_dim)).view(-1, self.kv_size)
         q, k = self.rotary_emb(positions, q, k)
         o = self.attn(q, k, v)
         output = self.o_proj(o)
         return output
 
-        
-class Qwen3MLP(nn.Module):
+
+class GemmaMLP(nn.Module):
 
     def __init__(
         self,
@@ -136,21 +203,21 @@ class Qwen3MLP(nn.Module):
             tp_group=tp_group,
             tp_size=tp_size,
         )
-        assert hidden_act == "silu"
-        self.act_fn = SiluAndMul()
+        self.hidden_act = hidden_act
 
-    def forward(self, x):
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
         gate_up = self.gate_up_proj(x)
-        x = self.act_fn(gate_up)
+        gate, up = gate_up.chunk(2, dim=-1)
+        x = _apply_hidden_act(self.hidden_act, gate) * up
         x = self.down_proj(x)
         return x
 
 
-class Qwen3DecoderLayer(nn.Module):
+class GemmaDecoderLayer(nn.Module):
 
     def __init__(
         self,
-        config: Qwen3Config,
+        config: Any,
         draft: bool,
         speculate: bool,
         spec_k: int,
@@ -159,21 +226,21 @@ class Qwen3DecoderLayer(nn.Module):
         tp_group: dist.ProcessGroup | None = None,
         tp_size: int = 1,
     ) -> None:
-        super().__init__() 
+        super().__init__()
         self.draft = draft
         self.speculate = speculate
         self.spec_k = spec_k
         self.async_fan_out = async_fan_out
         self.draft_async = draft_async
-        self.self_attn = Qwen3Attention(
+
+        self.self_attn = GemmaAttention(
             hidden_size=config.hidden_size,
             num_heads=config.num_attention_heads,
             num_kv_heads=config.num_key_value_heads,
             max_position=config.max_position_embeddings,
             rms_norm_eps=config.rms_norm_eps,
-            qkv_bias=getattr(config, 'attention_bias', False),
-            head_dim=getattr(config, 'head_dim', None),
-            rope_theta=getattr(config, "rope_theta", 1000000),
+            head_dim=getattr(config, "head_dim", None),
+            rope_theta=_rope_theta_from_config(config),
             rope_scaling=getattr(config, "rope_scaling", None),
             draft=self.draft,
             speculate=self.speculate,
@@ -182,15 +249,17 @@ class Qwen3DecoderLayer(nn.Module):
             draft_async=self.draft_async,
             tp_group=tp_group,
             tp_size=tp_size,
+            use_qk_norm=_use_qk_norm(config),
         )
 
-        self.mlp = Qwen3MLP(
+        self.mlp = GemmaMLP(
             hidden_size=config.hidden_size,
             intermediate_size=config.intermediate_size,
-            hidden_act=config.hidden_act,
+            hidden_act=_hidden_act_name(config),
             tp_group=tp_group,
             tp_size=tp_size,
         )
+
         self.input_layernorm = RMSDNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.post_attention_layernorm = RMSDNorm(config.hidden_size, eps=config.rms_norm_eps)
 
@@ -201,8 +270,7 @@ class Qwen3DecoderLayer(nn.Module):
         residual: torch.Tensor | None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         if residual is None:
-            residual = hidden_states
-            hidden_states = self.input_layernorm(hidden_states)
+            hidden_states, residual = self.input_layernorm(hidden_states, residual), hidden_states
         else:
             hidden_states, residual = self.input_layernorm(hidden_states, residual)
         hidden_states = self.self_attn(positions, hidden_states)
@@ -211,16 +279,18 @@ class Qwen3DecoderLayer(nn.Module):
         return hidden_states, residual
 
 
-class Qwen3Model(nn.Module):
+class GemmaModel(nn.Module):
 
     def __init__(
         self,
-        config: Qwen3Config,
+        config: Any,
         draft: bool = False,
         speculate: bool = False,
         spec_k: int = 1,
-        async_fan_out: int = 1, 
+        async_fan_out: int = 1,
         draft_async: bool = False,
+        use_eagle: bool = False,
+        eagle_layers: list[int] | None = None,
         tp_group: dist.ProcessGroup | None = None,
         tp_size: int = 1,
     ) -> None:
@@ -230,6 +300,10 @@ class Qwen3Model(nn.Module):
         self.spec_k = spec_k
         self.async_fan_out = async_fan_out
         self.draft_async = draft_async
+        self.use_eagle = use_eagle
+        self.eagle_layers = eagle_layers
+        print(f"[GemmaModel] use_eagle={use_eagle}, eagle_layers={eagle_layers}", flush=True)
+
         self.embed_tokens = VocabParallelEmbedding(
             config.vocab_size,
             config.hidden_size,
@@ -238,7 +312,7 @@ class Qwen3Model(nn.Module):
             tp_size=tp_size,
         )
         self.layers = nn.ModuleList([
-            Qwen3DecoderLayer(
+            GemmaDecoderLayer(
                 config,
                 draft=self.draft,
                 speculate=self.speculate,
@@ -256,16 +330,28 @@ class Qwen3Model(nn.Module):
         self,
         input_ids: torch.Tensor,
         positions: torch.Tensor,
-    ) -> torch.Tensor:
-        hidden_states = self.embed_tokens(input_ids)  # torch.Size([4096, 2560]) always through residual stream 
+    ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
+        hidden_states = self.embed_tokens(input_ids)
         residual = None
-        for layer in self.layers:
+
+        collected_acts = [] if self.use_eagle else None
+
+        for layer_idx, layer in enumerate(self.layers):
+            if collected_acts is not None and layer_idx in self.eagle_layers:
+                current_act = hidden_states if residual is None else hidden_states + residual
+                collected_acts.append(current_act)
             hidden_states, residual = layer(positions, hidden_states, residual)
+
         hidden_states, _ = self.norm(hidden_states, residual)
+
+        if collected_acts:
+            eagle_acts = torch.cat(collected_acts, dim=-1)
+            print(f"[GemmaModel] eagle_acts shape={eagle_acts.shape}", flush=True)
+            return hidden_states, eagle_acts
         return hidden_states
 
 
-class Qwen3ForCausalLM(nn.Module):
+class GemmaForCausalLM(nn.Module):
     packed_modules_mapping = {
         "q_proj": ("qkv_proj", "q"),
         "k_proj": ("qkv_proj", "k"),
@@ -276,30 +362,50 @@ class Qwen3ForCausalLM(nn.Module):
 
     def __init__(
         self,
-        config: Qwen3Config, 
+        config: Any,
         draft: bool = False,
         speculate: bool = False,
         use_eagle: bool = False,
+        eagle_layers: list[int] | None = None,
         spec_k: int = 1,
-        async_fan_out: int = 1, 
+        async_fan_out: int = 1,
         draft_async: bool = False,
         tp_group: dist.ProcessGroup | None = None,
         tp_size: int = 1,
     ) -> None:
         super().__init__()
-
-        # if this is the standalone draft process, we want tp_size==1
+        self.config = config
         self.draft = draft
+        self.async_fan_out = async_fan_out
         self.draft_async = draft_async
+        self.use_eagle = use_eagle
+        self.eagle_layers = eagle_layers
         self.tp_group = tp_group
         self.tp_size = tp_size
-        
-        assert not use_eagle, "ERROR in Qwen3ForCausalLM: use_eagle not supported for Qwen3"
-        assert not (tp_group is None and self.tp_size > 1), "ERROR in Qwen3ForCausalLM: tp_group is None and tp_size > 1"
 
-        print(f'Starting Qwen3ForCausalLM init, draft={draft}, speculate={speculate}, spec_k={spec_k}')
-        self.model = Qwen3Model(config, draft, speculate, spec_k, async_fan_out, draft_async, tp_group=tp_group, tp_size=self.tp_size)
-        self.async_fan_out = async_fan_out
+        assert not (use_eagle and draft), (
+            "ERROR in GemmaForCausalLM: use_eagle should be on EagleDraftForCausalLM and not GemmaForCausalLM"
+        )
+        assert not (tp_group is None and self.tp_size > 1), (
+            "ERROR in GemmaForCausalLM: tp_group is None and tp_size > 1"
+        )
+
+        print(
+            f"Starting GemmaForCausalLM init, draft={draft}, speculate={speculate}, spec_k={spec_k}",
+            flush=True,
+        )
+        self.model = GemmaModel(
+            config,
+            draft,
+            speculate,
+            spec_k,
+            async_fan_out,
+            draft_async,
+            use_eagle=use_eagle,
+            eagle_layers=eagle_layers,
+            tp_group=tp_group,
+            tp_size=self.tp_size,
+        )
         self.lm_head = ParallelLMHead(
             config.vocab_size,
             config.hidden_size,
@@ -307,22 +413,27 @@ class Qwen3ForCausalLM(nn.Module):
             tp_group=tp_group,
             tp_size=self.tp_size,
         )
-        if config.tie_word_embeddings:
+        if getattr(config, "tie_word_embeddings", True):
             self.lm_head.weight.data = self.model.embed_tokens.weight.data
-        print(f'Finishing Qwen3ForCausalLM init, draft={draft}, speculate={speculate}, spec_k={spec_k}') 
+        print(
+            f"Finishing GemmaForCausalLM init, draft={draft}, speculate={speculate}, spec_k={spec_k}",
+            flush=True,
+        )
 
     def forward(
         self,
         input_ids: torch.Tensor,
         positions: torch.Tensor,
-    ) -> torch.Tensor:
-        hidden_states = self.model(input_ids, positions)
-        return hidden_states
+    ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
+        return self.model(input_ids, positions)
 
     def compute_logits(
         self,
         hidden_states: torch.Tensor,
-        last_only: bool = True, 
+        last_only: bool = True,
     ) -> torch.Tensor:
         logits = self.lm_head(hidden_states, last_only=last_only)
+        softcap = _final_logit_softcap(self.config)
+        if softcap is not None and softcap > 0:
+            logits = torch.tanh(logits / softcap) * softcap
         return logits
