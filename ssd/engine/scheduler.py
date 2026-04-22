@@ -458,7 +458,11 @@ class Scheduler:
             else:
                 seq.hv_round_idx += 1
             seq.num_draft_cached_tokens = len(seq) - 1 + seq.hv_num_provisional_tokens
-            seq.num_inter_cached_tokens += len(suffix)
+            # Intermediate KV depth was already advanced by (K+1) in
+            # ``VerifierHierarchical._verify_intermediate_round`` after
+            # ``run_intermediate_verify_suffix`` (one physical forward over the full
+            # speculative tail). Do not add ``len(suffix)`` here or RoPE positions
+            # overshoot the actual cache and verification quality degrades.
             self._hv_trim_block_tail(self.intermediate_block_manager, seq, seq.num_inter_cached_tokens)
 
     def postprocess_hv_target_round(
