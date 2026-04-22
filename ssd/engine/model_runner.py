@@ -2,6 +2,13 @@
 import pickle
 import time
 import torch
+import torch._dynamo
+
+# Applied in every ModelRunner worker (spawn); must run before ``ssd.models`` imports
+# pull in ``@torch.compile`` layers (default recompile/cache limits are easy to hit).
+torch._dynamo.config.recompile_limit = 64
+torch._dynamo.config.cache_size_limit = 64
+
 import torch.distributed as dist
 from multiprocessing.synchronize import Event
 from multiprocessing.shared_memory import SharedMemory
