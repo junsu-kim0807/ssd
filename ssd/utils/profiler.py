@@ -54,6 +54,8 @@ class StepProfileState:
     step_wall_time_s: float = 0.0
     draft_time_s: float = 0.0
     verification_time_s: float = 0.0
+    hv_inter_verify_time_s: float = 0.0
+    hv_target_verify_time_s: float = 0.0
     sync_time_s: float = 0.0
     postprocess_time_s: float = 0.0
     draft_time_worker_s: float = 0.0  # async draft process wall (one scalar per step)
@@ -128,6 +130,8 @@ class _ProfilerProtocol(Protocol):
     def flush_spec_decode_rows(self, seqs: list[Any], is_prefill: bool, rows: list[dict[str, Any]]) -> None: ...
     def wants_metadata_computation(self) -> bool: ...
     def inter_target_counts_for_seq(self, seq_id: int) -> tuple[int, int]: ...
+    def accum_hierarchical_verify_time(self, dt: float, is_intermediate: bool) -> None: ...
+    def decode_metadata_step_id(self) -> int: ...
 
 
 @dataclass
@@ -177,6 +181,12 @@ class _NoOpProfiler:
     def inter_target_counts_for_seq(self, seq_id: int) -> tuple[int, int]:
         return (0, 0)
 
+    def accum_hierarchical_verify_time(self, dt: float, is_intermediate: bool) -> None:
+        return
+
+    def decode_metadata_step_id(self) -> int:
+        return 0
+
 
 NOOP_PROFILER: _ProfilerProtocol = _NoOpProfiler()
 
@@ -192,6 +202,7 @@ class SSDProfiler:
         self._speculate_k = config.speculate_k
         self._tokenizer = None
         self._step_id = -1
+        self._decode_metadata_step_id = 0
         self._state: StepProfileState | None = None
         self._t_step_outer: float = 0.0
 
@@ -211,6 +222,12 @@ class SSDProfiler:
         self._num_verification_requests = 0
         self._num_intermediate_verification_requests = 0
         self._num_target_verification_requests = 0
+
+        self._run_hv_inter_verify_s = 0.0
+        self._run_hv_target_verify_s = 0.0
+        self._hv_inter_accept_samples: list[int] = []
+        self._hv_target_accept_samples: list[int] = []
+        self._hv_inter_target_prefix_samples: list[int] = []
 
         # Per-seq observation counters (not sequence semantics)
         self._inter_verify_count_by_seq: dict[int, int] = {}
@@ -254,6 +271,10 @@ class SSDProfiler:
             wall = float(self._run_execution_wall_s)
             decode_toks = int(self._run_decode_tokens)
             throughput = (decode_toks / wall) if wall > 0.0 else 0.0
+
+            def _avg(xs: list[int]) -> float | None:
+                return float(sum(xs)) / float(len(xs)) if xs else None
+
             payload = {
                 "execution_wall_time_s": self._run_execution_wall_s,
                 "prefill_wall_time_s": self._run_prefill_wall_s,
@@ -291,12 +312,34 @@ class SSDProfiler:
                     "cost_metadata_jsonl": (
                         "per-row draft_time_s uses draft worker wall when async (same basis as run-level draft_time_s)"
                     ),
+                    "step_id_in_cost_metadata_jsonl": (
+                        "decode-only ordinal for decode rows (prefill engine steps are omitted so ids stay contiguous); "
+                        "prefill rows still use engine step_id"
+                    ),
                 },
             }
+            if self._spec_policy == "hierarchical":
+                payload["hierarchical_intermediate_verification_time_s"] = self._run_hv_inter_verify_s
+                payload["hierarchical_target_verification_time_s"] = self._run_hv_target_verify_s
+                payload["avg_intermediate_accept_len"] = _avg(self._hv_inter_accept_samples)
+                payload["avg_target_accept_len"] = _avg(self._hv_target_accept_samples)
+                payload["avg_inter_target_prefix_accept_len"] = _avg(self._hv_inter_target_prefix_samples)
+                payload["notes"]["hierarchical_intermediate_verification_time_s"] = (
+                    "sum of verify wall time on intermediate rounds only (spec_policy=hierarchical)"
+                )
+                payload["notes"]["hierarchical_target_verification_time_s"] = (
+                    "sum of verify wall time on target rounds only"
+                )
+                payload["notes"]["avg_inter_target_prefix_accept_len"] = (
+                    "mean over target-verify rows: greedy matches along candidate prefix excluding the last K tokens "
+                    "(K=num_speculative_token / speculate_k)"
+                )
             self._sink.write_cost_breakdown(payload)
 
     def start_step(self, seqs: list[Any], is_prefill: bool) -> None:
         self._step_id += 1
+        if not is_prefill:
+            self._decode_metadata_step_id += 1
         self._t_step_outer = perf_counter()
         ids = [s.seq_id for s in seqs]
         self._state = StepProfileState(
@@ -330,6 +373,9 @@ class SSDProfiler:
             self._run_sync_s += st.sync_time_s
             self._run_postprocess_s += st.postprocess_time_s
             self._run_draft_worker_s += st.draft_time_worker_s
+            if self._spec_policy == "hierarchical":
+                self._run_hv_inter_verify_s += st.hv_inter_verify_time_s
+                self._run_hv_target_verify_s += st.hv_target_verify_time_s
 
         if wants_metadata_rows(self._mode):
             # Rows require merge from step — SpecDecodeStep calls _flush_spec_decode_rows
@@ -402,6 +448,27 @@ class SSDProfiler:
                 self._num_intermediate_verification_requests += 1
                 self._inter_verify_count_by_seq[sid] = self._inter_verify_count_by_seq.get(sid, 0) + 1
 
+    def _record_hierarchical_accept_samples(self, seqs: list[Any], trace: Any) -> None:
+        if self._spec_policy != "hierarchical":
+            return
+        vms = getattr(trace, "verification_models", None)
+        if not vms:
+            return
+        for i, vm in enumerate(vms):
+            if i >= len(seqs):
+                break
+            if vm == "intermediate":
+                ial = getattr(trace, "inter_accept_len", None)
+                if ial is not None and i < len(ial) and ial[i] is not None:
+                    self._hv_inter_accept_samples.append(int(ial[i]))
+            elif vm in ("target", "pivot_target"):
+                al = getattr(trace, "accept_len", None)
+                if al is not None and i < len(al):
+                    self._hv_target_accept_samples.append(int(al[i]))
+                itp = getattr(trace, "inter_target_prefix_accept_len", None)
+                if itp is not None and i < len(itp):
+                    self._hv_inter_target_prefix_samples.append(int(itp[i]))
+
     def record_decode_verify_batch(self, seqs: list[Any], verify_result: Any) -> None:
         n = len(seqs)
         if self._state is not None:
@@ -409,6 +476,7 @@ class SSDProfiler:
         trace = getattr(verify_result, "profile_trace", None)
         if trace is not None:
             self.record_verify_step(seqs, trace)
+            self._record_hierarchical_accept_samples(seqs, trace)
             return
         self._num_verification_requests += n
         if getattr(verify_result, "is_hv_intermediate", False):
@@ -450,6 +518,18 @@ class SSDProfiler:
     @property
     def step_id(self) -> int:
         return self._step_id
+
+    def decode_metadata_step_id(self) -> int:
+        return int(self._decode_metadata_step_id)
+
+    def accum_hierarchical_verify_time(self, dt: float, is_intermediate: bool) -> None:
+        if self._state is None:
+            return
+        self._state.verification_time_s += dt
+        if is_intermediate:
+            self._state.hv_inter_verify_time_s += dt
+        else:
+            self._state.hv_target_verify_time_s += dt
 
     def wants_kernel(self) -> bool:
         return self._mode == "kernel_breakdown"

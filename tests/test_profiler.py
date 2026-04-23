@@ -92,6 +92,44 @@ def test_cost_breakdown_finish_run_writes_json(tmp_path):
     assert data["num_decode_tokens"] == 1
     assert data["num_prefill_token"] == 0
     assert data["throughput"] > 0
+    assert "hierarchical_intermediate_verification_time_s" not in data
+
+
+def test_cost_breakdown_hierarchical_fields(tmp_path):
+    p = SSDProfiler(
+        _prof_cfg(
+            profiler_mode="cost_breakdown",
+            profiler_output_dir=str(tmp_path),
+            spec_policy="hierarchical",
+        )
+    )
+
+    class S:
+        seq_id = 0
+
+    p.start_run(SimpleNamespace(), None)
+    p.start_step([S()], is_prefill=False)
+    p.accum_hierarchical_verify_time(0.02, True)
+    p.accum_hierarchical_verify_time(0.05, False)
+    p.finish_step(1)
+    tr_i = SimpleNamespace(
+        verification_models=["intermediate"],
+        inter_accept_len=[3],
+    )
+    p._record_hierarchical_accept_samples([S()], tr_i)
+    tr = SimpleNamespace(
+        verification_models=["target"],
+        accept_len=[2],
+        inter_target_prefix_accept_len=[1],
+    )
+    p._record_hierarchical_accept_samples([S()], tr)
+    p.finish_run()
+    data = json.loads((tmp_path / "cost_breakdown.json").read_text())
+    assert data["hierarchical_intermediate_verification_time_s"] == 0.02
+    assert data["hierarchical_target_verification_time_s"] == 0.05
+    assert abs(data["avg_target_accept_len"] - 2.0) < 1e-6
+    assert abs(data["avg_inter_target_prefix_accept_len"] - 1.0) < 1e-6
+    assert abs(data["avg_intermediate_accept_len"] - 3.0) < 1e-6
 
 
 def test_profile_greedy_token_confidence_not_all_ones():

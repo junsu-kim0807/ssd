@@ -204,10 +204,18 @@ class SpecDecodeStep(InferenceStep):
 
         #### STEP 2: VERIFY ####
         if self._profiler_active():
-            pr.start_stage("verify")
+            if hierarchical:
+                _t_hv_verify = perf_counter()
+            else:
+                pr.start_stage("verify")
         out_verify_result = self.verifier.verify(seqs, speculate_result, eagle=self.eagle)
         if self._profiler_active():
-            pr.finish_stage("verify")
+            if hierarchical:
+                pr.accum_hierarchical_verify_time(
+                    perf_counter() - _t_hv_verify, out_verify_result.is_hv_intermediate
+                )
+            else:
+                pr.finish_stage("verify")
             pr.record_decode_verify_batch(seqs, out_verify_result)
 
         if _prof:

@@ -27,6 +27,9 @@ class VerifyProfileTrace:
     inter_accept_len: list[int | None] | None = None
     inter_recovery_token: list[int | None] | None = None
     inter_bonus_token: list[int | None] | None = None
+    # Target HV only: consecutive greedy matches along ``candidates`` restricted to
+    # indices ``j`` with ``j+1 < len(candidates) - lookahead`` (exclude last K draft tail).
+    inter_target_prefix_accept_len: list[int] | None = None
 
 
 @dataclass

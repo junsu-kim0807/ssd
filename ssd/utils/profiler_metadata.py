@@ -4,11 +4,19 @@ Per-row ``num_draft`` / ``num_verification``: for decode steps, the profiler's
 per-step batch counts (typically ``batch_size`` when each sequence runs one draft
 and one verify in that step). Prefill rows use the same batch size for both.
 
+Decode rows use ``step_id = profiler.decode_metadata_step_id()`` (1-based decode
+ordinal). Prefill rows still use the global engine ``profiler.step_id`` so
+prefill engine steps do not create gaps in decode ``step_id`` values.
+
 Hierarchical intermediate rounds (``verification_model == "intermediate"``): the
 verify trace's shared ``token_ids_per_position`` / ``token_confidence_per_position``
 fields hold the **intermediate** model chain (length K+1), not the target verifier
 chain. They are written as ``intermediate_verify_chain_*``; ``target_*`` columns
 are null. Per-position accept/recovery/bonus for that round remain in ``inter_*``.
+
+Target hierarchical rows may include ``inter_target_prefix_accept_len``: greedy
+acceptance count restricted to candidate indices before the last ``K`` draft tail
+tokens (``K = num_speculative_token``).
 """
 
 from __future__ import annotations
@@ -137,8 +145,10 @@ def trace_to_row_indexed(
     cost_fields: bool,
 ) -> dict[str, Any]:
     inter_r, tgt_r = profiler.inter_target_counts_for_seq(seq.seq_id)
+    # Decode JSONL uses a decode-only counter so prefill engine steps do not create gaps in ids.
+    _sid = int(profiler.decode_metadata_step_id()) if not is_prefill else int(profiler.step_id)
     row: dict[str, Any] = {
-        "step_id": profiler.step_id,
+        "step_id": _sid,
         "request_id": seq.seq_id,
         "batch_size": batch_size,
         "is_prefill": is_prefill,
@@ -165,6 +175,7 @@ def trace_to_row_indexed(
             row["target_accept_len"] = None
             row["target_recovery_token"] = None
             row["target_bonus_token"] = None
+            row["inter_target_prefix_accept_len"] = None
             tid = trace.token_ids_per_position[i]
             tcf = trace.token_confidence_per_position[i]
             row["intermediate_verify_chain_token_ids_per_position"] = list(tid) if tid else None
@@ -183,6 +194,10 @@ def trace_to_row_indexed(
             row["target_accept_len"] = trace.accept_len[i]
             row["target_recovery_token"] = trace.recovery_tokens[i]
             row["target_bonus_token"] = trace.bonus_tokens[i]
+            itp = getattr(trace, "inter_target_prefix_accept_len", None)
+            row["inter_target_prefix_accept_len"] = (
+                int(itp[i]) if itp is not None and i < len(itp) else None
+            )
         if trace.inter_token_ids_per_position is not None:
             row["inter_token_ids_per_position"] = trace.inter_token_ids_per_position[i]
             row["inter_token_confidence_per_position"] = trace.inter_token_confidence_per_position[i]
@@ -202,6 +217,7 @@ def trace_to_row_indexed(
         row["target_accept_len"] = None
         row["target_recovery_token"] = None
         row["target_bonus_token"] = None
+        row["inter_target_prefix_accept_len"] = None
         row["intermediate_verify_chain_token_ids_per_position"] = None
         row["intermediate_verify_chain_token_confidence_per_position"] = None
         row["inter_token_ids_per_position"] = None

@@ -179,11 +179,14 @@ class VerifierHierarchical(VerifierBase):
         tok_conf: list[list[float]] = []
         acc_lens: list[int] = []
         bonus_toks: list[int] = []
-        for i, seq in enumerate(seqs):
+        inter_target_prefix_accepts: list[int] = []
+        K = self.lookahead
+        for i, _seq in enumerate(seqs):
             L = len(candidates[i])
             logits_i = logits_flat[offset : offset + L]
             offset += L
-            suffix, rec = verify_greedy_chain_variable(logits_i, candidates[i])
+            cand = candidates[i]
+            suffix, rec = verify_greedy_chain_variable(logits_i, cand)
             new_suffixes.append(suffix)
             recovery_tokens.append(rec)
             if self.enable_profile_trace:
@@ -193,6 +196,16 @@ class VerifierHierarchical(VerifierBase):
                 tok_conf.append([float(pr[j].max().item()) for j in range(L)])
                 acc_lens.append(max(0, len(suffix) - 1))
                 bonus_toks.append(int(preds_row[-1].item()))
+                cap_excl = L - K
+                itp = 0
+                if cap_excl > 0:
+                    for j in range(0, L - 1):
+                        if j + 1 >= cap_excl:
+                            break
+                        if cand[j + 1] != int(preds_row[j].item()):
+                            break
+                        itp += 1
+                inter_target_prefix_accepts.append(itp)
 
         profile_trace = None
         if self.enable_profile_trace:
@@ -204,6 +217,7 @@ class VerifierHierarchical(VerifierBase):
                 accept_len=acc_lens,
                 recovery_tokens=list(recovery_tokens),
                 bonus_tokens=bonus_toks,
+                inter_target_prefix_accept_len=inter_target_prefix_accepts,
             )
 
         return VerifyResult(
