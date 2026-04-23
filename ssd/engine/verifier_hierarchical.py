@@ -69,62 +69,79 @@ class VerifierHierarchical(VerifierBase):
     ) -> VerifyResult:
         K = self.lookahead
         batch_size = len(seqs)
+        prev_nics = [seq.num_inter_cached_tokens for seq in seqs]
 
-        # One autoregressive forward over the full speculative tail (same tokens as draft).
-        # ``num_inter_cached_tokens`` is authoritative (restored after prior steps); do not
-        # reset to ``num_cached_tokens`` or prior-round intermediate KV is discarded.
-        # Use ``call`` so TP follower ranks run the same forward (``intermediate_run`` already does).
-        logits_flat = self.intermediate_runner.call("run_intermediate_verify_suffix", seqs, K)
-        for seq in seqs:
-            seq.num_inter_cached_tokens += K + 1
+        # Packed varlen: optional ``token_ids[nic:c0)`` gap rows + ``(K+1)`` scored tail.
+        logits_flat, score_starts, q_lens = self.intermediate_runner.call(
+            "run_intermediate_verify_suffix", seqs, K
+        )
 
-        logits_inter = logits_flat.view(batch_size, K + 1, -1)
-        preds = logits_inter.argmax(dim=-1)
-        draft_tokens = speculate_result.speculations[:, 1:]
-        preds_draft = preds[:, :-1]
-        matches = draft_tokens == preds_draft
-        mismatch = ~matches
-        any_m = mismatch.any(dim=1)
-        first_m = mismatch.int().argmax(dim=1)
-        accept_n = torch.where(any_m, first_m, torch.full_like(first_m, K))
-        batch_idx = torch.arange(batch_size, device=self.device)
-        recovery_from_inter = preds[batch_idx, accept_n]
+        draft_tokens = speculate_result.speculations[:, 1:].to(self.device)
+        starts = speculate_result.speculations[:, 0]
 
+        offset = 0
         new_suffixes: list[list[int]] = []
         recovery_tokens: list[int] = []
-        starts = speculate_result.speculations[:, 0].tolist()
+        accept_n_list: list[int] = []
+        profile_scored: list[torch.Tensor] | None = [] if self.enable_profile_trace else None
+
         for b in range(batch_size):
-            n = int(accept_n[b].item())
-            suffix = [starts[b]] + draft_tokens[b, :n].tolist()
-            new_suffixes.append(suffix)
-            recovery_tokens.append(int(recovery_from_inter[b].item()))
+            ss = score_starts[b]
+            ql = q_lens[b]
+            logits_i = logits_flat[offset : offset + ql]
+            offset += ql
+            scored = logits_i[ss : ss + K + 1]
+            preds = scored.argmax(dim=-1)
+            if profile_scored is not None:
+                profile_scored.append(scored.detach())
+            dt = draft_tokens[b]
+            preds_draft = preds[:-1]
+            matches = dt == preds_draft
+            mismatch = ~matches
+            any_m = mismatch.any()
+            first_m = mismatch.int().argmax()
+            n = int(first_m.item()) if bool(any_m.item()) else K
+            accept_n_list.append(n)
+            recovery_from_inter = preds[n]
+            new_suffixes.append([int(starts[b].item())] + dt[:n].tolist())
+            recovery_tokens.append(int(recovery_from_inter.item()))
+
+        # Logical frontier: scored window begins at ``prev_nic + score_start`` (gap rows only
+        # shift ``score_start``). Do not use ``num_cached_tokens`` here — with provisional
+        # tape ``prev_nic`` can exceed ``c0``, and ``c0 + n + 1`` would shrink ``nic`` wrongly.
+        for b, (seq, n) in enumerate(zip(seqs, accept_n_list)):
+            seq.num_inter_cached_tokens = prev_nics[b] + score_starts[b] + int(n) + 1
 
         profile_trace = None
-        if self.enable_profile_trace:
-            probs_head = torch.softmax(logits_inter[:, :-1, :].float(), dim=-1)
-            inter_conf = probs_head.max(dim=-1).values.cpu().tolist()
-            inter_ids = preds[:, :-1].cpu().tolist()
-            probs_full = torch.softmax(logits_inter.float(), dim=-1)
-            row_conf = probs_full.max(dim=-1).values.cpu().tolist()
-            pred_rows = preds.cpu().tolist()
+        if self.enable_profile_trace and profile_scored is not None:
+            inter_token_ids_per_position: list[list[int]] = []
+            inter_token_confidence_per_position: list[list[float]] = []
+            token_ids_per_position: list[list[int]] = []
+            token_confidence_per_position: list[list[float]] = []
+            bonus_tokens: list[int] = []
+            for scored in profile_scored:
+                pr = torch.softmax(scored.float(), dim=-1)
+                preds_row = scored.argmax(dim=-1)
+                token_ids_per_position.append([int(preds_row[j].item()) for j in range(K + 1)])
+                token_confidence_per_position.append([float(pr[j].max().item()) for j in range(K + 1)])
+                probs_head = torch.softmax(scored[:-1, :].float(), dim=-1)
+                inter_token_ids_per_position.append([int(preds_row[j].item()) for j in range(K)])
+                inter_token_confidence_per_position.append(
+                    [float(probs_head[j].max().item()) for j in range(K)]
+                )
+                bonus_tokens.append(int(preds_row[K].item()))
             profile_trace = VerifyProfileTrace(
                 verification_models=["intermediate"] * batch_size,
-                token_ids_per_position=[
-                    [int(pred_rows[b][j]) for j in range(K + 1)] for b in range(batch_size)
-                ],
-                token_confidence_per_position=[
-                    [float(row_conf[b][j]) for j in range(K + 1)] for b in range(batch_size)
-                ],
+                token_ids_per_position=token_ids_per_position,
+                token_confidence_per_position=token_confidence_per_position,
                 accept_len=[0] * batch_size,
                 recovery_tokens=list(recovery_tokens),
-                bonus_tokens=[int(preds[b, K].item()) for b in range(batch_size)],
-                inter_token_ids_per_position=[[int(inter_ids[b][j]) for j in range(K)] for b in range(batch_size)],
-                inter_token_confidence_per_position=[
-                    [float(inter_conf[b][j]) for j in range(K)] for b in range(batch_size)
-                ],
-                inter_accept_len=[int(accept_n[b].item()) for b in range(batch_size)],
-                inter_recovery_token=[int(recovery_from_inter[b].item()) for b in range(batch_size)],
-                inter_bonus_token=[int(preds[b, K].item()) for b in range(batch_size)],
+                bonus_tokens=bonus_tokens,
+                inter_token_ids_per_position=inter_token_ids_per_position,
+                inter_token_confidence_per_position=inter_token_confidence_per_position,
+                inter_accept_len=[int(accept_n_list[b]) for b in range(batch_size)],
+                inter_recovery_token=[recovery_tokens[b] for b in range(batch_size)],
+                inter_bonus_token=bonus_tokens,
             )
 
         return VerifyResult(

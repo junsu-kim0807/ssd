@@ -30,7 +30,7 @@ from ssd.engine.helpers.runner_helpers import (
     prepare_block_tables_from_seqs,
     prepare_prefill_tensors_from_seqs,
     prepare_verify_tensors_varlen,
-    prepare_intermediate_verify_suffix_tensors,
+    prepare_intermediate_verify_gapaware_tensors,
 )
 from ssd.engine.intermediate_shard_config import make_intermediate_shard_config
 from ssd.engine.helpers.cudagraph_helpers import (
@@ -785,8 +785,12 @@ class ModelRunner:
             "intermediate_run requires TP-colocated hierarchical intermediate or intermediate_mode runner"
         )
 
-    def run_intermediate_verify_suffix(self, seqs: list[Sequence], k: int) -> torch.Tensor:
-        """Extend intermediate KV along ``token_ids[c:c+k+1]`` (sync spec tail).
+    def run_intermediate_verify_suffix(self, seqs: list[Sequence], k: int):
+        """Gap-aware packed varlen intermediate verify (optional ``[nic:c0)`` + ``K+1`` tail).
+
+        Returns ``(logits_flat, score_starts, q_lens)`` where ``logits_flat`` has
+        ``sum(q_lens)`` rows in batch order, and row ``score_starts[b]:score_starts[b]+k+1``
+        are used for acceptance (see ``VerifierHierarchical._verify_intermediate_round``).
 
         Standalone ``IntermediateRunner`` respects ``config.enforce_eager`` (verify CUDAGraph
         when eager is off). TP-colocated ``intermediate_model`` has no verify graph on this
@@ -795,14 +799,28 @@ class ModelRunner:
         assert getattr(self, "intermediate_mode", False) or getattr(
             self, "_hierarchical_intermediate_parallel", False
         ), "run_intermediate_verify_suffix requires intermediate_mode or TP-colocated intermediate"
-        force_eager = self._intermediate_colocated_verify_needs_eager()
         eager_was = self.enforce_eager
-        if force_eager:
-            self.enforce_eager = True
+        force_eager = False
         try:
-            input_ids, positions, slot_mapping, context_lens, cu_seqlens_q, max_seqlen_q = (
-                prepare_intermediate_verify_suffix_tensors(seqs, self.block_size, k)
+            (
+                input_ids,
+                positions,
+                slot_mapping,
+                context_lens,
+                cu_seqlens_q,
+                max_seqlen_q,
+                score_starts,
+                q_lens,
+            ) = prepare_intermediate_verify_gapaware_tensors(seqs, self.block_size, k)
+            # CUDAGraph verify path assumes constant ``q_len == k+1`` per seq. Uniform padding
+            # makes the batch shape-stable; CG is still reachable iff ``max_q == k+1`` (no gap).
+            # Colocated intermediate_model has no verify CG on this runner — always eager.
+            force_eager = (
+                self._intermediate_colocated_verify_needs_eager()
+                or int(max_seqlen_q) != k + 1
             )
+            if force_eager:
+                self.enforce_eager = True
             block_tables = prepare_block_tables_from_seqs(
                 seqs, self.is_draft, is_intermediate=True)
             set_context(
@@ -814,9 +832,11 @@ class ModelRunner:
                 slot_mapping=slot_mapping,
                 context_lens=context_lens,
                 block_tables=block_tables,
+                is_varlen_verify=True,
             )
             _m = self.intermediate_model if self._hierarchical_intermediate_parallel else None
-            return self.run_model(input_ids, positions, False, last_only=False, model=_m)
+            logits_flat = self.run_model(input_ids, positions, False, last_only=False, model=_m)
+            return logits_flat, score_starts, q_lens
         finally:
             if force_eager:
                 self.enforce_eager = eager_was

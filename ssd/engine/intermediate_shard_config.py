@@ -12,7 +12,8 @@ def make_intermediate_shard_config(cfg: Config) -> Config:
 
     ``speculate`` must stay **True** with the same ``speculate_k`` as the target so
     ``Attention`` takes the multi-query ``flash_attn_with_kvcache`` path when
-    ``run_intermediate_verify_suffix`` sets ``cu_seqlens_q`` (K+1 tokens per seq).
+    ``run_intermediate_verify_suffix`` sets ``cu_seqlens_q`` (variable tokens per seq:
+    optional ``[nic:c0)`` gap plus ``K+1`` scored tail).
     ``speculate=False`` incorrectly routes that forward through single-query decode
     and breaks with e.g. ``batch_size must be equal to batch_size_k``.
 

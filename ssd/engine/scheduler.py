@@ -244,7 +244,7 @@ class Scheduler:
         seq.extend_token_ids = None
 
     def _hv_discard_provisional(self, seq: Sequence) -> None:
-        """Policy B on preempt: drop HV provisional state (tokens not in seq.token_ids)."""
+        """On preempt drop HV provisional state (tokens not in seq.token_ids)."""
         seq.hv_provisional_token_ids.clear()
         seq.hv_provisional_recovery_token_id = None
         seq.hv_num_provisional_tokens = 0
@@ -461,12 +461,18 @@ class Scheduler:
             else:
                 seq.hv_round_idx += 1
             seq.num_draft_cached_tokens = len(seq) - 1 + seq.hv_num_provisional_tokens
-            # Intermediate KV depth was already advanced by (K+1) in
-            # ``VerifierHierarchical._verify_intermediate_round`` after
-            # ``run_intermediate_verify_suffix`` (one physical forward over the full
-            # speculative tail). Do not add ``len(suffix)`` here or RoPE positions
-            # overshoot the actual cache and verification quality degrades.
+            # Intermediate KV depth advances by ``accept_n + 1`` inside
+            # ``VerifierHierarchical._verify_intermediate_round`` (Fix 1). Positions in the
+            # physical write past that point are stale; trim block tail so next round
+            # re-allocates and overwrites.
             self._hv_trim_block_tail(self.intermediate_block_manager, seq, seq.num_inter_cached_tokens)
+            # Fix 3: invalidate draft KV past the new logical draft frontier. Draft physically
+            # wrote its own speculated tail at positions [committed..committed+K], but only
+            # [committed..committed+n] match what intermediate chose; positions beyond diverge.
+            # ``num_draft_cached_tokens`` already gates attention via ``context_len``, but
+            # trim releases the surplus tail blocks so future re-allocation gives a clean
+            # write surface (no silent reliance on overwrite ordering).
+            self._hv_trim_block_tail(self.draft_block_manager, seq, seq.num_draft_cached_tokens)
 
     def postprocess_hv_target_round(
         self,
@@ -475,25 +481,43 @@ class Scheduler:
         next_recovery_tokens: list[int],
         eagle_acts: torch.Tensor | None = None,
     ) -> None:
-        """Final commit using target authority; clears HV provisional state."""
+        """Final commit using target authority; clears HV provisional state.
+
+        After Fix 1, ``num_inter_cached_tokens`` tracks the *logical* intermediate
+        frontier (``committed + prov_count - 1`` at round r), advanced per round by
+        ``accept_n + 1``. At target commit:
+
+        - ``nic > committed`` (target rejected inside the provisional tape):
+          trim ``nic`` down to ``committed`` and drop the stale tail blocks.
+        - ``nic < committed`` (target accepted past the intermediate frontier): leave ``nic``;
+          the next intermediate verify packs ``token_ids[nic:committed]`` as warmup rows ahead
+          of the scored ``(K+1)`` tail (see ``prepare_intermediate_verify_gapaware_tensors``).
+        - ``nic == committed``: no action needed.
+        """
         for seq in seqs:
             self._hv_discard_provisional(seq)
             seq.hv_round_idx = 0
-            # Provisional tokens are not in seq.token_ids; new_suffix will commit them once via
-            # postprocess_speculate. Reset draft/inter lengths to the committed tape so
-            # _update_sequence_metadata's += len(new_suffix) does not double-count provisional depth.
-            # Invariant: before postprocess_speculate, num_draft_cached_tokens == len(seq)-1 and
-            # num_inter_cached_tokens == num_cached_tokens so metadata += len(new_suffix) lands on
-            # the committed frontier only (provisional depth was tracked separately during HV).
-            seq.num_draft_cached_tokens = len(seq) - 1
-            if self.intermediate_block_manager is not None:
-                seq.num_inter_cached_tokens = seq.num_cached_tokens
+            # Provisional tokens are not in seq.token_ids; postprocess_speculate will commit
+            # new_suffix and advance num_draft/num_cached by len(new_suffix). Reset draft depth
+            # to the full committed tape (``len(seq)``, same as prefill's num_draft = num_prompt).
+            # ``len(seq) - 1`` would leave ``num_draft`` one short after += len(new_suffix), so the
+            # next ``speculate`` recovery append would fail ``prepare_decode``'s draft invariant.
+            seq.num_draft_cached_tokens = len(seq)
+            # NOTE: do NOT touch num_inter_cached_tokens here — postprocess_speculate does not
+            # modify it, and we must preserve the physical intermediate frontier across commit.
         self.postprocess_speculate(seqs, new_suffixes, next_recovery_tokens, eagle_acts=eagle_acts)
         for seq in seqs:
             seq.target_last_spec_step_accepted_len = seq.last_spec_step_accepted_len
             if self.intermediate_block_manager is not None:
-                seq.num_inter_cached_tokens = seq.num_cached_tokens
-                self._hv_trim_block_tail(self.intermediate_block_manager, seq, seq.num_inter_cached_tokens)
+                if seq.num_inter_cached_tokens > seq.num_cached_tokens:
+                    # Case 1: intermediate advanced past committed — roll nic back to committed
+                    # and release the stale tail blocks.
+                    seq.num_inter_cached_tokens = seq.num_cached_tokens
+                    self._hv_trim_block_tail(
+                        self.intermediate_block_manager, seq, seq.num_inter_cached_tokens
+                    )
+                # Case 2: nic <= committed — keep nic. Gap (if any) is folded into the next
+                # intermediate verify forward, not a separate catchup pass.
 
     def _hv_trim_block_tail(self, manager: BlockManager | None, seq: Sequence, required_tokens: int) -> None:
         if manager is None:

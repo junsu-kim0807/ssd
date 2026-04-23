@@ -147,6 +147,10 @@ def prepare_verify_tensors_varlen(
 
     `verify_tokens_per_seq[i]` is the full candidate suffix (length L_i) scored against KV
     whose context ends at num_cached_tokens (committed frontier, not including temp speculate).
+
+    ``context_lens`` must be the logical length ``c0 + L`` (committed + candidate), not
+    ``len(seq)``: hierarchical target candidates can include ``hv_provisional_token_ids`` not
+    present on ``token_ids`` while ``positions`` use ``c0 + j`` for ``j < L``.
     """
     input_ids: list[int] = []
     positions: list[int] = []
@@ -157,8 +161,7 @@ def prepare_verify_tensors_varlen(
         c0 = seq.num_cached_tokens
         L = len(cand)
         assert L >= 1
-        # Match fixed verify path: constant context length for the whole batch row.
-        context_lens.append(len(seq))
+        context_lens.append(c0 + L)
         seqlen_q_list.append(L)
         for j, tok in enumerate(cand):
             pos = c0 + j
@@ -181,45 +184,68 @@ def prepare_verify_tensors_varlen(
     return input_ids_t, positions_t, slot_mapping_t, context_lens_t, cu_seqlens_q, max_seqlen_q
 
 
-def prepare_intermediate_verify_suffix_tensors(
+def prepare_intermediate_verify_gapaware_tensors(
     seqs: list[Sequence],
     block_size: int,
     k: int,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, int]:
-    """One packed forward over the speculative tail on the *intermediate* KV.
+) -> tuple[
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    int,
+    list[int],
+    list[int],
+]:
+    """Packed varlen intermediate verify: optional ``[nic:c0)`` gap + scored ``(K+1)`` tail.
 
-    The chain is always length ``k+1``: recovery then ``k`` draft tokens. When HV
-    ``skip_append`` left recovery only on ``hv_provisional_token_ids[-1]``, the tail is
-    ``[prov[-1]] + token_ids[num_cached : num_cached + k]``; otherwise it is
-    ``token_ids[num_cached : num_cached + k + 1]``.
+    Per sequence:
+    - If ``nic < c0`` (target committed ahead of intermediate KV): ``full = token_ids[nic:c0]
+      + token_ids[c0:c0+k+1]``, ``score_start = c0 - nic`` (warmup rows only).
+    - Elif provisional depth ``pt > 0``: ``full = [prov[-1]] + token_ids[c0:c0+k]``, ``score_start = 0``.
+    - Else: ``full = token_ids[c0:c0+k+1]``, ``score_start = 0``.
 
-    RoPE positions start at ``num_inter_cached_tokens`` (intermediate KV depth before this
-    forward), which must match prior intermediate accepts + provisional depth — not only
-    ``num_cached_tokens`` — so intermediate scoring aligns with the draft's logical chain.
+    RoPE starts at ``nic``; ``context_lens`` is ``nic + len(full)`` per row pack. Verification
+    uses logits rows ``[score_start : score_start + k + 1]`` only (same contract as the old
+    fixed ``K+1`` path when ``score_start == 0``).
     """
     input_ids: list[int] = []
     positions: list[int] = []
     slot_mapping: list[int] = []
     context_lens: list[int] = []
     seqlen_q_list: list[int] = []
+    score_starts: list[int] = []
     for seq in seqs:
         c0 = seq.num_cached_tokens
-        base_pos = seq.num_inter_cached_tokens
-        assert base_pos >= c0, (
-            f"intermediate verify: num_inter_cached_tokens must be >= num_cached_tokens, "
-            f"got {base_pos} vs {c0}"
-        )
+        nic = seq.num_inter_cached_tokens
         pt = seq.hv_num_provisional_tokens
-        if pt > 0:
-            tail = [seq.hv_provisional_token_ids[-1]] + list(seq.token_ids[c0 : c0 + k])
-        else:
+
+        if nic < c0:
+            assert pt == 0, "intermediate verify gap path requires empty provisional tape"
+            gap = list(seq.token_ids[nic:c0])
             tail = list(seq.token_ids[c0 : c0 + k + 1])
-        assert len(tail) == k + 1, (
-            f"intermediate verify: need K+1 tokens on tail, got {len(tail)} (K={k})"
+            full = gap + tail
+            score_start = len(gap)
+            base_pos = nic
+        elif pt > 0:
+            full = [seq.hv_provisional_token_ids[-1]] + list(seq.token_ids[c0 : c0 + k])
+            score_start = 0
+            base_pos = nic
+        else:
+            full = list(seq.token_ids[c0 : c0 + k + 1])
+            score_start = 0
+            base_pos = nic
+
+        assert len(full) == score_start + k + 1, (
+            f"intermediate verify: expected len={score_start + k + 1}, got {len(full)} "
+            f"(nic={nic}, c0={c0}, pt={pt}, K={k})"
         )
-        seqlen_q_list.append(k + 1)
-        context_lens.append(base_pos + k + 1)
-        for j, tok in enumerate(tail):
+        q_len = len(full)
+        seqlen_q_list.append(q_len)
+        score_starts.append(score_start)
+        context_lens.append(base_pos + q_len)
+        for j, tok in enumerate(full):
             pos = base_pos + j
             input_ids.append(int(tok))
             positions.append(pos)
@@ -234,10 +260,19 @@ def prepare_intermediate_verify_suffix_tensors(
     context_lens_t = torch.tensor(context_lens, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
     _dev = torch.device("cuda")
     cu_seqlens_q = torch.zeros(len(seqs) + 1, dtype=torch.int32, device=_dev)
-    q_lens = torch.tensor(seqlen_q_list, dtype=torch.int32, device=_dev)
-    cu_seqlens_q[1:] = torch.cumsum(q_lens, dim=0)
-    max_seqlen_q = k + 1
-    return input_ids_t, positions_t, slot_mapping_t, context_lens_t, cu_seqlens_q, max_seqlen_q
+    q_lens_t = torch.tensor(seqlen_q_list, dtype=torch.int32, device=_dev)
+    cu_seqlens_q[1:] = torch.cumsum(q_lens_t, dim=0)
+    max_seqlen_q = max(seqlen_q_list) if seqlen_q_list else 0
+    return (
+        input_ids_t,
+        positions_t,
+        slot_mapping_t,
+        context_lens_t,
+        cu_seqlens_q,
+        max_seqlen_q,
+        score_starts,
+        seqlen_q_list,
+    )
 
 
 def prepare_block_tables_from_seqs(
