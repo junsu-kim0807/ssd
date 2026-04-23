@@ -6,7 +6,12 @@ from types import SimpleNamespace
 
 import torch
 
-from ssd.utils.profiler import SSDProfiler, make_profiler, NOOP_PROFILER
+from ssd.utils.profiler import (
+    SSDProfiler,
+    _target_accept_len_distribution_tables,
+    make_profiler,
+    NOOP_PROFILER,
+)
 from ssd.utils.profiler_metadata import (
     draft_metadata_from_logits,
     prefill_metadata_rows,
@@ -101,12 +106,72 @@ def test_metadata_finish_run_writes_analysis_jsonl(tmp_path):
     assert data["total_target_verification_rounds"] == 2
     assert data["misspeculation_rounds"] == 1
     assert abs(data["misspeculation_probability"] - 0.5) < 1e-9
-    assert len(data["target_batch_accept_distributions"]) == 1
-    b0 = data["target_batch_accept_distributions"][0]
-    assert b0["batch_size"] == 2
-    assert abs(b0["accept_len_histogram"]["0"] - 0.5) < 1e-9
-    assert abs(b0["accept_len_histogram"]["3"] - 0.5) < 1e-9
+    tbd = data["target_batch_accept_distributions"]
+    assert isinstance(tbd, dict)
+    assert abs(tbd["0"] - 0.5) < 1e-9
+    assert abs(tbd["3"] - 0.5) < 1e-9
     assert data["avg_intermediate_accept_len"] is None
+    assert data["accept_distribution_rounds"] == 2
+    rp = data["accept_rate_per_position"]
+    lp = data["accept_length_per_round"]
+    assert abs(rp["0"] - 0.5) < 1e-9
+    assert abs(rp["1"] - 0.5) < 1e-9
+    assert abs(rp["2"] - 0.5) < 1e-9
+    assert rp["3"] == 0.0
+    assert abs(lp["0"] - 0.5) < 1e-9
+    assert abs(lp["3"] - 0.5) < 1e-9
+    assert abs(sum(lp.values()) - 1.0) < 1e-9
+    for k in ("accept_rate_per_position", "accept_length_per_round"):
+        assert k in data["notes"]
+
+
+def test_metadata_target_batch_hist_averaged_over_steps(tmp_path):
+    p = SSDProfiler(
+        _prof_cfg(
+            profiler_mode="metadata",
+            profiler_output_dir=str(tmp_path),
+            spec_policy="default",
+        )
+    )
+
+    class S:
+        seq_id = 0
+
+    p.start_run(SimpleNamespace(), None)
+    p.start_step([S(), S()], is_prefill=False)
+    tr1 = SimpleNamespace(
+        verification_models=["target", "target"],
+        accept_len=[0, 3],
+        inter_accept_len=None,
+        inter_target_prefix_accept_len=None,
+    )
+    p.record_decode_verify_batch([S(), S()], SimpleNamespace(profile_trace=tr1, is_hv_intermediate=False))
+    p.finish_step(1)
+    p.start_step([S(), S()], is_prefill=False)
+    tr2 = SimpleNamespace(
+        verification_models=["target", "target"],
+        accept_len=[0, 0],
+        inter_accept_len=None,
+        inter_target_prefix_accept_len=None,
+    )
+    p.record_decode_verify_batch([S(), S()], SimpleNamespace(profile_trace=tr2, is_hv_intermediate=False))
+    p.finish_step(1)
+    p.finish_run()
+    data = json.loads((tmp_path / "analysis.jsonl").read_text(encoding="utf-8").strip().splitlines()[-1])
+    tbd = data["target_batch_accept_distributions"]
+    assert abs(tbd["0"] - 0.75) < 1e-9
+    assert abs(tbd["3"] - 0.25) < 1e-9
+
+
+def test_target_accept_len_distribution_tables():
+    rate, pmf = _target_accept_len_distribution_tables([7, 3, 0], speculate_k=3)
+    assert rate["0"] == 2 / 3
+    assert abs(rate["6"] - 1 / 3) < 1e-9
+    assert rate["7"] == 0.0
+    assert abs(sum(pmf.values()) - 1.0) < 1e-9
+    assert abs(pmf["7"] - 1 / 3) < 1e-9
+    for i in range(7):
+        assert rate[str(i)] >= rate[str(i + 1)]
 
 
 def test_metadata_analysis_hierarchical_avgs(tmp_path):

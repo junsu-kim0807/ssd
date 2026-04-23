@@ -17,7 +17,7 @@ from __future__ import annotations
 
 import json
 import os
-from collections import Counter
+from collections import Counter, defaultdict
 from dataclasses import dataclass, field
 from pathlib import Path
 from time import perf_counter
@@ -48,6 +48,36 @@ def wants_cost_aggregates(mode: str) -> bool:
 def wants_metadata_analysis_file(mode: str) -> bool:
     """Run-level ``analysis.jsonl`` (accept stats, misspeculation, batch histograms)."""
     return mode == "metadata"
+
+
+def _target_accept_len_distribution_tables(
+    accept_lens: list[int],
+    speculate_k: int,
+) -> tuple[dict[str, float], dict[str, float]]:
+    """Cumulative position accept rates and per-length PMF for target verification rounds.
+
+    ``accept_rate_per_position[str(i)]`` = fraction of rounds with ``accept_len >= i + 1``
+    (i=0 → first speculative token accepted, i.e. at least one accept beyond recovery-only).
+
+    ``accept_length_per_round[str(L)]`` = fraction of rounds with ``accept_len == L`` (zeros
+    included for L up to ``cap``). ``cap = max(2 * speculate_k + 1, max(accept_lens))`` so
+    e.g. ``speculate_k=3`` yields keys ``0``..``7`` when needed.
+    """
+    n = len(accept_lens)
+    if n == 0:
+        return {}, {}
+    max_obs = max(accept_lens)
+    cap = max(2 * int(speculate_k) + 1, int(max_obs))
+    inv = 1.0 / float(n)
+    accept_rate_per_position: dict[str, float] = {}
+    for i in range(cap + 1):
+        need = i + 1
+        accept_rate_per_position[str(i)] = float(sum(1 for a in accept_lens if a >= need)) * inv
+    ctr = Counter(accept_lens)
+    accept_length_per_round: dict[str, float] = {
+        str(k): float(ctr.get(k, 0)) * inv for k in range(cap + 1)
+    }
+    return accept_rate_per_position, accept_length_per_round
 
 
 def wants_profile_trace(mode: str) -> bool:
@@ -246,7 +276,9 @@ class SSDProfiler:
         # metadata-mode analysis.jsonl (record_decode_verify_batch)
         self._meta_target_verification_rounds: int = 0
         self._meta_misspeculation_rounds: int = 0
-        self._meta_batch_target_accept_dist: list[dict[str, Any]] = []
+        self._meta_batch_hist_sums: defaultdict[str, float] = defaultdict(float)
+        self._meta_batch_hist_union: set[str] = set()
+        self._meta_batch_hist_batches: int = 0
 
         self._kernel_prof: Any | None = None
 
@@ -365,6 +397,10 @@ class SSDProfiler:
 
             n_tgt = int(self._meta_target_verification_rounds)
             n_miss = int(self._meta_misspeculation_rounds)
+            tgt_samples = list(self._hv_target_accept_samples)
+            rate_pos, len_pmf = _target_accept_len_distribution_tables(
+                tgt_samples, int(self._speculate_k)
+            )
             analysis: dict[str, Any] = {
                 "avg_target_accept_len": _avg_int(self._hv_target_accept_samples),
                 "avg_intermediate_accept_len": (
@@ -378,9 +414,37 @@ class SSDProfiler:
                 "total_target_verification_rounds": n_tgt,
                 "misspeculation_rounds": n_miss,
                 "misspeculation_probability": (float(n_miss) / float(n_tgt)) if n_tgt > 0 else None,
-                "target_batch_accept_distributions": list(self._meta_batch_target_accept_dist),
+                "accept_rate_per_position": rate_pos,
+                "accept_length_per_round": len_pmf,
+                "accept_distribution_rounds": len(tgt_samples),
+                "target_batch_accept_distributions": (
+                    {
+                        k: self._meta_batch_hist_sums[k] / float(self._meta_batch_hist_batches)
+                        for k in sorted(self._meta_batch_hist_union, key=int)
+                    }
+                    if self._meta_batch_hist_batches > 0
+                    else {}
+                ),
                 "spec_policy": self._spec_policy,
                 "speculate_k": int(self._speculate_k),
+                "notes": {
+                    "accept_rate_per_position": (
+                        "For key i (string): fraction of target rounds (with traced accept_len) where "
+                        "accept_len >= i+1; monotone non-increasing in i. Axis cap = max(2*speculate_k+1, max accept_len)."
+                    ),
+                    "accept_length_per_round": (
+                        "For key L (string): fraction of those rounds with accept_len == L; keys 0..cap sum to 1."
+                    ),
+                    "accept_distribution_rounds": (
+                        "Count of target verify rows contributing to the two distributions "
+                        "(VerifyProfileTrace.accept_len present); can differ from total_target_verification_rounds "
+                        "if accept_len was missing for some target rows."
+                    ),
+                    "target_batch_accept_distributions": (
+                        "Mean over decode steps of per-batch accept_len histograms (batch_size>1, all target rounds); "
+                        "each step histogram is accept_len counts / batch_size; missing keys in a step count as 0."
+                    ),
+                },
             }
             self._sink.append_jsonl("analysis.jsonl", analysis)
 
@@ -497,7 +561,7 @@ class SSDProfiler:
                 self._inter_verify_count_by_seq[sid] = self._inter_verify_count_by_seq.get(sid, 0) + 1
 
     def _accumulate_metadata_analysis(self, seqs: list[Any], trace: Any) -> None:
-        """Target-round counters and per-step batch accept histograms for ``analysis.jsonl``."""
+        """Target-round counters; multi-seq target batches contribute to averaged batch histogram."""
         if not wants_metadata_analysis_file(self._mode):
             return
         vms = getattr(trace, "verification_models", None)
@@ -523,15 +587,15 @@ class SSDProfiler:
                 tot = float(B)
                 ctr = Counter(vals)
                 hist = {str(k): ctr[k] / tot for k in sorted(ctr)}
-                st = self._state
-                step_id = int(st.step_id) if st is not None else -1
-                self._meta_batch_target_accept_dist.append(
-                    {
-                        "batch_size": B,
-                        "engine_step_id": step_id,
-                        "accept_len_histogram": hist,
-                    }
-                )
+                u = self._meta_batch_hist_union
+                s = self._meta_batch_hist_sums
+                for k_str, p in hist.items():
+                    s[k_str] += p
+                for k_str in u:
+                    if k_str not in hist:
+                        s[k_str] += 0.0
+                u.update(hist.keys())
+                self._meta_batch_hist_batches += 1
 
     def _record_profile_accept_samples(self, seqs: list[Any], trace: Any) -> None:
         """Collect accept_len stats from ``VerifyProfileTrace`` for cost_breakdown (all spec policies)."""
