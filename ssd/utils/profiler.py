@@ -158,7 +158,7 @@ class ProfilerSink:
 
 class _ProfilerProtocol(Protocol):
     def start_run(self, config: Any, tokenizer: Any) -> None: ...
-    def finish_run(self) -> None: ...
+    def finish_run(self, *, preempt_count: int = 0) -> None: ...
     def start_step(self, seqs: list[Any], is_prefill: bool) -> None: ...
     def finish_step(self, num_output_tokens: int) -> None: ...
     def start_stage(self, stage_name: str) -> None: ...
@@ -181,7 +181,7 @@ class _NoOpProfiler:
     def start_run(self, config: Any, tokenizer: Any) -> None:
         return
 
-    def finish_run(self) -> None:
+    def finish_run(self, *, preempt_count: int = 0) -> None:
         return
 
     def start_step(self, seqs: list[Any], is_prefill: bool) -> None:
@@ -313,7 +313,7 @@ class SSDProfiler:
             except Exception:
                 self._kernel_prof = None
 
-    def finish_run(self) -> None:
+    def finish_run(self, *, preempt_count: int = 0) -> None:
         if self._kernel_prof is not None:
             try:
                 self._kernel_prof.__exit__(None, None, None)
@@ -354,8 +354,12 @@ class SSDProfiler:
                 "num_verification": self._num_verification_requests,
                 "num_intermediate_verification": self._num_intermediate_verification_requests,
                 "num_target_verification": self._num_target_verification_requests,
+                "num_preemption": int(preempt_count),
                 "notes": {
-                    "num_prefill_token": "sum of per-prefill-engine-step token counts passed to finish_step",
+                    "num_prefill_token": (
+                        "sum over prefill engine steps of per-seq ``1 if remain==0 else remain`` "
+                        "(``remain = len(seq) - seq.num_cached_tokens``), matching scheduler prefill_query_cost"
+                    ),
                     "num_decode_tokens": (
                         "sum of committed completion tokens per decode engine step (delta of "
                         "Sequence.num_completion_tokens); LLMEngine passes this when profiler_mode is "
@@ -364,6 +368,9 @@ class SSDProfiler:
                     "throughput": "num_decode_tokens / execution_wall_time_s (decode tokens over total step wall)",
                     "num_draft": "cumulative count of requests entering draft stage",
                     "num_verification": "cumulative count of requests entering verification stage",
+                    "num_preemption": (
+                        "Scheduler.preempt() call count for this run (decode-time KV ejection / requeue)"
+                    ),
                     "num_decode_engine_steps": "LLMEngine.step calls where is_prefill=False",
                     "avg_decode_scheduled_batch_size": (
                         "mean len(seqs) per decode engine step (scheduler batch for that step)"

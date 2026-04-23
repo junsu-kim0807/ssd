@@ -61,7 +61,9 @@ class VerifierHierarchical(VerifierBase):
             seq.hv_num_provisional_tokens = 0
         self.intermediate_runner.call("intermediate_run", seqs, True)
         for seq in seqs:
-            seq.num_inter_cached_tokens = seq.num_prompt_tokens
+            # Intermediate KV must match the same committed prefix as target after prefill
+            # (including tokens after the original prompt when re-prefilling after preempt).
+            seq.num_inter_cached_tokens = seq.num_tokens
         return VerifyResult([], [seq.recovery_token_id for seq in seqs], None, is_hv_intermediate=False)
 
     def _verify_intermediate_round(

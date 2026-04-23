@@ -61,6 +61,8 @@ class Scheduler:
 
         self.waiting: deque[Sequence] = deque()
         self.running: deque[Sequence] = deque()
+        # Decode-time preemptions (``preempt()``); compare across policies / batch sizes.
+        self.preempt_count: int = 0
 
     def hv_target_lookahead_upper(self) -> int:
         """Worst-case length of one target HV verify pass (see VerifierHierarchical._build_target_candidates)."""
@@ -225,6 +227,7 @@ class Scheduler:
 
     def preempt(self, seq: Sequence):
         # print(f"[_preempt] Seq {seq.seq_id}: preempting sequence", flush=True)
+        self.preempt_count += 1
         seq.status = SequenceStatus.WAITING
         seq.recovery_token_id = None
         self.block_manager.deallocate(seq)
@@ -239,9 +242,11 @@ class Scheduler:
             seq.inter_block_table.clear()
         self.waiting.appendleft(seq) # self.running handled in schedule() when preempt called
 
-        # ── instead, absorb completions as "new prompt" so we re-cache them next prefill
-        seq.num_prompt_tokens = seq.num_tokens
-        # reinit like it's new, this can be a flag for "am on first spec step"
+        # Do not change ``num_prompt_tokens``: completion accounting and ``max_new_tokens`` use
+        # ``num_completion_tokens = num_tokens - num_prompt_tokens``. Re-labeling completions as
+        # prompt would reset the budget and corrupt metrics after re-prefill.
+        if __debug__:
+            assert seq.num_prompt_tokens <= seq.num_tokens
         seq.last_spec_step_accepted_len = -1
         seq.intermediate_last_spec_step_accepted_len = -1
         seq.target_last_spec_step_accepted_len = -1

@@ -242,6 +242,7 @@ def test_cost_breakdown_finish_run_writes_json(tmp_path):
     data = json.loads(out.read_text())
     assert data["num_decode_engine_steps"] == 1
     assert data["num_decode_tokens"] == 1
+    assert data["num_preemption"] == 0
     assert abs(data["avg_decode_scheduled_batch_size"] - 1.0) < 1e-9
     assert data["num_prefill_token"] == 0
     assert data["throughput"] > 0

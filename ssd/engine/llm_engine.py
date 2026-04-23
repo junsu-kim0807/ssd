@@ -468,7 +468,7 @@ class LLMEngine:
             if use_tqdm:
                 pbar.close()
         finally:
-            self.profiler.finish_run()
+            self.profiler.finish_run(preempt_count=self.scheduler.preempt_count)
 
         if not stream_callback:
             self.log_metrics()

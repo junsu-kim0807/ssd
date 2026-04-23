@@ -40,6 +40,12 @@ class AutoRegressiveStep(InferenceStep):
         if __debug__:
             print(f'[auto_regressive_step] is_prefill={is_prefill}', flush=True)
 
+        prefill_query_tokens = 0
+        if is_prefill:
+            for seq in seqs:
+                remain = len(seq) - seq.num_cached_tokens
+                prefill_query_tokens += 1 if remain == 0 else remain
+
         token_ids = self.model_runner.call("run", seqs, is_prefill)
 
         if __debug__:
@@ -47,7 +53,7 @@ class AutoRegressiveStep(InferenceStep):
             print(f"[auto_regressive_step] generated tokens: {decoded_tokens}", flush=True)
 
         self.scheduler.postprocess(seqs, token_ids, is_prefill)
-        return len(seqs) if not is_prefill else sum(len(seq) for seq in seqs)
+        return len(seqs) if not is_prefill else prefill_query_tokens
 
     def prefill(self, seqs: list[Sequence]) -> int:
         return self.step(seqs, is_prefill=True)
@@ -116,6 +122,11 @@ class SpecDecodeStep(InferenceStep):
         # Prefill timing: only the outer engine step wall (LLMEngine start_step/finish_step).
         # No inner draft_prefill/target_prefill stages and no per-request JSONL rows — all profiler modes.
 
+        actual_prefill_tokens = 0
+        for seq in seqs:
+            remain = len(seq) - seq.num_cached_tokens
+            actual_prefill_tokens += 1 if remain == 0 else remain
+
         if not self.eagle and self.async_spec:
             empty_verify_result = VerifyResult([], [], None)
             self.speculator.prefill(seqs, empty_verify_result)
@@ -126,12 +137,15 @@ class SpecDecodeStep(InferenceStep):
 
         for seq in seqs:
             assert seq.recovery_token_id is not None
-            seq.num_cached_tokens = seq.num_prompt_tokens
-            seq.num_draft_cached_tokens = seq.num_prompt_tokens
+            # After (re)prefill, target/draft KV cover the full committed tape ``token_ids``
+            # (``num_tokens``); keep prompt boundary only in ``num_prompt_tokens``.
+            ntok = seq.num_tokens
+            seq.num_cached_tokens = ntok
+            seq.num_draft_cached_tokens = ntok
             if getattr(self.scheduler, "hierarchical", False):
-                seq.num_inter_cached_tokens = seq.num_prompt_tokens
+                seq.num_inter_cached_tokens = ntok
 
-        return sum(len(seq) for seq in seqs)
+        return actual_prefill_tokens
 
     def decode(self, seqs: list[Sequence]) -> int:
         _prof = os.environ.get("SSD_PROFILE", "0") == "1"
