@@ -51,6 +51,8 @@ _REPO_ROOT = Path(__file__).resolve().parent.parent
 # Mirror bench/bench_helpers.py (bench.py HF presets); keep in sync if defaults change.
 # Hierarchical default intermediates (when bench ``--intermediate`` omitted): Qwen3-8B | Gemma-4-E4B-it |
 # Llama-3.1-8B-Instruct | Vicuna-7B (vicuna13b_160m preset only); see ``resolve_intermediate_model_path``.
+BENCH_PRESET_LLAMA_TARGET = "meta-llama/Llama-3.3-70B-Instruct"
+BENCH_PRESET_LLAMA_DRAFT = "meta-llama/Llama-3.2-1B-Instruct"
 BENCH_PRESET_QWEN_TARGET = "Qwen/Qwen3-32B"
 BENCH_PRESET_QWEN_DRAFT = "Qwen/Qwen3-0.6B"
 BENCH_PRESET_GEMMA_TARGET = "google/gemma-4-31B-it"
@@ -70,7 +72,7 @@ DEFAULT_MEM_PER_GPU = "128G"
 DEFAULT_TIME_LIMIT = "04:00:00"
 DEFAULT_CPUS_PER_TASK = 16
 
-BATCH_SWEEP = (1, 4, 16, 64, 256)
+BATCH_SWEEP = (1, 16, 32, 64, 128)
 K_SWEEP = (3, 5, 7, 9)
 TEMP_SWEEP = (0.0, 0.3, 0.7, 1.0)
 
@@ -93,6 +95,7 @@ MULTI_DATASET_PROFILE_SLUGS: tuple[str, ...] = (
 
 MODEL_PRESETS: dict[str, tuple[str, str, str]] = {
     # family -> (bench flag name, target hub id, draft hub id)
+    "llama": ("llama", BENCH_PRESET_LLAMA_TARGET, BENCH_PRESET_LLAMA_DRAFT),
     "qwen": ("qwen", BENCH_PRESET_QWEN_TARGET, BENCH_PRESET_QWEN_DRAFT),
     "gemma": ("gemma", BENCH_PRESET_GEMMA_TARGET, BENCH_PRESET_GEMMA_DRAFT),
     "vicuna13b_160m": (
@@ -103,6 +106,11 @@ MODEL_PRESETS: dict[str, tuple[str, str, str]] = {
 }
 
 DEFAULT_GPU_BY_FAMILY_METHOD: dict[tuple[str, str], int] = {
+    ("llama", "ar"): 4,
+    ("llama", "sync"): 4,
+    ("llama", "async"): 4,
+    ("llama", "hierarchical"): 4,
+    ("llama", "pivot"): 4,
     ("qwen", "ar"): 2,
     ("qwen", "sync"): 2,
     ("qwen", "async"): 3,
@@ -648,8 +656,8 @@ def main() -> None:
     p.add_argument(
         "--models",
         type=str,
-        default="qwen,gemma,vicuna13b_160m",
-        help="Comma-separated model families (qwen | gemma | vicuna13b_160m)",
+        default="qwen,llama",
+        help="Comma-separated model families (qwen | gemma | vicuna13b_160m | llama)",
     )
     p.add_argument(
         "--methods",
@@ -700,7 +708,7 @@ def main() -> None:
     p.add_argument(
         "--profile-mode",
         type=str,
-        default="cost_metadata",
+        default="cost",
         choices=PROFILE_MODE_CHOICES,
         help="bench.py --profile_mode (cost | metadata | cost_metadata)",
     )
