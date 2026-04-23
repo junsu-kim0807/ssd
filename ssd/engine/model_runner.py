@@ -476,6 +476,13 @@ class ModelRunner:
             gbs = (self.graph_bs_list.get("verify_varlen_bucket") or {}).get(bucket_q_len, [])
         return bool(gbs) and max(gbs) >= num_seqs
 
+    def _debug_eager_fallback_log(self, component: str, reason: str, **details: object) -> None:
+        """When ``config.debug_mode`` (bench ``--debug``), log CUDAGraph bypass / eager verify paths (rank 0 only)."""
+        if not getattr(self.config, "debug_mode", False) or getattr(self, "rank", 0) != 0:
+            return
+        extra = "".join(f" {k}={v!r}" for k, v in details.items())
+        print(f"[eager_fallback] {component} reason={reason!r}{extra}", flush=True)
+
     def run_intermediate_verify_cudagraph(self, input_ids: torch.Tensor, positions: torch.Tensor, bucket_q_len: int):
         k1 = self.config.speculate_k + 1
         model = (
@@ -929,14 +936,44 @@ class ModelRunner:
         if self.config.enforce_eager or not getattr(
             self.config, "enable_target_verify_varlen_cudagraph", True
         ):
+            self._debug_eager_fallback_log(
+                "run_verify_varlen",
+                "eager_config",
+                enforce_eager=bool(self.config.enforce_eager),
+                enable_target_verify_varlen_cudagraph=bool(
+                    getattr(self.config, "enable_target_verify_varlen_cudagraph", True)
+                ),
+                max_L=max_L,
+                nseq=nseq,
+            )
             return _eager_forward()
 
         bucket_q = K1 if max_L <= K1 else self._select_target_verify_bucket(max_L)
         if bucket_q is None or not self._target_verify_graph_bs_ok(bucket_q, nseq):
+            self._debug_eager_fallback_log(
+                "run_verify_varlen",
+                "no_bucket_or_bs_too_small",
+                max_L=max_L,
+                nseq=nseq,
+                bucket_q=bucket_q,
+                strides_eager=strides_eager,
+            )
             return _eager_forward()
         if bucket_q == K1 and "verify" not in self.graph_vars:
+            self._debug_eager_fallback_log(
+                "run_verify_varlen",
+                "missing_cudagraph_verify_exact",
+                bucket_q=bucket_q,
+                nseq=nseq,
+            )
             return _eager_forward()
         if bucket_q != K1 and bucket_q not in (self.graph_vars.get("verify_varlen_bucket") or {}):
+            self._debug_eager_fallback_log(
+                "run_verify_varlen",
+                "missing_cudagraph_varlen_bucket",
+                bucket_q=bucket_q,
+                nseq=nseq,
+            )
             return _eager_forward()
 
         try:
@@ -1086,6 +1123,32 @@ class ModelRunner:
                 return logits_flat, score_starts, packed_q_lens
             finally:
                 reset_context()
+
+        graph_ok = (
+            bucket_q is not None
+            and self._intermediate_verify_graph_bs_ok(bucket_q, nseq)
+        )
+        if not graph_ok:
+            self._debug_eager_fallback_log(
+                "run_intermediate_verify_suffix",
+                "eager_not_cudagraph",
+                use_cg=use_cg,
+                max_actual_q=max_actual_q,
+                k1=k1,
+                bucket_q=bucket_q,
+                nseq=nseq,
+                needs_eager_k1=self._intermediate_colocated_verify_needs_eager(k1),
+                needs_eager_bucket=(
+                    self._intermediate_colocated_verify_needs_eager(bucket_q)
+                    if bucket_q is not None
+                    else None
+                ),
+                graph_bs_ok=(
+                    self._intermediate_verify_graph_bs_ok(bucket_q, nseq)
+                    if bucket_q is not None
+                    else False
+                ),
+            )
 
         force_eager = True
         try:
