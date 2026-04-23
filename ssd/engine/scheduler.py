@@ -267,8 +267,10 @@ class Scheduler:
         for seq, token_id in zip(seqs, token_ids):
             seq.append_token(token_id)
             if is_prefill:
-                seq.num_cached_tokens = seq.num_prompt_tokens # no draft needed
-            else: 
+                # Match committed tape (including completions after preempt + re-prefill); do not
+                # use ``num_prompt_tokens`` alone or AR would under-cache when ``num_tokens`` is larger.
+                seq.num_cached_tokens = seq.num_tokens
+            else:
                 seq.num_cached_tokens += 1
             if (not seq.ignore_eos and token_id == self.eos) or seq.num_completion_tokens == seq.max_new_tokens:
                 seq.status = SequenceStatus.FINISHED
