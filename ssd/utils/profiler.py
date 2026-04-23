@@ -10,7 +10,9 @@ prefill JSONL rows, in any ``profiler_mode``.
 
 For ``cost_breakdown`` / ``cost_metadata``, ``finish_step`` decode counts are
 committed completion tokens (``num_completion_tokens`` delta), not the raw
-``decode()`` return value.
+``decode()`` return value; that sum matches total new output (completion) tokens
+per engine step across the scheduled batch (same as ``num_decode_tokens`` in
+``cost_breakdown.json`` when summed over the run).
 """
 
 from __future__ import annotations
@@ -269,6 +271,14 @@ class SSDProfiler:
         self._hv_target_accept_samples: list[int] = []
         self._hv_inter_target_prefix_samples: list[int] = []
 
+        # cost_breakdown / cost_metadata: scheduled decode batch size (len(seqs) per decode step)
+        self._decode_sched_batch_sum: int = 0
+        # hierarchical: verify-round batch sizes (intermediate vs target steps)
+        self._hv_cost_inter_batch_sum: int = 0
+        self._hv_cost_inter_batch_steps: int = 0
+        self._hv_cost_target_batch_sum: int = 0
+        self._hv_cost_target_batch_steps: int = 0
+
         # Per-seq observation counters (not sequence semantics)
         self._inter_verify_count_by_seq: dict[int, int] = {}
         self._target_verify_count_by_seq: dict[int, int] = {}
@@ -335,6 +345,11 @@ class SSDProfiler:
                 "draft_worker_wall_time_s": self._run_draft_worker_s,
                 "num_prefill_engine_steps": self._num_prefill_engine_steps,
                 "num_decode_engine_steps": self._num_decode_engine_steps,
+                "avg_decode_scheduled_batch_size": (
+                    float(self._decode_sched_batch_sum) / float(self._num_decode_engine_steps)
+                    if self._num_decode_engine_steps
+                    else None
+                ),
                 "num_draft": self._num_draft_requests,
                 "num_verification": self._num_verification_requests,
                 "num_intermediate_verification": self._num_intermediate_verification_requests,
@@ -350,6 +365,9 @@ class SSDProfiler:
                     "num_draft": "cumulative count of requests entering draft stage",
                     "num_verification": "cumulative count of requests entering verification stage",
                     "num_decode_engine_steps": "LLMEngine.step calls where is_prefill=False",
+                    "avg_decode_scheduled_batch_size": (
+                        "mean len(seqs) per decode engine step (scheduler batch for that step)"
+                    ),
                     "prefill_wall_time_s": (
                         "sum of outer prefill step wall times only; prefill does not contribute to "
                         "draft_time_s / verification_time_s / sync_time_s / postprocess_time_s below"
@@ -378,6 +396,16 @@ class SSDProfiler:
                 payload["hierarchical_target_verification_time_s"] = self._run_hv_target_verify_s
                 payload["avg_intermediate_accept_len"] = _avg(self._hv_inter_accept_samples)
                 payload["avg_inter_target_prefix_accept_len"] = _avg(self._hv_inter_target_prefix_samples)
+                payload["hv_avg_verify_batch_size_intermediate"] = (
+                    float(self._hv_cost_inter_batch_sum) / float(self._hv_cost_inter_batch_steps)
+                    if self._hv_cost_inter_batch_steps
+                    else None
+                )
+                payload["hv_avg_verify_batch_size_target"] = (
+                    float(self._hv_cost_target_batch_sum) / float(self._hv_cost_target_batch_steps)
+                    if self._hv_cost_target_batch_steps
+                    else None
+                )
                 payload["notes"]["hierarchical_intermediate_verification_time_s"] = (
                     "sum of verify wall time on intermediate rounds only (spec_policy=hierarchical)"
                 )
@@ -387,6 +415,12 @@ class SSDProfiler:
                 payload["notes"]["avg_inter_target_prefix_accept_len"] = (
                     "mean over target-verify rows: greedy matches along candidate prefix excluding the last K tokens "
                     "(K=num_speculative_token / speculate_k)"
+                )
+                payload["notes"]["hv_avg_verify_batch_size_intermediate"] = (
+                    "mean len(seqs) on decode steps whose verify round was intermediate (HV)"
+                )
+                payload["notes"]["hv_avg_verify_batch_size_target"] = (
+                    "mean len(seqs) on decode steps whose verify round was target (HV)"
                 )
             self._sink.write_cost_breakdown(payload)
 
@@ -475,6 +509,7 @@ class SSDProfiler:
             self._run_prefill_tokens += int(num_output_tokens)
         else:
             self._num_decode_engine_steps += 1
+            self._decode_sched_batch_sum += int(st.batch_size)
             self._run_decode_tokens += int(num_output_tokens)
             # Decode steps only: stage timers and async worker scalars (prefill uses outer wall only).
             if self._draft_async:
@@ -619,11 +654,39 @@ class SSDProfiler:
                 if ial is not None and i < len(ial) and ial[i] is not None:
                     self._hv_inter_accept_samples.append(int(ial[i]))
 
+    def _accum_hv_cost_verify_batch_size(
+        self, seqs: list[Any], verify_result: Any, trace: Any | None
+    ) -> None:
+        if not wants_cost_aggregates(self._mode) or self._spec_policy != "hierarchical":
+            return
+        bsz = len(seqs)
+        is_inter: bool | None = None
+        if trace is not None:
+            vms = getattr(trace, "verification_models", None)
+            if not vms or len(vms) != len(seqs):
+                return
+            tgt_vm = frozenset({"target", "pivot_target"})
+            if all(vm == "intermediate" for vm in vms):
+                is_inter = True
+            elif all(vm in tgt_vm for vm in vms):
+                is_inter = False
+        else:
+            is_inter = bool(getattr(verify_result, "is_hv_intermediate", False))
+        if is_inter is None:
+            return
+        if is_inter:
+            self._hv_cost_inter_batch_sum += bsz
+            self._hv_cost_inter_batch_steps += 1
+        else:
+            self._hv_cost_target_batch_sum += bsz
+            self._hv_cost_target_batch_steps += 1
+
     def record_decode_verify_batch(self, seqs: list[Any], verify_result: Any) -> None:
         n = len(seqs)
+        trace = getattr(verify_result, "profile_trace", None)
+        self._accum_hv_cost_verify_batch_size(seqs, verify_result, trace)
         if self._state is not None:
             self._state.num_verification_requests_step = n
-        trace = getattr(verify_result, "profile_trace", None)
         if trace is not None:
             self.record_verify_step(seqs, trace)
             self._record_profile_accept_samples(seqs, trace)

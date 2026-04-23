@@ -242,6 +242,7 @@ def test_cost_breakdown_finish_run_writes_json(tmp_path):
     data = json.loads(out.read_text())
     assert data["num_decode_engine_steps"] == 1
     assert data["num_decode_tokens"] == 1
+    assert abs(data["avg_decode_scheduled_batch_size"] - 1.0) < 1e-9
     assert data["num_prefill_token"] == 0
     assert data["throughput"] > 0
     assert "avg_target_accept_len" in data
@@ -262,9 +263,17 @@ def test_cost_breakdown_hierarchical_fields(tmp_path):
         seq_id = 0
 
     p.start_run(SimpleNamespace(), None)
-    p.start_step([S()], is_prefill=False)
+    p.start_step([S(), S()], is_prefill=False)
     p.accum_hierarchical_verify_time(0.02, True)
+    p.record_decode_verify_batch(
+        [S(), S()], SimpleNamespace(profile_trace=None, is_hv_intermediate=True)
+    )
+    p.finish_step(1)
+    p.start_step([S(), S()], is_prefill=False)
     p.accum_hierarchical_verify_time(0.05, False)
+    p.record_decode_verify_batch(
+        [S(), S()], SimpleNamespace(profile_trace=None, is_hv_intermediate=False)
+    )
     p.finish_step(1)
     tr_i = SimpleNamespace(
         verification_models=["intermediate"],
@@ -284,6 +293,9 @@ def test_cost_breakdown_hierarchical_fields(tmp_path):
     assert abs(data["avg_target_accept_len"] - 2.0) < 1e-6
     assert abs(data["avg_inter_target_prefix_accept_len"] - 1.0) < 1e-6
     assert abs(data["avg_intermediate_accept_len"] - 3.0) < 1e-6
+    assert abs(data["avg_decode_scheduled_batch_size"] - 2.0) < 1e-9
+    assert abs(data["hv_avg_verify_batch_size_intermediate"] - 2.0) < 1e-9
+    assert abs(data["hv_avg_verify_batch_size_target"] - 2.0) < 1e-9
 
 
 def test_profile_greedy_token_confidence_not_all_ones():

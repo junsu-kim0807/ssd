@@ -48,7 +48,14 @@ from ssd.engine.helpers.cudagraph_helpers import (
     capture_glue_decode_cudagraph,
     get_custom_mask,
 )
-    
+
+# ---------------------------------------------------------------------------
+# [REMOVE_ME HV_EAGER_FALLBACK_LOG] Hierarchical CUDAGraph→eager bypass: log on
+# rank0 without bench --debug. Set False or delete this block and the branch in
+# ``_debug_eager_fallback_log`` to restore debug-only logging.
+_LOG_HV_EAGER_FALLBACK_WITHOUT_DEBUG = True
+# ---------------------------------------------------------------------------
+
 
 class ModelRunner:
 
@@ -477,11 +484,24 @@ class ModelRunner:
         return bool(gbs) and max(gbs) >= num_seqs
 
     def _debug_eager_fallback_log(self, component: str, reason: str, **details: object) -> None:
-        """When ``config.debug_mode`` (bench ``--debug``), log CUDAGraph bypass / eager verify paths (rank 0 only)."""
-        if not getattr(self.config, "debug_mode", False) or getattr(self, "rank", 0) != 0:
+        """Log CUDAGraph bypass / eager verify paths on rank 0.
+
+        With ``--debug``: always logs. With hierarchical and
+        ``_LOG_HV_EAGER_FALLBACK_WITHOUT_DEBUG``: logs even without ``--debug``,
+        prefixed with ``[REMOVE_ME HV_EAGER_FALLBACK_LOG]`` for easy removal.
+        """
+        if getattr(self, "rank", 0) != 0:
             return
         extra = "".join(f" {k}={v!r}" for k, v in details.items())
-        print(f"[eager_fallback] {component} reason={reason!r}{extra}", flush=True)
+        line = f"[eager_fallback] {component} reason={reason!r}{extra}"
+        if getattr(self.config, "debug_mode", False):
+            print(line, flush=True)
+            return
+        if (
+            _LOG_HV_EAGER_FALLBACK_WITHOUT_DEBUG
+            and getattr(self.config, "spec_policy", "") == "hierarchical"
+        ):
+            print(f"[REMOVE_ME HV_EAGER_FALLBACK_LOG] {line}", flush=True)
 
     def run_intermediate_verify_cudagraph(self, input_ids: torch.Tensor, positions: torch.Tensor, bucket_q_len: int):
         k1 = self.config.speculate_k + 1
