@@ -2,42 +2,61 @@ import os
 import torch
 import numpy as np
 from typing import List
+from ssd.config import _decoder_cfg
 from ssd.utils.context import set_context, get_context, reset_context
 from ssd.engine.helpers.mask_helpers import get_custom_mask
 from time import perf_counter
 
 
+def _decoder_hf_for_verify_capture(model_runner, model_override: torch.nn.Module):
+    im = getattr(model_runner, "intermediate_model", None)
+    if im is not None and model_override is im:
+        assert model_runner.intermediate_shard_cfg is not None
+        return _decoder_cfg(model_runner.intermediate_shard_cfg.hf_config)
+    return model_runner.decoder_hf_config
+
+
 ## RUN CUDAGRAPHS
 @torch.inference_mode()
-def run_verify_cudagraph(model_runner, input_ids, positions, last_only, graph_vars):
+def run_verify_cudagraph_generic(
+    model_runner,
+    input_ids,
+    positions,
+    last_only,
+    graph_vars,
+    graphs: dict,
+    graph_bs_list: list,
+    q_len: int,
+    logits_model: torch.nn.Module,
+):
+    """Replay a captured verify CUDAGraph with fixed per-sequence query length ``q_len``."""
     context = get_context()
-    k_plus_1 = model_runner.config.speculate_k + 1
-    orig_bs = input_ids.size(0) // k_plus_1  # orig_bs = N here
+    orig_bs = input_ids.size(0) // q_len
 
-    wrapper_bs = next(
-        x for x in model_runner.graph_bs_list["verify"] if x >= orig_bs)
-    graph = model_runner.graphs["verify"][wrapper_bs]
+    wrapper_bs = next(x for x in graph_bs_list if x >= orig_bs)
+    graph = graphs[wrapper_bs]
 
     for k, v in graph_vars.items():
         if k != "outputs":
             v.zero_()
 
-    # Pad to graph bucket size if needed (fixes B>=6 crash from non-monotonic cu_seqlens_q)
     if wrapper_bs > orig_bs:
         pad_bs = wrapper_bs - orig_bs
-        pad_flat = pad_bs * k_plus_1
+        pad_flat = pad_bs * q_len
         dev = input_ids.device
 
         input_ids = torch.cat([input_ids, torch.zeros(pad_flat, dtype=input_ids.dtype, device=dev)])
         positions = torch.cat([positions, torch.zeros(pad_flat, dtype=positions.dtype, device=dev)])
-        slot_mapping = torch.cat([
-            context.slot_mapping,
-            torch.full((pad_flat,), -1, dtype=context.slot_mapping.dtype, device=dev)])
-        # Repeat last real row for ghost sequences (valid page table / context len)
+        slot_mapping = torch.cat(
+            [
+                context.slot_mapping,
+                torch.full((pad_flat,), -1, dtype=context.slot_mapping.dtype, device=dev),
+            ]
+        )
         bt = context.block_tables
         cl = context.context_lens
-        block_tables = torch.cat([bt, bt[orig_bs-1:orig_bs].expand(pad_bs, -1).contiguous()])
-        context_lens = torch.cat([cl, cl[orig_bs-1:orig_bs].expand(pad_bs).contiguous()])
+        block_tables = torch.cat([bt, bt[orig_bs - 1 : orig_bs].expand(pad_bs, -1).contiguous()])
+        context_lens = torch.cat([cl, cl[orig_bs - 1 : orig_bs].expand(pad_bs).contiguous()])
         bs = wrapper_bs
     else:
         slot_mapping = context.slot_mapping
@@ -45,19 +64,17 @@ def run_verify_cudagraph(model_runner, input_ids, positions, last_only, graph_va
         context_lens = context.context_lens
         bs = orig_bs
 
-    graph_vars["input_ids"][:bs * k_plus_1] = input_ids
-    graph_vars["positions"][:bs * k_plus_1] = positions
-    graph_vars["slot_mapping"][:bs * k_plus_1] = slot_mapping
+    graph_vars["input_ids"][: bs * q_len] = input_ids
+    graph_vars["positions"][: bs * q_len] = positions
+    graph_vars["slot_mapping"][: bs * q_len] = slot_mapping
     graph_vars["context_lens"][:bs] = context_lens
-    # Construct cu_seqlens_q for FULL padded batch (monotonically increasing)
-    seqlen_q = torch.full(
-        (bs,), k_plus_1, dtype=torch.int32, device=graph_vars["cu_seqlens_q"].device)
-    cu = graph_vars["cu_seqlens_q"][:bs + 1]
+    seqlen_q = torch.full((bs,), q_len, dtype=torch.int32, device=graph_vars["cu_seqlens_q"].device)
+    cu = graph_vars["cu_seqlens_q"][: bs + 1]
     cu.zero_()
     cu[1:].copy_(torch.cumsum(seqlen_q, 0))
 
     if block_tables is not None:
-        graph_vars["block_tables"][:bs, :block_tables.size(1)] = block_tables
+        graph_vars["block_tables"][:bs, : block_tables.size(1)] = block_tables
 
     _pt = os.environ.get("SSD_PROFILE_TARGET", "0") == "1"
     if _pt:
@@ -70,21 +87,39 @@ def run_verify_cudagraph(model_runner, input_ids, positions, last_only, graph_va
         torch.cuda.synchronize()
         _t1 = perf_counter()
 
-    # Extract outputs for the ORIGINAL batch size only
-    outputs = graph_vars["outputs"][:orig_bs * k_plus_1]
-    logits = model_runner.model.compute_logits(outputs, last_only)
+    outputs = graph_vars["outputs"][: orig_bs * q_len]
+    logits = logits_model.compute_logits(outputs, last_only)
 
     if _pt:
         torch.cuda.synchronize()
         _t2 = perf_counter()
         has_eagle = "eagle_acts" in graph_vars
-        print(f"[PROFILE verify_cg] replay={(_t1-_t0)*1000:.2f}ms logits={(_t2-_t1)*1000:.2f}ms eagle={has_eagle} bs={orig_bs} rank={model_runner.rank}", flush=True)
+        print(
+            f"[PROFILE verify_cg] replay={(_t1-_t0)*1000:.2f}ms logits={(_t2-_t1)*1000:.2f}ms "
+            f"eagle={has_eagle} bs={orig_bs} q_len={q_len} rank={model_runner.rank}",
+            flush=True,
+        )
 
-    # For eagle target, also return eagle_acts
     if "eagle_acts" in graph_vars:
-        eagle_acts = graph_vars["eagle_acts"][:orig_bs * k_plus_1]
+        eagle_acts = graph_vars["eagle_acts"][: orig_bs * q_len]
         return logits, eagle_acts
     return logits
+
+
+@torch.inference_mode()
+def run_verify_cudagraph(model_runner, input_ids, positions, last_only, graph_vars):
+    k_plus_1 = model_runner.config.speculate_k + 1
+    return run_verify_cudagraph_generic(
+        model_runner,
+        input_ids,
+        positions,
+        last_only,
+        graph_vars,
+        model_runner.graphs["verify"],
+        model_runner.graph_bs_list["verify"],
+        k_plus_1,
+        model_runner.model,
+    )
 
 
 @torch.inference_mode()
@@ -537,34 +572,43 @@ def capture_cudagraph(model_runner):
 
 
 @torch.inference_mode()
-def capture_verify_cudagraph(model_runner):
+def capture_verify_cudagraph_generic(
+    model_runner,
+    *,
+    model_override: torch.nn.Module,
+    q_len: int,
+):
+    """Capture verify-style CUDAGraphs: fixed ``q_len`` tokens per sequence, varlen batch layout."""
     config = model_runner.config
-    # assert not model_runner.is_draft, "ERROR in capture_verify_cudagraph: verify path only supported for target model"
-    hf_config = model_runner.decoder_hf_config
+    hf_config = _decoder_hf_for_verify_capture(model_runner, model_override)
     max_bs = min(model_runner.config.max_num_seqs, 512)
-    k_plus_1 = model_runner.config.speculate_k + 1
+    dev = model_runner.device
 
-    is_eagle_target = config.use_eagle and not model_runner.is_draft
+    is_eagle_target = (
+        config.use_eagle
+        and not model_runner.is_draft
+        and model_override is model_runner.model
+    )
 
-    # For verify, we need to handle k+1 tokens per sequence, and use cu_seqlens_q and max_seqlen_q
-    input_ids = torch.zeros(max_bs * k_plus_1, dtype=torch.int64)
-    positions = torch.zeros(max_bs * k_plus_1, dtype=torch.int64)
-    slot_mapping = torch.zeros(max_bs * k_plus_1, dtype=torch.int32)
-    context_lens = torch.zeros(max_bs, dtype=torch.int32)
-    block_tables = torch.zeros(
-        max_bs, model_runner.max_num_blocks, dtype=torch.int32)
-    outputs = torch.zeros(max_bs * k_plus_1, hf_config.hidden_size)
-    cu_seqlens_q = torch.zeros(max_bs + 1, dtype=torch.int32)
+    input_ids = torch.zeros(max_bs * q_len, dtype=torch.int64, device=dev)
+    positions = torch.zeros(max_bs * q_len, dtype=torch.int64, device=dev)
+    slot_mapping = torch.zeros(max_bs * q_len, dtype=torch.int32, device=dev)
+    context_lens = torch.zeros(max_bs, dtype=torch.int32, device=dev)
+    block_tables = torch.zeros(max_bs, model_runner.max_num_blocks, dtype=torch.int32, device=dev)
+    outputs = torch.zeros(max_bs * q_len, hf_config.hidden_size, device=dev)
+    cu_seqlens_q = torch.zeros(max_bs + 1, dtype=torch.int32, device=dev)
 
-    # Eagle target: also capture eagle_acts from model forward
     eagle_acts = None
     if is_eagle_target:
-        # eagle_acts has shape [num_tokens, 3 * hidden_size] for 3 layers
-        eagle_acts = torch.zeros(max_bs * k_plus_1, 3 * hf_config.hidden_size,
-                                  dtype=hf_config.torch_dtype)
+        eagle_acts = torch.zeros(
+            max_bs * q_len,
+            3 * hf_config.hidden_size,
+            dtype=hf_config.torch_dtype,
+            device=dev,
+        )
 
     base = [1, 2, 4, 8]
-    dynamic = list(range(16, max_bs+1, 16))
+    dynamic = list(range(16, max_bs + 1, 16))
     all_b = base + dynamic
     if max_bs not in all_b:
         all_b.append(max_bs)
@@ -576,41 +620,36 @@ def capture_verify_cudagraph(model_runner):
 
     for bs in reversed(all_N):
         graph = torch.cuda.CUDAGraph()
-        # For verify, each sequence is length K+1, so seqlen_q is [K+1]*bs
-        seqlen_q = torch.full((bs,), k_plus_1, dtype=torch.int32)
-        cu = cu_seqlens_q[:bs + 1]
+        seqlen_q = torch.full((bs,), q_len, dtype=torch.int32, device=dev)
+        cu = cu_seqlens_q[: bs + 1]
         cu.zero_()
         cu[1:].copy_(torch.cumsum(seqlen_q, 0))
         context_lens[:bs] = seqlen_q
 
         set_context(
             is_prefill=False,
-            slot_mapping=slot_mapping[:bs * k_plus_1],
+            slot_mapping=slot_mapping[: bs * q_len],
             context_lens=context_lens[:bs],
             block_tables=block_tables[:bs],
             cu_seqlens_q=cu,
-            max_seqlen_q=k_plus_1,
+            max_seqlen_q=q_len,
         )
 
-        # warmup
-        model_out = model_runner.model(
-            input_ids[:bs * k_plus_1], positions[:bs * k_plus_1])
+        model_out = model_override(input_ids[: bs * q_len], positions[: bs * q_len])
         if isinstance(model_out, tuple):
-            outputs[:bs * k_plus_1] = model_out[0]
+            outputs[: bs * q_len] = model_out[0]
             if eagle_acts is not None:
-                eagle_acts[:bs * k_plus_1] = model_out[1]
+                eagle_acts[: bs * q_len] = model_out[1]
         else:
-            outputs[:bs * k_plus_1] = model_out
+            outputs[: bs * q_len] = model_out
         with torch.cuda.graph(graph, graph_pool):
-            # capture
-            model_out = model_runner.model(
-                input_ids[:bs * k_plus_1], positions[:bs * k_plus_1])
+            model_out = model_override(input_ids[: bs * q_len], positions[: bs * q_len])
             if isinstance(model_out, tuple):
-                outputs[:bs * k_plus_1] = model_out[0]
+                outputs[: bs * q_len] = model_out[0]
                 if eagle_acts is not None:
-                    eagle_acts[:bs * k_plus_1] = model_out[1]
+                    eagle_acts[: bs * q_len] = model_out[1]
             else:
-                outputs[:bs * k_plus_1] = model_out
+                outputs[: bs * q_len] = model_out
 
         if graph_pool is None:
             graph_pool = graph.pool()
@@ -631,6 +670,16 @@ def capture_verify_cudagraph(model_runner):
         graph_vars["eagle_acts"] = eagle_acts
 
     return graph_vars, graph_pool, graphs, all_N
+
+
+@torch.inference_mode()
+def capture_verify_cudagraph(model_runner):
+    k_plus_1 = model_runner.config.speculate_k + 1
+    return capture_verify_cudagraph_generic(
+        model_runner,
+        model_override=model_runner.model,
+        q_len=k_plus_1,
+    )
 
 
 @torch.inference_mode()

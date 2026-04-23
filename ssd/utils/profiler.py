@@ -316,13 +316,16 @@ class SSDProfiler:
                         "decode-only ordinal for decode rows (prefill engine steps are omitted so ids stay contiguous); "
                         "prefill rows still use engine step_id"
                     ),
+                    "avg_target_accept_len": (
+                        "mean of per-verify accept_len from profile traces (null if no trace rows with accept_len)"
+                    ),
                 },
             }
+            payload["avg_target_accept_len"] = _avg(self._hv_target_accept_samples)
             if self._spec_policy == "hierarchical":
                 payload["hierarchical_intermediate_verification_time_s"] = self._run_hv_inter_verify_s
                 payload["hierarchical_target_verification_time_s"] = self._run_hv_target_verify_s
                 payload["avg_intermediate_accept_len"] = _avg(self._hv_inter_accept_samples)
-                payload["avg_target_accept_len"] = _avg(self._hv_target_accept_samples)
                 payload["avg_inter_target_prefix_accept_len"] = _avg(self._hv_inter_target_prefix_samples)
                 payload["notes"]["hierarchical_intermediate_verification_time_s"] = (
                     "sum of verify wall time on intermediate rounds only (spec_policy=hierarchical)"
@@ -448,26 +451,27 @@ class SSDProfiler:
                 self._num_intermediate_verification_requests += 1
                 self._inter_verify_count_by_seq[sid] = self._inter_verify_count_by_seq.get(sid, 0) + 1
 
-    def _record_hierarchical_accept_samples(self, seqs: list[Any], trace: Any) -> None:
-        if self._spec_policy != "hierarchical":
-            return
+    def _record_profile_accept_samples(self, seqs: list[Any], trace: Any) -> None:
+        """Collect accept_len stats from ``VerifyProfileTrace`` for cost_breakdown (all spec policies)."""
         vms = getattr(trace, "verification_models", None)
         if not vms:
             return
+        hier = self._spec_policy == "hierarchical"
         for i, vm in enumerate(vms):
             if i >= len(seqs):
                 break
-            if vm == "intermediate":
-                ial = getattr(trace, "inter_accept_len", None)
-                if ial is not None and i < len(ial) and ial[i] is not None:
-                    self._hv_inter_accept_samples.append(int(ial[i]))
-            elif vm in ("target", "pivot_target"):
+            if vm in ("target", "pivot_target"):
                 al = getattr(trace, "accept_len", None)
                 if al is not None and i < len(al):
                     self._hv_target_accept_samples.append(int(al[i]))
-                itp = getattr(trace, "inter_target_prefix_accept_len", None)
-                if itp is not None and i < len(itp):
-                    self._hv_inter_target_prefix_samples.append(int(itp[i]))
+                if hier:
+                    itp = getattr(trace, "inter_target_prefix_accept_len", None)
+                    if itp is not None and i < len(itp):
+                        self._hv_inter_target_prefix_samples.append(int(itp[i]))
+            elif hier and vm == "intermediate":
+                ial = getattr(trace, "inter_accept_len", None)
+                if ial is not None and i < len(ial) and ial[i] is not None:
+                    self._hv_inter_accept_samples.append(int(ial[i]))
 
     def record_decode_verify_batch(self, seqs: list[Any], verify_result: Any) -> None:
         n = len(seqs)
@@ -476,7 +480,7 @@ class SSDProfiler:
         trace = getattr(verify_result, "profile_trace", None)
         if trace is not None:
             self.record_verify_step(seqs, trace)
-            self._record_hierarchical_accept_samples(seqs, trace)
+            self._record_profile_accept_samples(seqs, trace)
             return
         self._num_verification_requests += n
         if getattr(verify_result, "is_hv_intermediate", False):

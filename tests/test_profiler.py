@@ -92,6 +92,8 @@ def test_cost_breakdown_finish_run_writes_json(tmp_path):
     assert data["num_decode_tokens"] == 1
     assert data["num_prefill_token"] == 0
     assert data["throughput"] > 0
+    assert "avg_target_accept_len" in data
+    assert data["avg_target_accept_len"] is None
     assert "hierarchical_intermediate_verification_time_s" not in data
 
 
@@ -116,13 +118,13 @@ def test_cost_breakdown_hierarchical_fields(tmp_path):
         verification_models=["intermediate"],
         inter_accept_len=[3],
     )
-    p._record_hierarchical_accept_samples([S()], tr_i)
+    p._record_profile_accept_samples([S()], tr_i)
     tr = SimpleNamespace(
         verification_models=["target"],
         accept_len=[2],
         inter_target_prefix_accept_len=[1],
     )
-    p._record_hierarchical_accept_samples([S()], tr)
+    p._record_profile_accept_samples([S()], tr)
     p.finish_run()
     data = json.loads((tmp_path / "cost_breakdown.json").read_text())
     assert data["hierarchical_intermediate_verification_time_s"] == 0.02

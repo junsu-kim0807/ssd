@@ -72,6 +72,8 @@ class VerifierHierarchical(VerifierBase):
         prev_nics = [seq.num_inter_cached_tokens for seq in seqs]
 
         # Packed varlen: optional ``token_ids[nic:c0)`` gap rows + ``(K+1)`` scored tail.
+        # ``q_lens`` are packed per-sequence lengths (CUDAGraph bucket padding); scored rows are
+        # always ``logits_i[score_starts[b] : score_starts[b] + K + 1]``.
         logits_flat, score_starts, q_lens = self.intermediate_runner.call(
             "run_intermediate_verify_suffix", seqs, K
         )
@@ -168,7 +170,12 @@ class VerifierHierarchical(VerifierBase):
         candidates = self._build_target_candidates(seqs, speculate_result)
         # prepare_verify_tensors_varlen uses seq.num_cached_tokens as the KV frontier.
         # Do not bump num_cached_tokens before the call (that would shift positions/slots).
-        logits_flat = self.target_model_runner.call("run_verify_varlen", seqs, candidates)
+        logits_ret = self.target_model_runner.call("run_verify_varlen", seqs, candidates)
+        if isinstance(logits_ret, tuple):
+            logits_flat, q_strides = logits_ret
+        else:
+            logits_flat = logits_ret
+            q_strides = [len(candidates[i]) for i in range(len(seqs))]
         if logits_flat is not None and logits_flat.dim() == 3:
             logits_flat = logits_flat.reshape(-1, logits_flat.size(-1))
 
@@ -183,8 +190,9 @@ class VerifierHierarchical(VerifierBase):
         K = self.lookahead
         for i, _seq in enumerate(seqs):
             L = len(candidates[i])
-            logits_i = logits_flat[offset : offset + L]
-            offset += L
+            s = q_strides[i]
+            logits_i = logits_flat[offset : offset + s][:L]
+            offset += s
             cand = candidates[i]
             suffix, rec = verify_greedy_chain_variable(logits_i, cand)
             new_suffixes.append(suffix)

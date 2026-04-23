@@ -55,6 +55,13 @@ class Config:
     intermediate_hf_config: AutoConfig | None = None
     target_verify_interval: int = 1  # r: hv_round_idx 0..r-1 intermediate; hv_round_idx == r => target verify
 
+    # HV verify CUDAGraph (ignored unless spec_policy=hierarchical; still gated by enforce_eager)
+    enable_intermediate_verify_cudagraph: bool = True
+    enable_intermediate_gap_bucket_cudagraph: bool = True
+    intermediate_verify_gap_buckets: list[int] | None = None
+    enable_target_verify_varlen_cudagraph: bool = True
+    target_verify_varlen_buckets: list[int] | None = None
+
     # eagle3
     use_eagle: bool = False 
     eagle_layers: list[int] | None = None   
@@ -128,6 +135,13 @@ class Config:
                         self.max_model_len,
                     ),
                 )
+                K = self.speculate_k
+                r = self.target_verify_interval
+                hv_target_upper = (r + 1) * (K + 1)
+                if self.intermediate_verify_gap_buckets is None:
+                    self.intermediate_verify_gap_buckets = list(range(K + 2, 2 * K + 3))
+                if self.target_verify_varlen_buckets is None:
+                    self.target_verify_varlen_buckets = list(range(K + 2, hv_target_upper + 1))
 
         if self.profiler_output_dir and str(self.profiler_output_dir).strip():
             if self.profiler_mode not in (

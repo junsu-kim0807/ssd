@@ -18,9 +18,9 @@ def make_intermediate_shard_config(cfg: Config) -> Config:
     and breaks with e.g. ``batch_size must be equal to batch_size_k``.
 
     ``enforce_eager`` follows the top-level engine config (same as target/draft).
-    On TP-colocated intermediate, ``ModelRunner.run_intermediate_verify_suffix`` may
-    still force eager for that forward because verify CUDA graphs are not captured
-    for ``intermediate_model`` on the target runner.
+    When ``enforce_eager`` is False and verify CUDAGraphs are captured for the
+    colocated ``intermediate_model``, ``run_intermediate_verify_suffix`` uses those
+    graphs (exact ``K+1`` and optional gap buckets); otherwise it falls back to eager.
     """
     path = cfg.intermediate or cfg.draft
     util = min(0.45, max(0.05, cfg.gpu_memory_utilization * 0.4))
@@ -34,4 +34,9 @@ def make_intermediate_shard_config(cfg: Config) -> Config:
         speculate_k=cfg.speculate_k,
         draft_async=False,
         num_gpus=cfg.num_gpus,
+        enable_intermediate_verify_cudagraph=cfg.enable_intermediate_verify_cudagraph,
+        enable_intermediate_gap_bucket_cudagraph=cfg.enable_intermediate_gap_bucket_cudagraph,
+        intermediate_verify_gap_buckets=cfg.intermediate_verify_gap_buckets,
+        enable_target_verify_varlen_cudagraph=cfg.enable_target_verify_varlen_cudagraph,
+        target_verify_varlen_buckets=cfg.target_verify_varlen_buckets,
     )

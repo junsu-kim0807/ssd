@@ -30,16 +30,20 @@ from ssd.engine.helpers.runner_helpers import (
     prepare_block_tables_from_seqs,
     prepare_prefill_tensors_from_seqs,
     prepare_verify_tensors_varlen,
+    prepare_verify_tensors_varlen_bucketed,
     prepare_intermediate_verify_gapaware_tensors,
+    prepare_intermediate_verify_gapaware_bucketed_tensors,
 )
 from ssd.engine.intermediate_shard_config import make_intermediate_shard_config
 from ssd.engine.helpers.cudagraph_helpers import (
     run_verify_cudagraph,
+    run_verify_cudagraph_generic,
     run_decode_cudagraph,
     run_fi_tree_decode_cudagraph,
     run_glue_decode_cudagraph,
     capture_cudagraph,
     capture_verify_cudagraph,
+    capture_verify_cudagraph_generic,
     capture_fi_tree_decode_cudagraph,
     capture_glue_decode_cudagraph,
     get_custom_mask,
@@ -250,6 +254,10 @@ class ModelRunner:
         self.graph_pools = {}
         self.graphs = {}
         self.graph_bs_list = {}
+        self.inter_graph_vars: dict = {}
+        self.inter_graph_pools: dict = {}
+        self.inter_graphs: dict = {}
+        self.inter_graph_bs_list: dict = {}
 
         runner_cfg = _decoder_cfg(hf_config)
         model_type_name = getattr(runner_cfg, "model_type", getattr(hf_config, "model_type", None))
@@ -346,6 +354,37 @@ class ModelRunner:
                 self.graphs["glue_decode"] = glue_graphs
                 self.graph_bs_list["glue_decode"] = glue_bs_list
 
+            if (
+                not self.is_draft
+                and not self.intermediate_mode
+                and self.config.speculate
+                and getattr(self.config, "spec_policy", "") == "hierarchical"
+                and not self.config.use_eagle
+                and getattr(self.config, "enable_target_verify_varlen_cudagraph", True)
+            ):
+                self.graph_vars["verify_varlen_bucket"] = {}
+                self.graph_pools["verify_varlen_bucket"] = {}
+                self.graphs["verify_varlen_bucket"] = {}
+                self.graph_bs_list["verify_varlen_bucket"] = {}
+                for q_len in self.config.target_verify_varlen_buckets or []:
+                    gv, gp, g, gbs = capture_verify_cudagraph_generic(
+                        self, model_override=self.model, q_len=q_len
+                    )
+                    self.graph_vars["verify_varlen_bucket"][q_len] = gv
+                    self.graph_pools["verify_varlen_bucket"][q_len] = gp
+                    self.graphs["verify_varlen_bucket"][q_len] = g
+                    self.graph_bs_list["verify_varlen_bucket"][q_len] = gbs
+
+            if (
+                self.config.speculate
+                and getattr(self.config, "spec_policy", "") == "hierarchical"
+                and (
+                    self.intermediate_mode
+                    or getattr(self, "_hierarchical_intermediate_parallel", False)
+                )
+            ):
+                self._capture_intermediate_verify_graphs()
+
         return model_type
 
     @staticmethod
@@ -358,9 +397,115 @@ class ModelRunner:
             and getattr(config, "intermediate_hf_config", None) is not None
         )
 
-    def _intermediate_colocated_verify_needs_eager(self) -> bool:
-        """Colocated ``intermediate_model`` has no verify CUDAGraph on this runner; must not use ``graph_vars['verify']``."""
-        return bool(getattr(self, "_hierarchical_intermediate_parallel", False))
+    def _intermediate_colocated_verify_needs_eager(self, bucket_q_len: int | None = None) -> bool:
+        """True when TP-colocated intermediate must fall back to eager (no graph for this bucket or global eager)."""
+        if not getattr(self, "_hierarchical_intermediate_parallel", False):
+            return False
+        if self.enforce_eager or not getattr(self.config, "enable_intermediate_verify_cudagraph", True):
+            return True
+        gap_map = self.inter_graph_vars.get("verify_gap_bucket") or {}
+        if bucket_q_len is None:
+            return "verify_exact" not in self.inter_graph_vars
+        k1 = self.config.speculate_k + 1
+        if bucket_q_len == k1:
+            return "verify_exact" not in self.inter_graph_vars
+        return bucket_q_len not in gap_map
+
+    def _capture_intermediate_verify_graphs(self) -> None:
+        if self.enforce_eager or not getattr(self.config, "enable_intermediate_verify_cudagraph", True):
+            return
+        model_override = (
+            self.intermediate_model
+            if getattr(self, "_hierarchical_intermediate_parallel", False)
+            else self.model
+        )
+        k1 = self.config.speculate_k + 1
+        gv, gp, g, gbs = capture_verify_cudagraph_generic(
+            self, model_override=model_override, q_len=k1
+        )
+        self.inter_graph_vars["verify_exact"] = gv
+        self.inter_graph_pools["verify_exact"] = gp
+        self.inter_graphs["verify_exact"] = g
+        self.inter_graph_bs_list["verify_exact"] = gbs
+
+        if getattr(self.config, "enable_intermediate_gap_bucket_cudagraph", True):
+            self.inter_graph_vars["verify_gap_bucket"] = {}
+            self.inter_graph_pools["verify_gap_bucket"] = {}
+            self.inter_graphs["verify_gap_bucket"] = {}
+            self.inter_graph_bs_list["verify_gap_bucket"] = {}
+            for bq in self.config.intermediate_verify_gap_buckets or []:
+                gv2, gp2, g2, gbs2 = capture_verify_cudagraph_generic(
+                    self, model_override=model_override, q_len=bq
+                )
+                self.inter_graph_vars["verify_gap_bucket"][bq] = gv2
+                self.inter_graph_pools["verify_gap_bucket"][bq] = gp2
+                self.inter_graphs["verify_gap_bucket"][bq] = g2
+                self.inter_graph_bs_list["verify_gap_bucket"][bq] = gbs2
+
+    def _select_intermediate_verify_bucket(self, max_actual_q: int) -> int | None:
+        reg = self.inter_graph_vars.get("verify_gap_bucket") or {}
+        cand = [
+            b
+            for b in sorted(self.config.intermediate_verify_gap_buckets or [])
+            if b >= max_actual_q and b in reg
+        ]
+        return min(cand) if cand else None
+
+    def _select_target_verify_bucket(self, max_L: int) -> int | None:
+        reg = self.graph_vars.get("verify_varlen_bucket") or {}
+        cand = [
+            b
+            for b in sorted(self.config.target_verify_varlen_buckets or [])
+            if b >= max_L and b in reg
+        ]
+        return min(cand) if cand else None
+
+    def _intermediate_verify_graph_bs_ok(self, bucket_q_len: int, num_seqs: int) -> bool:
+        k1 = self.config.speculate_k + 1
+        if bucket_q_len == k1:
+            gbs = self.inter_graph_bs_list.get("verify_exact") or []
+        else:
+            gbs = (self.inter_graph_bs_list.get("verify_gap_bucket") or {}).get(bucket_q_len, [])
+        return bool(gbs) and max(gbs) >= num_seqs
+
+    def _target_verify_graph_bs_ok(self, bucket_q_len: int, num_seqs: int) -> bool:
+        k1 = self.config.speculate_k + 1
+        if bucket_q_len == k1:
+            gbs = self.graph_bs_list.get("verify") or []
+        else:
+            gbs = (self.graph_bs_list.get("verify_varlen_bucket") or {}).get(bucket_q_len, [])
+        return bool(gbs) and max(gbs) >= num_seqs
+
+    def run_intermediate_verify_cudagraph(self, input_ids: torch.Tensor, positions: torch.Tensor, bucket_q_len: int):
+        k1 = self.config.speculate_k + 1
+        model = (
+            self.intermediate_model
+            if getattr(self, "_hierarchical_intermediate_parallel", False)
+            else self.model
+        )
+        if bucket_q_len == k1:
+            return run_verify_cudagraph_generic(
+                self,
+                input_ids,
+                positions,
+                False,
+                self.inter_graph_vars["verify_exact"],
+                self.inter_graphs["verify_exact"],
+                self.inter_graph_bs_list["verify_exact"],
+                bucket_q_len,
+                model,
+            )
+        return run_verify_cudagraph_generic(
+            self,
+            input_ids,
+            positions,
+            False,
+            self.inter_graph_vars["verify_gap_bucket"][bucket_q_len],
+            self.inter_graphs["verify_gap_bucket"][bucket_q_len],
+            self.inter_graph_bs_list["verify_gap_bucket"][bucket_q_len],
+            bucket_q_len,
+            model,
+        )
 
     def _setup_hierarchical_intermediate_parallel(self, target_config: Config) -> None:
         """Shard intermediate across the same TP ranks / ``tp_pg`` as the target model."""
@@ -752,16 +897,88 @@ class ModelRunner:
         )
         return input_ids, positions
 
-    def run_verify_varlen(self, seqs: list[Sequence], verify_tokens_per_seq: list[list[int]]) -> torch.Tensor:
-        """Eager variable-length target verify forward (hierarchical target round)."""
-        eager_was = self.enforce_eager
-        self.enforce_eager = True
+    def run_verify_varlen(
+        self, seqs: list[Sequence], verify_tokens_per_seq: list[list[int]]
+    ) -> tuple[torch.Tensor, list[int]]:
+        """Hierarchical target verify: CUDAGraph when possible, else eager.
+
+        Returns ``(logits_flat, per_seq_strides)`` where ``per_seq_strides[i]`` is the packed
+        query length for sequence ``i`` (actual ``len(candidates[i])`` under eager, or the
+        graph bucket length under CG). Verifier must slice ``logits[:len(candidates[i])]``.
+        """
+        K1 = self.config.speculate_k + 1
+        nseq = len(seqs)
+        strides_eager = [len(c) for c in verify_tokens_per_seq]
+        max_L = max(strides_eager) if strides_eager else 0
+
+        def _eager_forward() -> tuple[torch.Tensor, list[int]]:
+            eager_was = self.enforce_eager
+            self.enforce_eager = True
+            try:
+                input_ids, positions = self.prepare_verify_varlen(seqs, verify_tokens_per_seq)
+                logits = self.run_model(input_ids, positions, False, last_only=False)
+                return logits, list(strides_eager)
+            finally:
+                self.enforce_eager = eager_was
+                reset_context()
+
+        hv = getattr(self.config, "spec_policy", "") == "hierarchical"
+        if not hv:
+            return _eager_forward()
+
+        if self.config.enforce_eager or not getattr(
+            self.config, "enable_target_verify_varlen_cudagraph", True
+        ):
+            return _eager_forward()
+
+        bucket_q = K1 if max_L <= K1 else self._select_target_verify_bucket(max_L)
+        if bucket_q is None or not self._target_verify_graph_bs_ok(bucket_q, nseq):
+            return _eager_forward()
+        if bucket_q == K1 and "verify" not in self.graph_vars:
+            return _eager_forward()
+        if bucket_q != K1 and bucket_q not in (self.graph_vars.get("verify_varlen_bucket") or {}):
+            return _eager_forward()
+
         try:
-            input_ids, positions = self.prepare_verify_varlen(seqs, verify_tokens_per_seq)
-            logits = self.run_model(input_ids, positions, False, last_only=False)
-            return logits
+            (
+                input_ids,
+                positions,
+                slot_mapping,
+                context_lens,
+                cu_seqlens_q,
+                _bucket,
+                _actual_lens,
+            ) = prepare_verify_tensors_varlen_bucketed(
+                seqs, self.block_size, verify_tokens_per_seq, bucket_q
+            )
+            block_tables = prepare_block_tables_from_seqs(seqs, self.is_draft, is_intermediate=False)
+            set_context(
+                is_prefill=False,
+                cu_seqlens_q=cu_seqlens_q,
+                cu_seqlens_k=None,
+                max_seqlen_q=int(bucket_q),
+                max_seqlen_k=0,
+                slot_mapping=slot_mapping,
+                context_lens=context_lens,
+                block_tables=block_tables,
+                is_varlen_verify=True,
+            )
+            if bucket_q == K1:
+                logits = run_verify_cudagraph(self, input_ids, positions, False, self.graph_vars["verify"])
+            else:
+                logits = run_verify_cudagraph_generic(
+                    self,
+                    input_ids,
+                    positions,
+                    False,
+                    self.graph_vars["verify_varlen_bucket"][bucket_q],
+                    self.graphs["verify_varlen_bucket"][bucket_q],
+                    self.graph_bs_list["verify_varlen_bucket"][bucket_q],
+                    bucket_q,
+                    self.model,
+                )
+            return logits, [bucket_q] * nseq
         finally:
-            self.enforce_eager = eager_was
             reset_context()
 
     def intermediate_run(self, seqs: list[Sequence], is_prefill: bool):
@@ -788,20 +1005,91 @@ class ModelRunner:
     def run_intermediate_verify_suffix(self, seqs: list[Sequence], k: int):
         """Gap-aware packed varlen intermediate verify (optional ``[nic:c0)`` + ``K+1`` tail).
 
-        Returns ``(logits_flat, score_starts, q_lens)`` where ``logits_flat`` has
-        ``sum(q_lens)`` rows in batch order, and row ``score_starts[b]:score_starts[b]+k+1``
-        are used for acceptance (see ``VerifierHierarchical._verify_intermediate_round``).
-
-        Standalone ``IntermediateRunner`` respects ``config.enforce_eager`` (verify CUDAGraph
-        when eager is off). TP-colocated ``intermediate_model`` has no verify graph on this
-        runner, so that path forces eager for this forward only.
+        Returns ``(logits_flat, score_starts, q_lens)`` where ``q_lens`` are packed per-sequence
+        lengths (``K+1`` or a bucket length under CUDAGraph); scored rows are always
+        ``score_starts[b]:score_starts[b]+k+1`` (see ``VerifierHierarchical._verify_intermediate_round``).
         """
         assert getattr(self, "intermediate_mode", False) or getattr(
             self, "_hierarchical_intermediate_parallel", False
         ), "run_intermediate_verify_suffix requires intermediate_mode or TP-colocated intermediate"
+        k1 = k + 1
+        nseq = len(seqs)
         eager_was = self.enforce_eager
         force_eager = False
+        full_pack = prepare_intermediate_verify_gapaware_tensors(seqs, self.block_size, k)
+        max_actual_q = int(full_pack[5])
+        score_starts = full_pack[6]
+
+        use_cg = (
+            not self.config.enforce_eager
+            and getattr(self.config, "enable_intermediate_verify_cudagraph", True)
+        )
+        bucket_q: int | None = None
+        if use_cg:
+            if max_actual_q == k1 and not self._intermediate_colocated_verify_needs_eager(k1):
+                bucket_q = k1
+            elif max_actual_q > k1 and getattr(
+                self.config, "enable_intermediate_gap_bucket_cudagraph", True
+            ):
+                bsel = self._select_intermediate_verify_bucket(max_actual_q)
+                if bsel is not None and not self._intermediate_colocated_verify_needs_eager(bsel):
+                    bucket_q = bsel
+
+        if (
+            bucket_q is not None
+            and self._intermediate_verify_graph_bs_ok(bucket_q, nseq)
+        ):
+            try:
+                if bucket_q == k1:
+                    (
+                        input_ids,
+                        positions,
+                        slot_mapping,
+                        context_lens,
+                        cu_seqlens_q,
+                        _bq,
+                        score_starts,
+                        packed_q_lens,
+                        _actual_q_lens,
+                    ) = prepare_intermediate_verify_gapaware_bucketed_tensors(
+                        seqs, self.block_size, k, k1
+                    )
+                else:
+                    (
+                        input_ids,
+                        positions,
+                        slot_mapping,
+                        context_lens,
+                        cu_seqlens_q,
+                        _bq,
+                        score_starts,
+                        packed_q_lens,
+                        _actual_q_lens,
+                    ) = prepare_intermediate_verify_gapaware_bucketed_tensors(
+                        seqs, self.block_size, k, bucket_q
+                    )
+                block_tables = prepare_block_tables_from_seqs(seqs, self.is_draft, is_intermediate=True)
+                set_context(
+                    is_prefill=False,
+                    cu_seqlens_q=cu_seqlens_q,
+                    cu_seqlens_k=None,
+                    max_seqlen_q=int(bucket_q),
+                    max_seqlen_k=0,
+                    slot_mapping=slot_mapping,
+                    context_lens=context_lens,
+                    block_tables=block_tables,
+                    is_varlen_verify=True,
+                )
+                logits_flat = self.run_intermediate_verify_cudagraph(
+                    input_ids, positions, bucket_q
+                )
+                return logits_flat, score_starts, packed_q_lens
+            finally:
+                reset_context()
+
+        force_eager = True
         try:
+            self.enforce_eager = True
             (
                 input_ids,
                 positions,
@@ -811,18 +1099,10 @@ class ModelRunner:
                 max_seqlen_q,
                 score_starts,
                 q_lens,
-            ) = prepare_intermediate_verify_gapaware_tensors(seqs, self.block_size, k)
-            # CUDAGraph verify path assumes constant ``q_len == k+1`` per seq. Uniform padding
-            # makes the batch shape-stable; CG is still reachable iff ``max_q == k+1`` (no gap).
-            # Colocated intermediate_model has no verify CG on this runner — always eager.
-            force_eager = (
-                self._intermediate_colocated_verify_needs_eager()
-                or int(max_seqlen_q) != k + 1
-            )
-            if force_eager:
-                self.enforce_eager = True
+            ) = full_pack
             block_tables = prepare_block_tables_from_seqs(
-                seqs, self.is_draft, is_intermediate=True)
+                seqs, self.is_draft, is_intermediate=True
+            )
             set_context(
                 is_prefill=False,
                 cu_seqlens_q=cu_seqlens_q,

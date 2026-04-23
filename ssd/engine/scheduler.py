@@ -194,6 +194,12 @@ class Scheduler:
                     self.hv_target_round_lookahead(seq),
                     self.K + 2,
                 )
+                if __debug__:
+                    # Intermediate verify CUDagraph trailing padding uses query lengths up to 2K+2;
+                    # ``hv_seq_lookahead_budget`` must reserve at least that much intermediate headroom.
+                    assert inter_lookahead_len >= 2 * (self.K + 1), (
+                        f"HV inter_lookahead_len={inter_lookahead_len} < 2*(K+1)={2 * (self.K + 1)}"
+                    )
 
             while not self.bms_can_append(seq, target_lookahead_len, draft_lookahead_len, inter_lookahead_len):
                 if self.running:  # eject a running sequence if one exists

@@ -184,6 +184,163 @@ def prepare_verify_tensors_varlen(
     return input_ids_t, positions_t, slot_mapping_t, context_lens_t, cu_seqlens_q, max_seqlen_q
 
 
+def prepare_verify_tensors_varlen_bucketed(
+    seqs: list[Sequence],
+    block_size: int,
+    verify_tokens_per_seq: list[list[int]],
+    bucket_q_len: int,
+) -> tuple[
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    int,
+    list[int],
+]:
+    """Trailing bucket padding for hierarchical target verify CUDAGraph (fixed ``bucket_q_len`` per seq).
+
+    Padding rows use ``cand[-1]`` and positions ``c0+j`` for ``j >= L``; verifier must use
+    ``logits[:L]`` only. ``context_lens`` is ``c0 + bucket_q_len`` per sequence.
+    """
+    actual_lens: list[int] = []
+    for cand in verify_tokens_per_seq:
+        L = len(cand)
+        assert L >= 1
+        assert L <= bucket_q_len, (
+            f"prepare_verify_tensors_varlen_bucketed: L={L} > bucket_q_len={bucket_q_len}"
+        )
+        actual_lens.append(L)
+
+    input_ids: list[int] = []
+    positions: list[int] = []
+    slot_mapping: list[int] = []
+    context_lens: list[int] = []
+
+    for seq, cand in zip(seqs, verify_tokens_per_seq):
+        c0 = seq.num_cached_tokens
+        L = len(cand)
+        context_lens.append(c0 + bucket_q_len)
+        for j in range(bucket_q_len):
+            tok = int(cand[j]) if j < L else int(cand[-1])
+            pos = c0 + j
+            input_ids.append(tok)
+            positions.append(pos)
+            block_idx = pos // block_size
+            pos_in_block = pos % block_size
+            block_id = seq.block_table[block_idx]
+            slot_mapping.append(block_id * block_size + pos_in_block)
+
+    input_ids_t = torch.tensor(input_ids, dtype=torch.int64, pin_memory=True).cuda(non_blocking=True)
+    positions_t = torch.tensor(positions, dtype=torch.int64, pin_memory=True).cuda(non_blocking=True)
+    slot_mapping_t = torch.tensor(slot_mapping, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
+    context_lens_t = torch.tensor(context_lens, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
+    _dev = torch.device("cuda")
+    cu_seqlens_q = torch.zeros(len(seqs) + 1, dtype=torch.int32, device=_dev)
+    q_lens = torch.full((len(seqs),), bucket_q_len, dtype=torch.int32, device=_dev)
+    cu_seqlens_q[1:] = torch.cumsum(q_lens, dim=0)
+    return input_ids_t, positions_t, slot_mapping_t, context_lens_t, cu_seqlens_q, bucket_q_len, actual_lens
+
+
+def build_intermediate_verify_row(seq: Sequence, k: int) -> tuple[list[int], int, int]:
+    """Per-sequence intermediate verify row: ``(full_tokens, base_pos, score_start)``."""
+    c0 = seq.num_cached_tokens
+    nic = seq.num_inter_cached_tokens
+    pt = seq.hv_num_provisional_tokens
+
+    if nic < c0:
+        assert pt == 0, "intermediate verify gap path requires empty provisional tape"
+        gap = list(seq.token_ids[nic:c0])
+        tail = list(seq.token_ids[c0 : c0 + k + 1])
+        full = gap + tail
+        score_start = len(gap)
+        base_pos = nic
+    elif pt > 0:
+        full = [seq.hv_provisional_token_ids[-1]] + list(seq.token_ids[c0 : c0 + k])
+        score_start = 0
+        base_pos = nic
+    else:
+        full = list(seq.token_ids[c0 : c0 + k + 1])
+        score_start = 0
+        base_pos = nic
+
+    assert len(full) == score_start + k + 1, (
+        f"intermediate verify: expected len={score_start + k + 1}, got {len(full)} "
+        f"(nic={nic}, c0={c0}, pt={pt}, K={k})"
+    )
+    return full, base_pos, score_start
+
+
+def prepare_intermediate_verify_gapaware_bucketed_tensors(
+    seqs: list[Sequence],
+    block_size: int,
+    k: int,
+    bucket_q_len: int,
+) -> tuple[
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    int,
+    list[int],
+    list[int],
+    list[int],
+]:
+    """Trailing bucket padding for intermediate verify CUDAGraph (fixed ``bucket_q_len`` per seq).
+
+    Scored slice remains ``score_start:score_start+k+1``; padding is only after the actual row.
+    """
+    input_ids: list[int] = []
+    positions: list[int] = []
+    slot_mapping: list[int] = []
+    context_lens: list[int] = []
+    score_starts: list[int] = []
+    packed_q_lens: list[int] = []
+    actual_q_lens: list[int] = []
+
+    for seq in seqs:
+        full_actual, base_pos, score_start = build_intermediate_verify_row(seq, k)
+        actual_q = len(full_actual)
+        assert actual_q <= bucket_q_len, (
+            f"intermediate verify bucket: actual_q={actual_q} > bucket_q_len={bucket_q_len}"
+        )
+        score_starts.append(score_start)
+        packed_q_lens.append(bucket_q_len)
+        actual_q_lens.append(actual_q)
+        context_lens.append(base_pos + bucket_q_len)
+        pad_tok = int(full_actual[-1])
+        for j in range(bucket_q_len):
+            tok = int(full_actual[j]) if j < actual_q else pad_tok
+            pos = base_pos + j
+            input_ids.append(tok)
+            positions.append(pos)
+            block_idx = pos // block_size
+            pos_in_block = pos % block_size
+            bid = seq.inter_block_table[block_idx]
+            slot_mapping.append(bid * block_size + pos_in_block)
+
+    input_ids_t = torch.tensor(input_ids, dtype=torch.int64, pin_memory=True).cuda(non_blocking=True)
+    positions_t = torch.tensor(positions, dtype=torch.int64, pin_memory=True).cuda(non_blocking=True)
+    slot_mapping_t = torch.tensor(slot_mapping, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
+    context_lens_t = torch.tensor(context_lens, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
+    _dev = torch.device("cuda")
+    cu_seqlens_q = torch.zeros(len(seqs) + 1, dtype=torch.int32, device=_dev)
+    q_lens_t = torch.full((len(seqs),), bucket_q_len, dtype=torch.int32, device=_dev)
+    cu_seqlens_q[1:] = torch.cumsum(q_lens_t, dim=0)
+    return (
+        input_ids_t,
+        positions_t,
+        slot_mapping_t,
+        context_lens_t,
+        cu_seqlens_q,
+        bucket_q_len,
+        score_starts,
+        packed_q_lens,
+        actual_q_lens,
+    )
+
+
 def prepare_intermediate_verify_gapaware_tensors(
     seqs: list[Sequence],
     block_size: int,
@@ -217,30 +374,7 @@ def prepare_intermediate_verify_gapaware_tensors(
     seqlen_q_list: list[int] = []
     score_starts: list[int] = []
     for seq in seqs:
-        c0 = seq.num_cached_tokens
-        nic = seq.num_inter_cached_tokens
-        pt = seq.hv_num_provisional_tokens
-
-        if nic < c0:
-            assert pt == 0, "intermediate verify gap path requires empty provisional tape"
-            gap = list(seq.token_ids[nic:c0])
-            tail = list(seq.token_ids[c0 : c0 + k + 1])
-            full = gap + tail
-            score_start = len(gap)
-            base_pos = nic
-        elif pt > 0:
-            full = [seq.hv_provisional_token_ids[-1]] + list(seq.token_ids[c0 : c0 + k])
-            score_start = 0
-            base_pos = nic
-        else:
-            full = list(seq.token_ids[c0 : c0 + k + 1])
-            score_start = 0
-            base_pos = nic
-
-        assert len(full) == score_start + k + 1, (
-            f"intermediate verify: expected len={score_start + k + 1}, got {len(full)} "
-            f"(nic={nic}, c0={c0}, pt={pt}, K={k})"
-        )
+        full, base_pos, score_start = build_intermediate_verify_row(seq, k)
         q_len = len(full)
         seqlen_q_list.append(q_len)
         score_starts.append(score_start)
