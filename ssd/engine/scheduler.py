@@ -137,9 +137,11 @@ class Scheduler:
             seq = self.waiting[0]
 
             # num tokens that are not yet in the kv cache, eg. can be <seq.num_tokens in case of prefix cache usage
-            remain = len(seq) - seq.num_cached_tokens 
+            remain = len(seq) - seq.num_cached_tokens
+            # ``prepare_prefill_tensors_from_seqs`` runs a 1-token cached-prefill when remain==0 (full prefix hit).
+            prefill_query_cost = 1 if remain == 0 else remain
 
-            if num_batched_tokens + remain > self.max_num_batched_tokens or not self.bms_can_allocate(seq):
+            if num_batched_tokens + prefill_query_cost > self.max_num_batched_tokens or not self.bms_can_allocate(seq):
                 break 
             
             self.block_manager.allocate(seq)
@@ -148,7 +150,7 @@ class Scheduler:
             if self.intermediate_block_manager is not None:
                 self.intermediate_block_manager.allocate(seq)
 
-            num_batched_tokens += remain
+            num_batched_tokens += prefill_query_cost
 
             seq.status = SequenceStatus.RUNNING
             self.waiting.popleft()

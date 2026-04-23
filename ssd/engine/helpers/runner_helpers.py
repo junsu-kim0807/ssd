@@ -448,12 +448,20 @@ def prepare_prefill_tensors_from_seqs(
         seqlen = len(seq)
         block_table, num_cached_tokens = _kv_block_table_and_cached(seq, is_draft, is_intermediate)
 
-        start = num_cached_tokens + (skip_first_token if is_draft else 0)
+        raw_start = num_cached_tokens + (skip_first_token if is_draft else 0)
+        # Prefix cache can make ``raw_start >= seqlen``, so ``seq[raw_start:]`` would be empty and
+        # prefill would run zero queries (breaks ``last_only`` lm_head). Re-score the last prompt
+        # token once at its true position (do not apply draft ``skip_first_token`` position shift).
+        if raw_start >= seqlen:
+            start = max(seqlen - 1, 0)
+            effective_pos_offset = 0
+        else:
+            start = raw_start
+            effective_pos_offset = -skip_first_token if is_draft else 0
         input_ids.extend(seq[start:])
-        pos_offset = -skip_first_token if is_draft else 0
-        positions.extend(list(range(start + pos_offset, seqlen + pos_offset)))
+        positions.extend(list(range(start + effective_pos_offset, seqlen + effective_pos_offset)))
         seqlen_q = seqlen - start
-        seqlen_k = seqlen + pos_offset
+        seqlen_k = seqlen + effective_pos_offset
         cu_seqlens_q.append(cu_seqlens_q[-1] + seqlen_q)
         cu_seqlens_k.append(cu_seqlens_k[-1] + seqlen_k)
         max_seqlen_q = max(seqlen_q, max_seqlen_q)
@@ -464,7 +472,7 @@ def prepare_prefill_tensors_from_seqs(
 
         # new: emit exactly one slot for each *new* token
         #    map each token index -> (block_id * block_size + offset)
-        for pos in range(start + pos_offset, seq.num_tokens + pos_offset):
+        for pos in range(start + effective_pos_offset, seq.num_tokens + effective_pos_offset):
             block_i = pos // block_size
             offset = pos % block_size
             slot = block_table[block_i] * block_size + offset
