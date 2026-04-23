@@ -70,6 +70,93 @@ def test_prefill_step_only_prefill_wall_not_draft(tmp_path):
     assert data["verification_time_s"] == 0.0
 
 
+def test_metadata_finish_run_writes_analysis_jsonl(tmp_path):
+    p = SSDProfiler(
+        _prof_cfg(
+            profiler_mode="metadata",
+            profiler_output_dir=str(tmp_path),
+            spec_policy="default",
+        )
+    )
+
+    class S:
+        seq_id = 0
+
+    p.start_run(SimpleNamespace(), None)
+    p.start_step([S(), S()], is_prefill=False)
+    tr = SimpleNamespace(
+        verification_models=["target", "target"],
+        accept_len=[0, 3],
+        inter_accept_len=None,
+        inter_target_prefix_accept_len=None,
+    )
+    vr = SimpleNamespace(profile_trace=tr, is_hv_intermediate=False)
+    p.record_decode_verify_batch([S(), S()], vr)
+    p.finish_step(1)
+    p.finish_run()
+    ap = tmp_path / "analysis.jsonl"
+    assert ap.is_file()
+    line = ap.read_text(encoding="utf-8").strip().splitlines()[-1]
+    data = json.loads(line)
+    assert data["total_target_verification_rounds"] == 2
+    assert data["misspeculation_rounds"] == 1
+    assert abs(data["misspeculation_probability"] - 0.5) < 1e-9
+    assert len(data["target_batch_accept_distributions"]) == 1
+    b0 = data["target_batch_accept_distributions"][0]
+    assert b0["batch_size"] == 2
+    assert abs(b0["accept_len_histogram"]["0"] - 0.5) < 1e-9
+    assert abs(b0["accept_len_histogram"]["3"] - 0.5) < 1e-9
+    assert data["avg_intermediate_accept_len"] is None
+
+
+def test_metadata_analysis_hierarchical_avgs(tmp_path):
+    p = SSDProfiler(
+        _prof_cfg(
+            profiler_mode="metadata",
+            profiler_output_dir=str(tmp_path),
+            spec_policy="hierarchical",
+        )
+    )
+
+    class S:
+        seq_id = 0
+
+    p.start_run(SimpleNamespace(), None)
+    p.start_step([S()], is_prefill=False)
+    tr_i = SimpleNamespace(
+        verification_models=["intermediate"],
+        accept_len=[0],
+        inter_accept_len=[2],
+        inter_target_prefix_accept_len=None,
+    )
+    p.record_decode_verify_batch([S()], SimpleNamespace(profile_trace=tr_i, is_hv_intermediate=True))
+    tr_t = SimpleNamespace(
+        verification_models=["target"],
+        accept_len=[1],
+        inter_accept_len=None,
+        inter_target_prefix_accept_len=[5],
+    )
+    p.record_decode_verify_batch([S()], SimpleNamespace(profile_trace=tr_t, is_hv_intermediate=False))
+    p.finish_step(1)
+    p.finish_run()
+    data = json.loads((tmp_path / "analysis.jsonl").read_text(encoding="utf-8").strip().splitlines()[-1])
+    assert abs(data["avg_intermediate_accept_len"] - 2.0) < 1e-9
+    assert abs(data["avg_target_accept_len"] - 1.0) < 1e-9
+    assert abs(data["avg_inter_target_prefix_accept_len"] - 5.0) < 1e-9
+
+
+def test_cost_metadata_does_not_write_analysis_jsonl(tmp_path):
+    p = SSDProfiler(
+        _prof_cfg(
+            profiler_mode="cost_metadata",
+            profiler_output_dir=str(tmp_path),
+        )
+    )
+    p.start_run(SimpleNamespace(), None)
+    p.finish_run()
+    assert not (tmp_path / "analysis.jsonl").exists()
+
+
 def test_cost_breakdown_finish_run_writes_json(tmp_path):
     p = SSDProfiler(
         _prof_cfg(

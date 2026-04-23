@@ -7,12 +7,17 @@ JSONL rows are appended in ``finish_step()`` only.
 Prefill engine steps contribute only ``prefill_wall_time_s`` (outer step wall).
 They do not add to draft/verify/sync/postprocess run totals and do not emit
 prefill JSONL rows, in any ``profiler_mode``.
+
+For ``cost_breakdown`` / ``cost_metadata``, ``finish_step`` decode counts are
+committed completion tokens (``num_completion_tokens`` delta), not the raw
+``decode()`` return value.
 """
 
 from __future__ import annotations
 
 import json
 import os
+from collections import Counter
 from dataclasses import dataclass, field
 from pathlib import Path
 from time import perf_counter
@@ -38,6 +43,11 @@ def wants_metadata_rows(mode: str) -> bool:
 
 def wants_cost_aggregates(mode: str) -> bool:
     return mode in ("cost_breakdown", "cost_metadata")
+
+
+def wants_metadata_analysis_file(mode: str) -> bool:
+    """Run-level ``analysis.jsonl`` (accept stats, misspeculation, batch histograms)."""
+    return mode == "metadata"
 
 
 def wants_profile_trace(mode: str) -> bool:
@@ -233,6 +243,11 @@ class SSDProfiler:
         self._inter_verify_count_by_seq: dict[int, int] = {}
         self._target_verify_count_by_seq: dict[int, int] = {}
 
+        # metadata-mode analysis.jsonl (record_decode_verify_batch)
+        self._meta_target_verification_rounds: int = 0
+        self._meta_misspeculation_rounds: int = 0
+        self._meta_batch_target_accept_dist: list[dict[str, Any]] = []
+
         self._kernel_prof: Any | None = None
 
     def start_run(self, config: Any, tokenizer: Any) -> None:
@@ -294,7 +309,11 @@ class SSDProfiler:
                 "num_target_verification": self._num_target_verification_requests,
                 "notes": {
                     "num_prefill_token": "sum of per-prefill-engine-step token counts passed to finish_step",
-                    "num_decode_tokens": "sum of per-decode-engine-step token counts passed to finish_step",
+                    "num_decode_tokens": (
+                        "sum of committed completion tokens per decode engine step (delta of "
+                        "Sequence.num_completion_tokens); LLMEngine passes this when profiler_mode is "
+                        "cost_breakdown or cost_metadata instead of the decode() return value"
+                    ),
                     "throughput": "num_decode_tokens / execution_wall_time_s (decode tokens over total step wall)",
                     "num_draft": "cumulative count of requests entering draft stage",
                     "num_verification": "cumulative count of requests entering verification stage",
@@ -338,6 +357,32 @@ class SSDProfiler:
                     "(K=num_speculative_token / speculate_k)"
                 )
             self._sink.write_cost_breakdown(payload)
+
+        if wants_metadata_analysis_file(self._mode):
+
+            def _avg_int(xs: list[int]) -> float | None:
+                return float(sum(xs)) / float(len(xs)) if xs else None
+
+            n_tgt = int(self._meta_target_verification_rounds)
+            n_miss = int(self._meta_misspeculation_rounds)
+            analysis: dict[str, Any] = {
+                "avg_target_accept_len": _avg_int(self._hv_target_accept_samples),
+                "avg_intermediate_accept_len": (
+                    _avg_int(self._hv_inter_accept_samples) if self._spec_policy == "hierarchical" else None
+                ),
+                "avg_inter_target_prefix_accept_len": (
+                    _avg_int(self._hv_inter_target_prefix_samples)
+                    if self._spec_policy == "hierarchical"
+                    else None
+                ),
+                "total_target_verification_rounds": n_tgt,
+                "misspeculation_rounds": n_miss,
+                "misspeculation_probability": (float(n_miss) / float(n_tgt)) if n_tgt > 0 else None,
+                "target_batch_accept_distributions": list(self._meta_batch_target_accept_dist),
+                "spec_policy": self._spec_policy,
+                "speculate_k": int(self._speculate_k),
+            }
+            self._sink.append_jsonl("analysis.jsonl", analysis)
 
     def start_step(self, seqs: list[Any], is_prefill: bool) -> None:
         self._step_id += 1
@@ -451,6 +496,43 @@ class SSDProfiler:
                 self._num_intermediate_verification_requests += 1
                 self._inter_verify_count_by_seq[sid] = self._inter_verify_count_by_seq.get(sid, 0) + 1
 
+    def _accumulate_metadata_analysis(self, seqs: list[Any], trace: Any) -> None:
+        """Target-round counters and per-step batch accept histograms for ``analysis.jsonl``."""
+        if not wants_metadata_analysis_file(self._mode):
+            return
+        vms = getattr(trace, "verification_models", None)
+        if not vms:
+            return
+        B = min(len(seqs), len(vms))
+        accept_lens = getattr(trace, "accept_len", None)
+        target_vm = frozenset({"target", "pivot_target"})
+        for i in range(B):
+            if vms[i] not in target_vm:
+                continue
+            self._meta_target_verification_rounds += 1
+            if accept_lens is not None and i < len(accept_lens):
+                if int(accept_lens[i]) == 0:
+                    self._meta_misspeculation_rounds += 1
+        if B > 1 and all(vms[i] in target_vm for i in range(B)):
+            vals: list[int] = []
+            if accept_lens is not None:
+                for i in range(B):
+                    if i < len(accept_lens):
+                        vals.append(int(accept_lens[i]))
+            if len(vals) == B:
+                tot = float(B)
+                ctr = Counter(vals)
+                hist = {str(k): ctr[k] / tot for k in sorted(ctr)}
+                st = self._state
+                step_id = int(st.step_id) if st is not None else -1
+                self._meta_batch_target_accept_dist.append(
+                    {
+                        "batch_size": B,
+                        "engine_step_id": step_id,
+                        "accept_len_histogram": hist,
+                    }
+                )
+
     def _record_profile_accept_samples(self, seqs: list[Any], trace: Any) -> None:
         """Collect accept_len stats from ``VerifyProfileTrace`` for cost_breakdown (all spec policies)."""
         vms = getattr(trace, "verification_models", None)
@@ -481,6 +563,7 @@ class SSDProfiler:
         if trace is not None:
             self.record_verify_step(seqs, trace)
             self._record_profile_accept_samples(seqs, trace)
+            self._accumulate_metadata_analysis(seqs, trace)
             return
         self._num_verification_requests += n
         if getattr(verify_result, "is_hv_intermediate", False):

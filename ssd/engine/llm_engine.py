@@ -15,7 +15,7 @@ from ssd.engine.verifier import Verifier
 from ssd.engine.verifier_pivot import VerifierPivot
 from ssd.engine.verifier_hierarchical import VerifierHierarchical
 from ssd.engine.intermediate_runner import IntermediateRunner
-from ssd.utils.profiler import make_profiler, wants_profile_trace, SSDProfiler
+from ssd.utils.profiler import make_profiler, wants_cost_aggregates, wants_profile_trace, SSDProfiler
 
 import atexit
 from dataclasses import fields
@@ -222,8 +222,22 @@ class LLMEngine:
         t = perf_counter()
         seqs, is_prefill = self.scheduler.schedule()
         self.profiler.start_step(seqs, is_prefill)
+        pre_decode_completion: list[int] | None = None
+        if (
+            not is_prefill
+            and isinstance(self.profiler, SSDProfiler)
+            and wants_cost_aggregates(self.config.profiler_mode)
+        ):
+            pre_decode_completion = [seq.num_completion_tokens for seq in seqs]
         ttl_tokens = step.prefill(seqs) if is_prefill else step.decode(seqs)
-        self.profiler.finish_step(ttl_tokens)
+        if pre_decode_completion is not None:
+            committed = sum(
+                seq.num_completion_tokens - prev
+                for seq, prev in zip(seqs, pre_decode_completion)
+            )
+            self.profiler.finish_step(committed)
+        else:
+            self.profiler.finish_step(ttl_tokens)
 
         time_taken = perf_counter() - t
 
