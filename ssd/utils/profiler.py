@@ -13,6 +13,11 @@ committed completion tokens (``num_completion_tokens`` delta), not the raw
 ``decode()`` return value; that sum matches total new output (completion) tokens
 per engine step across the scheduled batch (same as ``num_decode_tokens`` in
 ``cost_breakdown.json`` when summed over the run).
+
+Run-level ``avg_*_time_per_batch`` fields normalize wall time by
+``num_events / avg_decode_scheduled_batch_size`` (equivalently
+``wall_s * avg_decode_scheduled_batch_size / num_events``): same units as wall
+time, scaled so multi-seq decode steps are comparable to batch size 1.
 """
 
 from __future__ import annotations
@@ -332,6 +337,21 @@ class SSDProfiler:
             def _avg(xs: list[int]) -> float | None:
                 return float(sum(xs)) / float(len(xs)) if xs else None
 
+            avg_decode_bsz_f: float | None = (
+                float(self._decode_sched_batch_sum) / float(self._num_decode_engine_steps)
+                if self._num_decode_engine_steps
+                else None
+            )
+
+            def _per_batch_norm_wall(wall_s: float, n_events: int, avg_bsz: float | None) -> float | None:
+                """``wall_s / (n_events / avg_bsz)`` when inputs are valid; else None."""
+                if avg_bsz is None or avg_bsz <= 0.0 or n_events <= 0:
+                    return None
+                denom = float(n_events) / float(avg_bsz)
+                if denom <= 0.0:
+                    return None
+                return float(wall_s) / denom
+
             payload = {
                 "execution_wall_time_s": self._run_execution_wall_s,
                 "prefill_wall_time_s": self._run_prefill_wall_s,
@@ -345,11 +365,7 @@ class SSDProfiler:
                 "draft_worker_wall_time_s": self._run_draft_worker_s,
                 "num_prefill_engine_steps": self._num_prefill_engine_steps,
                 "num_decode_engine_steps": self._num_decode_engine_steps,
-                "avg_decode_scheduled_batch_size": (
-                    float(self._decode_sched_batch_sum) / float(self._num_decode_engine_steps)
-                    if self._num_decode_engine_steps
-                    else None
-                ),
+                "avg_decode_scheduled_batch_size": avg_decode_bsz_f,
                 "num_draft": self._num_draft_requests,
                 "num_verification": self._num_verification_requests,
                 "num_intermediate_verification": self._num_intermediate_verification_requests,
@@ -374,6 +390,21 @@ class SSDProfiler:
                     "num_decode_engine_steps": "LLMEngine.step calls where is_prefill=False",
                     "avg_decode_scheduled_batch_size": (
                         "mean len(seqs) per decode engine step (scheduler batch for that step)"
+                    ),
+                    "avg_draft_time_per_batch": (
+                        "draft_time_s / (num_draft / avg_decode_scheduled_batch_size); null if no decode "
+                        "steps, no draft requests, or invalid batch average"
+                    ),
+                    "avg_intermediate_verification_time_per_batch": (
+                        "hierarchical: hierarchical_intermediate_verification_time_s / "
+                        "(num_intermediate_verification / avg_decode_scheduled_batch_size); "
+                        "else null (no separate intermediate wall clock)"
+                    ),
+                    "avg_target_verification_time_per_batch": (
+                        "hierarchical: hierarchical_target_verification_time_s / "
+                        "(num_target_verification / avg_decode_scheduled_batch_size); "
+                        "else: verification_time_s with the same denominator using num_target_verification, "
+                        "or num_verification if num_target_verification is 0"
                     ),
                     "prefill_wall_time_s": (
                         "sum of outer prefill step wall times only; prefill does not contribute to "
@@ -429,6 +460,30 @@ class SSDProfiler:
                 payload["notes"]["hv_avg_verify_batch_size_target"] = (
                     "mean len(seqs) on decode steps whose verify round was target (HV)"
                 )
+
+            nd = int(self._num_draft_requests)
+            nm_inter = int(self._num_intermediate_verification_requests)
+            nm_tgt = int(self._num_target_verification_requests)
+            nm_ver = int(self._num_verification_requests)
+
+            payload["avg_draft_time_per_batch"] = _per_batch_norm_wall(
+                float(self._run_draft_s), nd, avg_decode_bsz_f
+            )
+
+            if self._spec_policy == "hierarchical":
+                payload["avg_intermediate_verification_time_per_batch"] = _per_batch_norm_wall(
+                    float(self._run_hv_inter_verify_s), nm_inter, avg_decode_bsz_f
+                )
+                payload["avg_target_verification_time_per_batch"] = _per_batch_norm_wall(
+                    float(self._run_hv_target_verify_s), nm_tgt, avg_decode_bsz_f
+                )
+            else:
+                payload["avg_intermediate_verification_time_per_batch"] = None
+                tgt_n = nm_tgt if nm_tgt > 0 else nm_ver
+                payload["avg_target_verification_time_per_batch"] = _per_batch_norm_wall(
+                    float(self._run_verify_s), tgt_n, avg_decode_bsz_f
+                )
+
             self._sink.write_cost_breakdown(payload)
 
         if wants_metadata_analysis_file(self._mode):

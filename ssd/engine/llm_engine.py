@@ -395,7 +395,7 @@ class LLMEngine:
                     enable_profile_trace=_ptrace,
                 )
             step_cls = SpecDecodeStep
-            if config.spec_policy == "hierarchical" and getattr(config, "hierarchical_fused", True):
+            if config.spec_policy == "hierarchical":
                 # Fused HV must not advance only some seqs to target round on intermediate EOS
                 # (mixed batch in verify_intermediate_round). Config.__post_init__ also sets this;
                 # force here so callers using dataclasses.replace etc. cannot violate the invariant.

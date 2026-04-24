@@ -249,6 +249,9 @@ def test_cost_breakdown_finish_run_writes_json(tmp_path):
     assert "avg_target_accept_len" in data
     assert data["avg_target_accept_len"] is None
     assert "hierarchical_intermediate_verification_time_s" not in data
+    assert data["avg_draft_time_per_batch"] is None
+    assert data["avg_intermediate_verification_time_per_batch"] is None
+    assert data["avg_target_verification_time_per_batch"] is None
 
 
 def test_cost_breakdown_hierarchical_fields(tmp_path):
@@ -265,12 +268,18 @@ def test_cost_breakdown_hierarchical_fields(tmp_path):
 
     p.start_run(SimpleNamespace(), None)
     p.start_step([S(), S()], is_prefill=False)
+    p.bump_draft_requests(2)
+    p.start_stage("draft")
+    p.finish_stage("draft")
     p.accum_hierarchical_verify_time(0.02, True)
     p.record_decode_verify_batch(
         [S(), S()], SimpleNamespace(profile_trace=None, is_hv_intermediate=True)
     )
     p.finish_step(1)
     p.start_step([S(), S()], is_prefill=False)
+    p.bump_draft_requests(2)
+    p.start_stage("draft")
+    p.finish_stage("draft")
     p.accum_hierarchical_verify_time(0.05, False)
     p.record_decode_verify_batch(
         [S(), S()], SimpleNamespace(profile_trace=None, is_hv_intermediate=False)
@@ -297,6 +306,11 @@ def test_cost_breakdown_hierarchical_fields(tmp_path):
     assert abs(data["avg_decode_scheduled_batch_size"] - 2.0) < 1e-9
     assert abs(data["hv_avg_verify_batch_size_intermediate"] - 2.0) < 1e-9
     assert abs(data["hv_avg_verify_batch_size_target"] - 2.0) < 1e-9
+    # avg_decode_scheduled_batch_size = 2; num_draft = 4 → draft_time / (4/2) = draft_time/2
+    assert data["avg_draft_time_per_batch"] is not None
+    assert abs(data["avg_draft_time_per_batch"] - data["draft_time_s"] / 2.0) < 1e-9
+    assert abs(data["avg_intermediate_verification_time_per_batch"] - 0.02) < 1e-9
+    assert abs(data["avg_target_verification_time_per_batch"] - 0.05) < 1e-9
 
 
 def test_profile_greedy_token_confidence_not_all_ones():

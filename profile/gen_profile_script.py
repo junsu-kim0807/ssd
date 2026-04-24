@@ -7,9 +7,8 @@ Layout for ``--profiler_output_dir`` when ``bench.py`` is run with ``--profile``
     ./results/<profile_mode>/<method>/b<batch>/k<k|na>/<target>+<draft>/<temp_tag>[/r<R>/][<dataset_slug>/]
 
 For ``--spec_policy hierarchical``, ``r<R>`` is always present (``R`` = ``bench.py --round`` /
-``Config.target_verify_interval``). Default engine uses **fused** HV (``r`` intermediate + target
-per decode step); use ``bench.py --legacy-hierarchical-steps`` for multi-step HV. Legacy scheduling:
-intermediate while ``hv_round_idx < R``, target when ``hv_round_idx == R``. If ``--hv-rounds`` is omitted, generated jobs sweep ``R`` in
+``Config.target_verify_interval``). The engine uses **fused** HV: each decode step runs ``R``
+intermediate verifies plus one target verify. If ``--hv-rounds`` is omitted, generated jobs sweep ``R`` in
 ``{1, 2, 3}``. Job scripts and Slurm logs use ``.../<temp_tag>/r<R>/`` under ``--job-root`` / log roots.
 
 ``--batch`` and ``--length`` are independent sweep dimensions (batch sizes vs speculative ``k``).

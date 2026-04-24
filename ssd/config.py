@@ -53,10 +53,8 @@ class Config:
     # hierarchical verification (sync spec, single verify per step)
     intermediate: str = ""  # HF model dir; empty => use same path as draft
     intermediate_hf_config: AutoConfig | None = None
-    target_verify_interval: int = 1  # r: hv_round_idx 0..r-1 intermediate; hv_round_idx == r => target verify
-    # Fused HV: one engine step runs r intermediate + 1 target verify (see HierarchicalFusedStep).
-    hierarchical_fused: bool = True
-    # When True, intermediate postprocess never jumps hv_round_idx to r on EOS (avoids mixed-round batches in fused).
+    target_verify_interval: int = 1  # r: r intermediate verifies + target in one fused decode step (HierarchicalFusedStep).
+    # When True, intermediate postprocess never jumps hv_round_idx to r on EOS (avoids mixed-round batches in fused HV).
     hv_ignore_intermediate_eos: bool = False
 
     # HV verify CUDAGraph (ignored unless spec_policy=hierarchical; still gated by enforce_eager)
@@ -146,8 +144,7 @@ class Config:
                     self.intermediate_verify_gap_buckets = list(range(K + 2, 2 * K + 3))
                 if self.target_verify_varlen_buckets is None:
                     self.target_verify_varlen_buckets = list(range(K + 2, hv_target_upper + 1))
-                if self.hierarchical_fused:
-                    self.hv_ignore_intermediate_eos = True
+                self.hv_ignore_intermediate_eos = True
 
         if self.profiler_output_dir and str(self.profiler_output_dir).strip():
             if self.profiler_mode not in (

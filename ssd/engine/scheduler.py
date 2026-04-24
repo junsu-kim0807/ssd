@@ -34,9 +34,6 @@ class Scheduler:
         self.hierarchical = bool(
             config.speculate and getattr(config, "spec_policy", "") == "hierarchical"
         )
-        self.hierarchical_fused = self.hierarchical and bool(
-            getattr(config, "hierarchical_fused", True)
-        )
         self.block_manager = BlockManager(
             config.num_kvcache_blocks, config.kvcache_block_size, is_draft=False, verbose=self.verbose, max_model_len=self.max_model_len)
 
@@ -73,24 +70,6 @@ class Scheduler:
         K = self.K
         # ``r`` intermediate rounds (hv 0..r-1), each up to K+1 provisional tokens, then one spec row.
         return (r + 1) * (K + 1)
-
-    def hv_seq_lookahead_budget(self, seq: Sequence) -> int:
-        """Per-sequence decode lookahead: depends on HV round and provisional depth."""
-        r = self.config.target_verify_interval
-        K = self.K
-        p = seq.hv_num_provisional_tokens
-        u = seq.hv_round_idx
-        # Target verify when ``u == r``; include current step in remaining draft depth.
-        steps_left = max(0, r - u + 1)
-        return (K + 1) * steps_left + (p + K + 1)
-
-    def hv_target_round_lookahead(self, _seq: Sequence) -> int:
-        """Target BlockManager headroom for the target HV round, reserved from round 0 onward.
-
-        Must cover the worst-case one-shot verify candidate on committed KV: at most
-        ``r * (K+1)`` provisional tokens (``r`` intermediate rounds) + one speculate row.
-        """
-        return self.hv_target_lookahead_upper()
 
     def is_finished(self):
         return not self.waiting and not self.running
@@ -134,16 +113,6 @@ class Scheduler:
         num_batched_tokens = 0 # within this round only 
         
         while self.waiting:
-            # Option A (HV): admit new prefill only when every running seq is at round 0 so batches
-            # never mix target vs intermediate verify (see VerifierHierarchical.verify).
-            if (
-                self.hierarchical
-                and not self.hierarchical_fused
-                and self.running
-                and not all(s.hv_round_idx == 0 for s in self.running)
-            ):
-                break
-
             seq = self.waiting[0]
 
             # num tokens that are not yet in the kv cache, eg. can be <seq.num_tokens in case of prefix cache usage
@@ -180,15 +149,15 @@ class Scheduler:
             # this will need to allow F_k strat as just sum(self.fan_out_list) when we add that 
             draft_lookahead_len = compute_megaspec_lookahead(self.MQ_LEN, self.K)
             inter_lookahead_len = None
-        elif sync_spec and self.hierarchical and self.hierarchical_fused:
+        elif sync_spec and self.hierarchical:
             fused_upper = self.hv_target_lookahead_upper()
             target_lookahead_len = max(fused_upper, self.K + 2)
             draft_lookahead_len = fused_upper
             inter_lookahead_len = fused_upper
-        elif sync_spec and self.hierarchical:
-            target_lookahead_len = None
-            draft_lookahead_len = None
-            inter_lookahead_len = None
+            if __debug__:
+                assert inter_lookahead_len >= 2 * (self.K + 1), (
+                    f"HV fused inter_lookahead_len={inter_lookahead_len} < 2*(K+1)={2 * (self.K + 1)}"
+                )
         elif sync_spec:
             target_lookahead_len = self.K + 1
             draft_lookahead_len = self.K + 1
@@ -201,31 +170,6 @@ class Scheduler:
         while self.running and num_seqs_decoded < self.max_num_seqs:
             seq = self.running.popleft()
             # print(f"[scheduler] processing seq {seq.seq_id} for decode, num_tokens={seq.num_tokens}", flush=True)
-
-            if sync_spec and self.hierarchical and self.hierarchical_fused:
-                fused_upper = self.hv_target_lookahead_upper()
-                draft_lookahead_len = fused_upper
-                inter_lookahead_len = fused_upper
-                target_lookahead_len = max(fused_upper, self.K + 2)
-                if __debug__:
-                    assert inter_lookahead_len >= 2 * (self.K + 1), (
-                        f"HV fused inter_lookahead_len={inter_lookahead_len} < 2*(K+1)={2 * (self.K + 1)}"
-                    )
-            elif sync_spec and self.hierarchical:
-                # Role-specific headroom: target needs one verify chain; draft/inter accumulate
-                # logical depth across HV rounds (see hierarchical plan / hv_seq_lookahead_budget).
-                draft_lookahead_len = self.hv_seq_lookahead_budget(seq)
-                inter_lookahead_len = self.hv_seq_lookahead_budget(seq)
-                target_lookahead_len = max(
-                    self.hv_target_round_lookahead(seq),
-                    self.K + 2,
-                )
-                if __debug__:
-                    # Intermediate verify CUDagraph trailing padding uses query lengths up to 2K+2;
-                    # ``hv_seq_lookahead_budget`` must reserve at least that much intermediate headroom.
-                    assert inter_lookahead_len >= 2 * (self.K + 1), (
-                        f"HV inter_lookahead_len={inter_lookahead_len} < 2*(K+1)={2 * (self.K + 1)}"
-                    )
 
             while not self.bms_can_append(seq, target_lookahead_len, draft_lookahead_len, inter_lookahead_len):
                 if self.running:  # eject a running sequence if one exists
@@ -540,25 +484,10 @@ class Scheduler:
             else:
                 seq.hv_round_idx += 1
             seq.num_draft_cached_tokens = len(seq) - 1 + seq.hv_num_provisional_tokens
-            # Intermediate / draft tail trim: on legacy HV, the next engine step re-enters
-            # ``schedule()`` and ``may_append()`` regrows block headroom. On **fused** HV,
-            # ``may_append`` ran only at this step's start; trimming here drops that headroom
-            # before later ``speculate()`` draft forwards in the same step, so skip trim when
-            # fused (attention still gated by ``context_len`` / cached frontiers). Target
-            # commit and ``preempt`` still deallocate / reconcile tables.
-            if not self.hierarchical_fused:
-                # Intermediate KV depth advances by ``accept_n + 1`` inside
-                # ``VerifierHierarchical._verify_intermediate_round`` (Fix 1). Positions in the
-                # physical write past that point are stale; trim block tail so next round
-                # re-allocates and overwrites.
-                self._hv_trim_block_tail(self.intermediate_block_manager, seq, seq.num_inter_cached_tokens)
-                # Fix 3: invalidate draft KV past the new logical draft frontier. Draft physically
-                # wrote its own speculated tail at positions [committed..committed+K], but only
-                # [committed..committed+n] match what intermediate chose; positions beyond diverge.
-                # ``num_draft_cached_tokens`` already gates attention via ``context_len``, but
-                # trim releases the surplus tail blocks so future re-allocation gives a clean
-                # write surface (no silent reliance on overwrite ordering).
-                self._hv_trim_block_tail(self.draft_block_manager, seq, seq.num_draft_cached_tokens)
+            # Fused HV: do not trim draft/intermediate block tails here — ``may_append`` ran once
+            # at this engine step's start; trimming would shrink headroom before later ``speculate()``
+            # draft runs. Attention is gated by ``context_len`` / cached frontiers; target commit and
+            # ``preempt`` reconcile tables.
             if getattr(self.config, "debug_mode", False):
                 print(
                     "[HV_BLOCK_DEBUG:hv_apply] "
