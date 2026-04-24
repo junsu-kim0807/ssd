@@ -90,6 +90,7 @@ class SpecDecodeStep(InferenceStep):
         pre_comp_lens: list[int],
         round_idx_start: list[int],
         dbg_target_cands: list[list[int]] | None,
+        fused_subround_idx: int | None = None,
     ) -> None:
         """One JSON line per sequence when ``config.debug_mode`` and hierarchical (bench --debug)."""
         if not isinstance(self.verifier, VerifierHierarchical):
@@ -113,6 +114,8 @@ class SpecDecodeStep(InferenceStep):
                     seq.completion_token_ids[pre_comp_lens[bi] :]
                 ),
             }
+            if fused_subround_idx is not None:
+                row["hv_fused_subround_idx"] = int(fused_subround_idx)
             print(json.dumps(row, ensure_ascii=False), flush=True)
 
     def _profiler_active(self) -> bool:
@@ -369,3 +372,271 @@ class SpecDecodeStep(InferenceStep):
                 pass
 
         return sum(len(s) for s in out_verify_result.new_suffixes)
+
+
+def _hv_rollback_committed_tape(seqs: list[Sequence], saved: list[tuple]) -> None:
+    """Drop transient speculative ``token_ids`` tail; restore committed target tape fields.
+
+    Draft KV logical frontier must stay aligned with HV provisional tape after each
+    ``_hv_apply_local_intermediate_round`` (see ``prepare_decode_tensors_from_seqs``:
+    ``num_draft_cached_tokens == len(seq) - 1 + hv_num_provisional_tokens`` when P>0).
+    The step-entry snapshot's ``orig_ndc`` is only valid while ``hv_num_provisional_tokens == 0``
+    (prefill matches full committed draft cache, not ``len-1``).
+    """
+    for seq, t in zip(seqs, saved):
+        orig_len, orig_nt, orig_lt, orig_ndc, orig_nct = t
+        del seq.token_ids[orig_len:]
+        seq.num_tokens = orig_nt
+        seq.last_token = orig_lt
+        seq.num_cached_tokens = orig_nct
+        if seq.hv_num_provisional_tokens > 0:
+            seq.num_draft_cached_tokens = len(seq) - 1 + seq.hv_num_provisional_tokens
+        else:
+            seq.num_draft_cached_tokens = orig_ndc
+
+
+class HierarchicalFusedStep(SpecDecodeStep):
+    """One engine step runs ``r`` intermediate verifies + one target verify (fused hierarchical)."""
+
+    def _hv_fused_flush_profiler_rows(
+        self,
+        pr: SSDProfiler,
+        seqs: list[Sequence],
+        speculate_result,
+        verify_result,
+        subround_idx: int,
+        engine_step_id: int,
+        draft_wall_s: float,
+        verify_wall_s: float,
+    ) -> None:
+        if not pr.wants_metadata_computation():
+            return
+        st = pr.current_step_state
+        if st is None or speculate_result.logits_q is None or speculate_result.logits_q.numel() == 0:
+            return
+        k = self.verifier.lookahead
+        f_ids, f_conf, d_ids, d_conf = draft_metadata_from_logits(
+            speculate_result.logits_q, speculate_result.speculations, k
+        )
+        B = len(seqs)
+        step_wall = pr.current_step_elapsed_s()
+        nd = st.num_draft_requests_step or B
+        nv = st.num_verification_requests_step or B
+        draft_row_s = (
+            float(st.draft_time_worker_s)
+            if pr.draft_async and st.draft_time_worker_s > 0.0
+            else draft_wall_s
+        )
+        rows = []
+        for bi, seq in enumerate(seqs):
+            ch = None
+            if speculate_result.cache_hits is not None:
+                ch = int(speculate_result.cache_hits[bi].item())
+            rows.append(
+                trace_to_row_indexed(
+                    profiler=pr,
+                    seq=seq,
+                    batch_index=bi,
+                    batch_size=B,
+                    is_prefill=False,
+                    speculate_k=k,
+                    spec_policy=pr.spec_policy,
+                    draft_async=pr.draft_async,
+                    cache_hit=ch,
+                    trace=verify_result.profile_trace,
+                    first_draft_token_ids=f_ids[bi],
+                    first_draft_token_confidence=f_conf[bi],
+                    draft_token_ids_per_position=d_ids[bi],
+                    draft_token_confidence_per_position=d_conf[bi],
+                    step_wall_time_s=step_wall,
+                    draft_time_s=draft_row_s,
+                    verification_time_s=verify_wall_s,
+                    sync_time_s=st.sync_time_s,
+                    num_draft=nd,
+                    num_verification=nv,
+                    cost_fields=(pr.mode == "cost_metadata"),
+                    hv_fused_subround_idx=subround_idx,
+                    hv_fused_engine_step_id=engine_step_id,
+                )
+            )
+        pr.flush_spec_decode_rows(seqs, False, rows)
+
+    def decode(self, seqs: list[Sequence]) -> int:
+        _prof = os.environ.get("SSD_PROFILE", "0") == "1"
+        if _prof:
+            torch.cuda.synchronize()
+            _t_outer0 = perf_counter()
+
+        verifier = self.verifier
+        assert isinstance(verifier, VerifierHierarchical), "HierarchicalFusedStep requires VerifierHierarchical"
+        assert not self.eagle and not self.async_spec
+        assert self.scheduler.config.hv_ignore_intermediate_eos, (
+            "HierarchicalFusedStep requires Config.hv_ignore_intermediate_eos=True "
+            "(intermediate EOS must not jump hv_round_idx to r per-seq; avoids mixed-round batches)."
+        )
+
+        pr = self.profiler
+        _nvtx = None
+        if self._profiler_active() and pr.wants_kernel():
+            try:
+                import torch.cuda.nvtx as _nvtx_mod
+
+                _nvtx = _nvtx_mod
+                _nvtx.range_push("spec_decode")
+            except Exception:
+                _nvtx = None
+
+        dbg_hv_pre_comp: list[int] | None = None
+        dbg_hv_round0: list[int] | None = None
+        if getattr(self.scheduler.config, "debug_mode", False):
+            dbg_hv_pre_comp = [seq.num_completion_tokens for seq in seqs]
+            dbg_hv_round0 = [seq.hv_round_idx for seq in seqs]
+
+        saved = [
+            (
+                len(seq.token_ids),
+                seq.num_tokens,
+                seq.last_token,
+                seq.num_draft_cached_tokens,
+                seq.num_cached_tokens,
+            )
+            for seq in seqs
+        ]
+
+        r = verifier.r
+        eagle_sentinel = True if self.eagle else None
+        in_verify_result = VerifyResult(
+            new_suffixes=[],
+            recovery_tokens=[],
+            eagle_acts=eagle_sentinel,
+        )
+
+        fused_engine_step_id = (
+            int(pr.decode_metadata_step_id()) if self._profiler_active() else 0
+        )
+
+        for u in range(r):
+            _hv_rollback_committed_tape(seqs, saved)
+            if self._profiler_active():
+                pr.bump_draft_requests(len(seqs))
+                pr.start_stage("draft")
+            t_d0 = perf_counter()
+            speculate_result = self.speculator.speculate(seqs, in_verify_result)
+            draft_wall_s = perf_counter() - t_d0
+            if self._profiler_active():
+                pr.finish_stage("draft")
+            t_v0 = perf_counter()
+            vr_inter = verifier.verify_intermediate_round(
+                seqs, speculate_result, emit_step_metrics=False
+            )
+            verify_wall_s = perf_counter() - t_v0
+            if self._profiler_active():
+                pr.accum_hierarchical_verify_time(verify_wall_s, True)
+                pr.record_decode_verify_batch(seqs, vr_inter)
+                self._hv_fused_flush_profiler_rows(
+                    pr,
+                    seqs,
+                    speculate_result,
+                    vr_inter,
+                    u,
+                    fused_engine_step_id,
+                    draft_wall_s,
+                    verify_wall_s,
+                )
+
+            if (
+                dbg_hv_pre_comp is not None
+                and dbg_hv_round0 is not None
+                and getattr(self.scheduler.config, "debug_mode", False)
+            ):
+                self._hv_correctness_debug_log(
+                    seqs,
+                    speculate_result,
+                    vr_inter,
+                    dbg_hv_pre_comp,
+                    dbg_hv_round0,
+                    None,
+                    fused_subround_idx=u,
+                )
+
+            _hv_rollback_committed_tape(seqs, saved)
+            self.scheduler._hv_apply_local_intermediate_round(
+                seqs, vr_inter.new_suffixes, vr_inter.recovery_tokens
+            )
+
+        _hv_rollback_committed_tape(seqs, saved)
+        if self._profiler_active():
+            pr.bump_draft_requests(len(seqs))
+            pr.start_stage("draft")
+        t_d0 = perf_counter()
+        speculate_result_tgt = self.speculator.speculate(seqs, in_verify_result)
+        draft_wall_s = perf_counter() - t_d0
+        if self._profiler_active():
+            pr.finish_stage("draft")
+        t_v0 = perf_counter()
+        vr_tgt = verifier.verify_target_round(
+            seqs, speculate_result_tgt, emit_step_metrics=True
+        )
+        verify_wall_s = perf_counter() - t_v0
+        if self._profiler_active():
+            pr.accum_hierarchical_verify_time(verify_wall_s, False)
+            pr.record_decode_verify_batch(seqs, vr_tgt)
+            self._hv_fused_flush_profiler_rows(
+                pr,
+                seqs,
+                speculate_result_tgt,
+                vr_tgt,
+                r,
+                fused_engine_step_id,
+                draft_wall_s,
+                verify_wall_s,
+            )
+
+        dbg_target_cands: list[list[int]] | None = None
+        if getattr(self.scheduler.config, "debug_mode", False):
+            dbg_target_cands = verifier._build_target_candidates(seqs, speculate_result_tgt)
+
+        _hv_rollback_committed_tape(seqs, saved)
+
+        if self._profiler_active():
+            pr.start_stage("postprocess")
+        self.scheduler.postprocess_hv_target_round(
+            seqs,
+            vr_tgt.new_suffixes,
+            vr_tgt.recovery_tokens,
+            eagle_acts=vr_tgt.eagle_acts if self.eagle else None,
+        )
+        if self._profiler_active():
+            pr.finish_stage("postprocess")
+
+        if (
+            dbg_hv_pre_comp is not None
+            and dbg_hv_round0 is not None
+            and getattr(self.scheduler.config, "debug_mode", False)
+        ):
+            self._hv_correctness_debug_log(
+                seqs,
+                speculate_result_tgt,
+                vr_tgt,
+                dbg_hv_pre_comp,
+                dbg_hv_round0,
+                dbg_target_cands,
+                fused_subround_idx=r,
+            )
+
+        if _prof:
+            torch.cuda.synchronize()
+            _t_outer1 = perf_counter()
+            toks = sum(len(s) for s in vr_tgt.new_suffixes)
+            print(
+                f"[PROFILE target] fused_decode_total_ms={(_t_outer1-_t_outer0)*1000:.2f}ms toks={toks}",
+                flush=True,
+            )
+
+        if _nvtx is not None:
+            try:
+                _nvtx.range_pop()
+            except Exception:
+                pass
+
+        return sum(len(s) for s in vr_tgt.new_suffixes)

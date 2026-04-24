@@ -97,8 +97,14 @@ def parse_arguments():
         metavar="R",
         dest="target_verify_interval",
         help="Hierarchical spec only (--spec --spec_policy hierarchical): index r (>=1). "
-        "Intermediate verify while hv_round_idx < r; target verify when hv_round_idx == r. "
+        "Intermediate verify while hv_round_idx < r; target verify when hv_round_idx == r "
+        "(legacy stepping); fused mode runs r intermediates + target in one engine step. "
         "Sets Config.target_verify_interval (default when omitted: from config, typically 1).",
+    )
+    parser.add_argument(
+        "--legacy-hierarchical-steps",
+        action="store_true",
+        help="Hierarchical only: disable fused decode (set hierarchical_fused=False; multi-step HV).",
     )
     parser.add_argument("--threshold", type=float, default=0.8,
                         help="Pivot confidence threshold")
@@ -460,6 +466,9 @@ def create_llm_kwargs(args, draft_path):
 
     if getattr(args, "target_verify_interval", None) is not None:
         llm_kwargs["target_verify_interval"] = int(args.target_verify_interval)
+
+    if args.spec and args.spec_policy == "hierarchical" and getattr(args, "legacy_hierarchical_steps", False):
+        llm_kwargs["hierarchical_fused"] = False
 
     if args.flh is not None:
         llm_kwargs["fan_out_list"] = args.flh

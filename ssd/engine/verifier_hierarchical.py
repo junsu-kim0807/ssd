@@ -66,8 +66,12 @@ class VerifierHierarchical(VerifierBase):
             seq.num_inter_cached_tokens = seq.num_tokens
         return VerifyResult([], [seq.recovery_token_id for seq in seqs], None, is_hv_intermediate=False)
 
-    def _verify_intermediate_round(
-        self, seqs: list[Sequence], speculate_result: SpeculateResult
+    def verify_intermediate_round(
+        self,
+        seqs: list[Sequence],
+        speculate_result: SpeculateResult,
+        *,
+        emit_step_metrics: bool = True,
     ) -> VerifyResult:
         K = self.lookahead
         batch_size = len(seqs)
@@ -148,9 +152,15 @@ class VerifierHierarchical(VerifierBase):
                 inter_bonus_token=bonus_tokens,
             )
 
-        return VerifyResult(
+        vr = VerifyResult(
             new_suffixes, recovery_tokens, None, is_hv_intermediate=True, profile_trace=profile_trace
         )
+        lens = [len(s) for s in vr.new_suffixes]
+        if emit_step_metrics:
+            self.metrics.setdefault("accepted_suffix_lens_with_recovery", []).extend(lens)
+        else:
+            self.metrics.setdefault("hv_fused_intermediate_suffix_lens", []).extend(lens)
+        return vr
 
     def _build_target_candidates(self, seqs: list[Sequence], speculate_result: SpeculateResult) -> list[list[int]]:
         out: list[list[int]] = []
@@ -166,8 +176,12 @@ class VerifierHierarchical(VerifierBase):
             out.append(parts)
         return out
 
-    def _verify_target_round(
-        self, seqs: list[Sequence], speculate_result: SpeculateResult
+    def verify_target_round(
+        self,
+        seqs: list[Sequence],
+        speculate_result: SpeculateResult,
+        *,
+        emit_step_metrics: bool = True,
     ) -> VerifyResult:
         candidates = self._build_target_candidates(seqs, speculate_result)
         # prepare_verify_tensors_varlen uses seq.num_cached_tokens as the KV frontier.
@@ -230,9 +244,14 @@ class VerifierHierarchical(VerifierBase):
                 inter_target_prefix_accept_len=inter_target_prefix_accepts,
             )
 
-        return VerifyResult(
+        vr = VerifyResult(
             new_suffixes, recovery_tokens, None, is_hv_intermediate=False, profile_trace=profile_trace
         )
+        if emit_step_metrics:
+            self.metrics.setdefault("accepted_suffix_lens_with_recovery", []).extend(
+                [len(s) for s in vr.new_suffixes]
+            )
+        return vr
 
     def verify(self, seqs: list[Sequence], speculate_result: SpeculateResult, eagle: bool = False) -> VerifyResult:
         assert not eagle
@@ -242,14 +261,13 @@ class VerifierHierarchical(VerifierBase):
             t0 = perf_counter()
 
         if all(self._is_target_round(s) for s in seqs):
-            vr = self._verify_target_round(seqs, speculate_result)
+            vr = self.verify_target_round(seqs, speculate_result, emit_step_metrics=True)
         else:
             assert all(not self._is_target_round(s) for s in seqs), "mixed target/intermediate rounds in one batch unsupported"
-            vr = self._verify_intermediate_round(seqs, speculate_result)
+            vr = self.verify_intermediate_round(seqs, speculate_result, emit_step_metrics=True)
 
         if _prof:
             torch.cuda.synchronize()
             print(f"[PROFILE verify hierarchical] {(perf_counter()-t0)*1000:.2f}ms inter={vr.is_hv_intermediate}", flush=True)
 
-        self.metrics.setdefault("accepted_suffix_lens_with_recovery", []).extend([len(s) for s in vr.new_suffixes])
         return vr

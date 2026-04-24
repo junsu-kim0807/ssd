@@ -143,6 +143,8 @@ def trace_to_row_indexed(
     num_draft: int,
     num_verification: int,
     cost_fields: bool,
+    hv_fused_subround_idx: int | None = None,
+    hv_fused_engine_step_id: int | None = None,
 ) -> dict[str, Any]:
     inter_r, tgt_r = profiler.inter_target_counts_for_seq(seq.seq_id)
     # Decode JSONL uses a decode-only counter so prefill engine steps do not create gaps in ids.
@@ -233,4 +235,8 @@ def trace_to_row_indexed(
         row["sync_time_s"] = sync_time_s
         row["num_draft"] = num_draft
         row["num_verification"] = num_verification
+    if hv_fused_subround_idx is not None:
+        row["hv_fused_subround_idx"] = int(hv_fused_subround_idx)
+    if hv_fused_engine_step_id is not None:
+        row["hv_fused_engine_step_id"] = int(hv_fused_engine_step_id)
     return row

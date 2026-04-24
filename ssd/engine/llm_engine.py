@@ -10,7 +10,7 @@ from ssd.engine.model_runner import ModelRunner
 from ssd.engine.draft_runner import DraftRunner
 from ssd.engine.speculator_async import SpeculatorAsync
 from ssd.engine.speculator_sync import SpeculatorSync
-from ssd.engine.step import InferenceStep, AutoRegressiveStep, SpecDecodeStep
+from ssd.engine.step import InferenceStep, AutoRegressiveStep, SpecDecodeStep, HierarchicalFusedStep
 from ssd.engine.verifier import Verifier
 from ssd.engine.verifier_pivot import VerifierPivot
 from ssd.engine.verifier_hierarchical import VerifierHierarchical
@@ -28,6 +28,7 @@ import torch.multiprocessing as mp
 METRICS = {
     "cache_hits": [],
     "accepted_suffix_lens_with_recovery": [],
+    "hv_fused_intermediate_suffix_lens": [],
     "accepted_suffix_lens_on_hit": [],  # Only for cache hits in async mode
     "accepted_suffix_lens_on_miss": [],  # Only for cache misses in async mode
     "prefill_total_time": 0,
@@ -393,7 +394,14 @@ class LLMEngine:
                     metrics=METRICS,
                     enable_profile_trace=_ptrace,
                 )
-            return SpecDecodeStep(
+            step_cls = SpecDecodeStep
+            if config.spec_policy == "hierarchical" and getattr(config, "hierarchical_fused", True):
+                # Fused HV must not advance only some seqs to target round on intermediate EOS
+                # (mixed batch in verify_intermediate_round). Config.__post_init__ also sets this;
+                # force here so callers using dataclasses.replace etc. cannot violate the invariant.
+                config.hv_ignore_intermediate_eos = True
+                step_cls = HierarchicalFusedStep
+            return step_cls(
                 scheduler=self.scheduler,
                 speculator=speculator,
                 verifier=verifier,

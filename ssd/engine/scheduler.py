@@ -34,6 +34,9 @@ class Scheduler:
         self.hierarchical = bool(
             config.speculate and getattr(config, "spec_policy", "") == "hierarchical"
         )
+        self.hierarchical_fused = self.hierarchical and bool(
+            getattr(config, "hierarchical_fused", True)
+        )
         self.block_manager = BlockManager(
             config.num_kvcache_blocks, config.kvcache_block_size, is_draft=False, verbose=self.verbose, max_model_len=self.max_model_len)
 
@@ -133,7 +136,12 @@ class Scheduler:
         while self.waiting:
             # Option A (HV): admit new prefill only when every running seq is at round 0 so batches
             # never mix target vs intermediate verify (see VerifierHierarchical.verify).
-            if self.hierarchical and self.running and not all(s.hv_round_idx == 0 for s in self.running):
+            if (
+                self.hierarchical
+                and not self.hierarchical_fused
+                and self.running
+                and not all(s.hv_round_idx == 0 for s in self.running)
+            ):
                 break
 
             seq = self.waiting[0]
@@ -172,6 +180,11 @@ class Scheduler:
             # this will need to allow F_k strat as just sum(self.fan_out_list) when we add that 
             draft_lookahead_len = compute_megaspec_lookahead(self.MQ_LEN, self.K)
             inter_lookahead_len = None
+        elif sync_spec and self.hierarchical and self.hierarchical_fused:
+            fused_upper = self.hv_target_lookahead_upper()
+            target_lookahead_len = max(fused_upper, self.K + 2)
+            draft_lookahead_len = fused_upper
+            inter_lookahead_len = fused_upper
         elif sync_spec and self.hierarchical:
             target_lookahead_len = None
             draft_lookahead_len = None
@@ -189,7 +202,16 @@ class Scheduler:
             seq = self.running.popleft()
             # print(f"[scheduler] processing seq {seq.seq_id} for decode, num_tokens={seq.num_tokens}", flush=True)
 
-            if sync_spec and self.hierarchical:
+            if sync_spec and self.hierarchical and self.hierarchical_fused:
+                fused_upper = self.hv_target_lookahead_upper()
+                draft_lookahead_len = fused_upper
+                inter_lookahead_len = fused_upper
+                target_lookahead_len = max(fused_upper, self.K + 2)
+                if __debug__:
+                    assert inter_lookahead_len >= 2 * (self.K + 1), (
+                        f"HV fused inter_lookahead_len={inter_lookahead_len} < 2*(K+1)={2 * (self.K + 1)}"
+                    )
+            elif sync_spec and self.hierarchical:
                 # Role-specific headroom: target needs one verify chain; draft/inter accumulate
                 # logical depth across HV rounds (see hierarchical plan / hv_seq_lookahead_budget).
                 draft_lookahead_len = self.hv_seq_lookahead_budget(seq)
@@ -447,7 +469,7 @@ class Scheduler:
                     self.intermediate_block_manager.deallocate(seq)
                 self.running.remove(seq)
 
-    def postprocess_hv_intermediate_round(
+    def _hv_apply_local_intermediate_round(
         self,
         seqs: list[Sequence],
         new_suffixes: list[list[int]],
@@ -455,6 +477,7 @@ class Scheduler:
     ) -> None:
         """Update HV provisional state and draft frontier; no committed token_ids change."""
         r = self.config.target_verify_interval
+        ignore_inter_eos = bool(getattr(self.config, "hv_ignore_intermediate_eos", False))
         for seq, suffix, rec in zip(seqs, new_suffixes, recovery_tokens):
             assert len(suffix) >= 1
             # ``suffix[0]`` is the speculative column-0 recovery, which already matches
@@ -471,7 +494,7 @@ class Scheduler:
             seq.hv_provisional_recovery_token_id = None
             seq.recovery_token_id = rec
             seq.intermediate_last_spec_step_accepted_len = len(suffix)
-            if not seq.ignore_eos and self.eos in suffix:
+            if (not ignore_inter_eos) and (not seq.ignore_eos) and (self.eos in suffix):
                 seq.hv_round_idx = r
             else:
                 seq.hv_round_idx += 1
@@ -488,6 +511,15 @@ class Scheduler:
             # trim releases the surplus tail blocks so future re-allocation gives a clean
             # write surface (no silent reliance on overwrite ordering).
             self._hv_trim_block_tail(self.draft_block_manager, seq, seq.num_draft_cached_tokens)
+
+    def postprocess_hv_intermediate_round(
+        self,
+        seqs: list[Sequence],
+        new_suffixes: list[list[int]],
+        recovery_tokens: list[int],
+    ) -> None:
+        """Update HV provisional state and draft frontier; no committed token_ids change."""
+        self._hv_apply_local_intermediate_round(seqs, new_suffixes, recovery_tokens)
 
     def postprocess_hv_target_round(
         self,

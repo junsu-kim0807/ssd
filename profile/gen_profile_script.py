@@ -7,8 +7,9 @@ Layout for ``--profiler_output_dir`` when ``bench.py`` is run with ``--profile``
     ./results/<profile_mode>/<method>/b<batch>/k<k|na>/<target>+<draft>/<temp_tag>[/r<R>/][<dataset_slug>/]
 
 For ``--spec_policy hierarchical``, ``r<R>`` is always present (``R`` = ``bench.py --round`` /
-``Config.target_verify_interval``): intermediate verify while ``hv_round_idx < R``, target verify
-when ``hv_round_idx == R``. If ``--hv-rounds`` is omitted, generated jobs sweep ``R`` in
+``Config.target_verify_interval``). Default engine uses **fused** HV (``r`` intermediate + target
+per decode step); use ``bench.py --legacy-hierarchical-steps`` for multi-step HV. Legacy scheduling:
+intermediate while ``hv_round_idx < R``, target when ``hv_round_idx == R``. If ``--hv-rounds`` is omitted, generated jobs sweep ``R`` in
 ``{1, 2, 3}``. Job scripts and Slurm logs use ``.../<temp_tag>/r<R>/`` under ``--job-root`` / log roots.
 
 ``--batch`` and ``--length`` are independent sweep dimensions (batch sizes vs speculative ``k``).
@@ -72,15 +73,15 @@ DEFAULT_MEM_PER_GPU = "128G"
 DEFAULT_TIME_LIMIT = "04:00:00"
 DEFAULT_CPUS_PER_TASK = 16
 
-BATCH_SWEEP = (1, 16, 32, 64, 128)
+BATCH_SWEEP = (1, 2, 4, 8, 16)
 K_SWEEP = (3, 5, 7, 9)
 TEMP_SWEEP = (0.0, 0.3, 0.7, 1.0)
 
 # Hierarchical: default sweep for ``bench.py --round`` when ``--hv-rounds`` is not passed.
 HV_ROUND_SWEEP_DEFAULT = (1, 2, 3)
 
-FIXED_NUMSEQS = 256
-FIXED_OUTPUT_LEN = 2048
+FIXED_NUMSEQS = 128
+FIXED_OUTPUT_LEN = 512
 
 PROFILE_MODE_CHOICES = ("cost", "metadata", "cost_metadata")
 
