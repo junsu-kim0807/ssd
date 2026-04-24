@@ -90,7 +90,7 @@ MULTI_DATASET_PROFILE_SLUGS: tuple[str, ...] = (
     "humaneval",
     "gsm8k",
     "math500",
-    "codeelo",
+    # "codeelo",
     "livecodebench",
 )
 
