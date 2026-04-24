@@ -128,6 +128,7 @@ def ensure_benchmark_dataset(args) -> None:
             "codeelo",
             "math500",
             "govreport",
+            "livecodebench_lite",
         ):
             _ensure_single_dataset_file(name, m)
         return

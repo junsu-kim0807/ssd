@@ -14,7 +14,7 @@ intermediate verifies plus one target verify. If ``--hv-rounds`` is omitted, gen
 ``--batch`` and ``--length`` are independent sweep dimensions (batch sizes vs speculative ``k``).
 
 When **either** ``--batch`` or ``--length`` is set, generated jobs cover the profile dataset set
-(alpaca, humaneval, gsm8k, math500, codeelo): profiler paths ``.../b<b>/k.../t0/r<R>/<dataset>/`` for hierarchical.
+(alpaca, humaneval, gsm8k, math500, codeelo, livecodebench): profiler paths ``.../b<b>/k.../t0/r<R>/<dataset>/`` for hierarchical.
 By default, **one Slurm script per dataset** (job name ``<dataset>_<family>_<method>_b<b>_<kpath>_<temp_tag>``).
 With ``--all``, one Slurm script runs every dataset in a ``for`` loop. ``--dataset`` is ignored in that mode.
 Job scripts and logs live under the same ``.../b<b>/k.../<pair>/t<tag>/`` layout; hierarchical adds ``r<R>/`` after ``t<tag>``.
@@ -91,6 +91,7 @@ MULTI_DATASET_PROFILE_SLUGS: tuple[str, ...] = (
     "gsm8k",
     "math500",
     "codeelo",
+    "livecodebench",
 )
 
 MODEL_PRESETS: dict[str, tuple[str, str, str]] = {
@@ -491,6 +492,7 @@ def build_multi_dataset_profile_loop_sh(
         "    gsm8k) EXTRA_DS=();;",
         "    math500) EXTRA_DS=(--math500);;",
         "    codeelo) EXTRA_DS=(--codeelo);;",
+        "    livecodebench) EXTRA_DS=(--livecodebench);;",
         '    *) echo "unknown dataset: ${dataset}" >&2; exit 1;;',
         "  esac",
         "  python -O bench/bench.py \\",

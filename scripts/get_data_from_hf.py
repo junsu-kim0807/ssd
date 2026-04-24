@@ -2,6 +2,9 @@ import os
 import json
 from datasets import load_dataset
 
+LIVECODEBENCH_LITE_DATASET = "sam-paech/livecodebench-code_generation_lite"
+LIVECODEBENCH_LITE_CONFIG = "release_v5"
+LIVECODEBENCH_LITE_MAX = 10000
 
 def get_base_output_dir():
     """Root for processed JSONL files. Prefer SSD_DATASET_DIR (same as bench/ssd.paths)."""
@@ -288,8 +291,13 @@ LIVECODEBENCH_LITE_CONFIG = "release_v5"
 LIVECODEBENCH_LITE_MAX = 10000
 
 
+LIVECODEBENCH_LITE_DATASET = "sam-paech/livecodebench-code_generation_lite"
+LIVECODEBENCH_LITE_CONFIG = "release_v5"
+LIVECODEBENCH_LITE_MAX = 10000
+
+
 def download_livecodebench_code_generation_lite_data(num_samples=None):
-    """Download livecodebench/code_generation_lite to JSONL with {\"text\": ...} per line."""
+    """Download LiveCodeBench code_generation_lite to JSONL with {"text": ...} per line."""
     output_dir = os.path.join(get_base_output_dir(), "livecodebench_lite")
     os.makedirs(output_dir, exist_ok=True)
 
@@ -299,51 +307,60 @@ def download_livecodebench_code_generation_lite_data(num_samples=None):
     else:
         num_samples = min(num_samples, max_samples)
 
-    output_file = os.path.join(output_dir, "livecodebench_lite_data_10000.jsonl")
+    output_file = os.path.join(
+        output_dir,
+        f"livecodebench_lite_{LIVECODEBENCH_LITE_CONFIG}_{num_samples}.jsonl",
+    )
 
     if os.path.exists(output_file):
         print(f"File {output_file} already exists. Skipping download.")
         return output_file
 
     print(
-        f"Loading livecodebench/code_generation_lite (config={LIVECODEBENCH_LITE_CONFIG})..."
+        f"Loading {LIVECODEBENCH_LITE_DATASET} "
+        f"(split={LIVECODEBENCH_LITE_CONFIG})..."
     )
-    dataset = None
-    last_err: Exception | None = None
-    for split in ("test", "train"):
-        try:
-            dataset = load_dataset(
-                "livecodebench/code_generation_lite",
-                LIVECODEBENCH_LITE_CONFIG,
-                split=split,
-                trust_remote_code=True,
-            )
-            print(f"Using split={split!r} ({len(dataset)} rows)")
-            break
-        except Exception as e:
-            last_err = e
-    if dataset is None:
-        raise RuntimeError("LiveCodeBench lite: could not load test or train split") from last_err
+
+    try:
+        dataset = load_dataset(
+            LIVECODEBENCH_LITE_DATASET,
+            split=LIVECODEBENCH_LITE_CONFIG,
+            columns=["question_title", "question_content", "starter_code"],
+        )
+    except TypeError:
+        dataset = load_dataset(
+            LIVECODEBENCH_LITE_DATASET,
+            split=LIVECODEBENCH_LITE_CONFIG,
+        )
+    except Exception as e:
+        raise RuntimeError(
+            f"Failed to load LiveCodeBench lite from "
+            f"{LIVECODEBENCH_LITE_DATASET} split={LIVECODEBENCH_LITE_CONFIG}"
+        ) from e
 
     total_samples = len(dataset)
     samples_to_process = min(num_samples, total_samples)
+    print(f"Using split={LIVECODEBENCH_LITE_CONFIG!r} ({total_samples} rows)")
 
     with open(output_file, "w", encoding="utf-8") as f:
         for i in range(samples_to_process):
             example = dataset[i]
+
             title = example.get("question_title") or ""
             body = example.get("question_content") or ""
             starter = example.get("starter_code") or ""
+
             parts = []
-            if title:
+            if title.strip():
                 parts.append(title.strip())
-            if body:
+            if body.strip():
                 parts.append(body.strip())
             if starter.strip():
                 parts.append("Starter code:\n" + starter.strip())
-            text = "\n\n".join(parts) if parts else ""
-            sample = {"text": text}
-            f.write(json.dumps(sample, ensure_ascii=False) + "\n")
+
+            text = "\n\n".join(parts).strip()
+            f.write(json.dumps({"text": text}, ensure_ascii=False) + "\n")
+
             if i % 200 == 0:
                 print(f"Processed {i}/{samples_to_process} samples...")
 
