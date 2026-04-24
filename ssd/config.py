@@ -21,7 +21,7 @@ class Config:
     max_num_batched_tokens: int = 16384
     max_num_seqs: int = 1 
     max_model_len: int = 4096 
-    # Bench defaults to 0.55 when ``spec_policy=hierarchical`` (sync: target shard 0 + draft + intermediate on GPU 0).
+    # Bench defaults to 0.55 when ``spec_policy=hierarchical`` (sync: target intermediate shard 0 + draft).
     gpu_memory_utilization: float = 0.7
     num_gpus: int = 1
     enforce_eager: bool = False

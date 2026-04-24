@@ -23,7 +23,7 @@ def make_intermediate_shard_config(cfg: Config) -> Config:
     graphs (exact ``K+1`` and optional gap buckets); otherwise it falls back to eager.
     """
     path = cfg.intermediate or cfg.draft
-    util = min(0.45, max(0.05, cfg.gpu_memory_utilization * 0.4))
+    util = min(0.3, max(0.05, cfg.gpu_memory_utilization * 0.4))
     return dataclasses.replace(
         cfg,
         model=path,

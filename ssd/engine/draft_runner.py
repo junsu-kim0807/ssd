@@ -24,7 +24,8 @@ class DraftRunner(ModelRunner):
         draft_cfg = dataclasses.replace(
             cfg,
             model=cfg.draft,
-            gpu_memory_utilization = (0.75 if not cfg.draft_async else 0.8), # REMAINING SPACE if not draft_async
+            # gpu_memory_utilization = (0.75 if not cfg.draft_async else 0.8), # Legacy
+            gpu_memory_utilization = (0.55 if not cfg.draft_async else 0.8), # REMAINING SPACE if not draft_async
             tokenizer_path=cfg.model if cfg.use_eagle else None,
             d_model_target=(
                 _decoder_cfg(cfg.hf_config).hidden_size
