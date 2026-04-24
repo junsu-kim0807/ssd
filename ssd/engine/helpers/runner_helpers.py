@@ -73,7 +73,6 @@ def prepare_decode_tensors_from_seqs(
         assert k == -1, "k should be -1 for normal decoding or draft fwd in speculation"
         for seq in seqs:
             block_table, num_cached_tokens = _kv_block_table_and_cached(seq, is_draft, is_intermediate)
-            assert len(seq) // block_size <= len(block_table), "in sync spec draft decode, not enough blocks allocated"
             expected = len(seq) - 1 + (seq.hv_num_provisional_tokens if is_draft else 0)
             assert num_cached_tokens == expected, (
                 f"num_cached_tokens should be {expected} in sq decode path "
@@ -97,12 +96,30 @@ def prepare_decode_tensors_from_seqs(
                 last_tok = seq.last_token
                 logical_pos = len(seq) - 1
                 context_len = len(seq)
+            if is_draft:
+                required_blocks = (context_len + block_size - 1) // block_size
+                assert required_blocks <= len(block_table), (
+                    f"draft block_table too short: need {required_blocks}, have {len(block_table)} "
+                    f"(len={len(seq)}, prov={seq.hv_num_provisional_tokens}, "
+                    f"logical_pos={logical_pos}, context_len={context_len}, "
+                    f"num_draft_cached_tokens={seq.num_draft_cached_tokens})"
+                )
+            else:
+                assert len(seq) // block_size <= len(block_table), (
+                    "in sync spec decode: committed tape spans more blocks than allocated"
+                )
+
             input_ids.append(last_tok)
             positions.append(logical_pos)
             context_lens.append(context_len)
 
             block_idx = logical_pos // block_size
             pos_in_block = logical_pos % block_size
+            assert block_idx < len(block_table), (
+                f"block_idx={block_idx} out of range for block_table len={len(block_table)} "
+                f"(is_draft={is_draft}, is_intermediate={is_intermediate}, "
+                f"logical_pos={logical_pos}, context_len={context_len})"
+            )
             slot_mapping.append(block_table[block_idx] * block_size + pos_in_block)
     else:  # verify and glue decode prep both go here
         assert not is_draft, "verify path only supported for target model" # we prep tensors to send to draft for glue on the target 

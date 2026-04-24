@@ -66,6 +66,16 @@ class BlockManager:
             return seq.num_inter_cached_tokens
         return seq.num_cached_tokens
 
+    def _effective_tokens_for_capacity(self, seq: Sequence) -> int:
+        """Token extent for block headroom (may exceed ``len(seq)`` for HV provisional tails)."""
+        if self.cache_role == "draft":
+            # Draft KV covers logical positions through ``num_draft_cached_tokens - 1``; the next
+            # speculate forward writes at that frontier (see ``prepare_decode_tensors_from_seqs``).
+            return max(seq.num_tokens, seq.num_draft_cached_tokens + 1)
+        if self.cache_role == "intermediate":
+            return max(seq.num_tokens, seq.num_inter_cached_tokens)
+        return seq.num_tokens
+
     def _bump_cached_tokens(self, seq: Sequence, delta: int) -> None:
         if self.cache_role == "draft":
             seq.num_draft_cached_tokens += delta
@@ -172,9 +182,7 @@ class BlockManager:
 
     def can_append(self, seq: Sequence, lookahead_num_tokens: int = 1) -> bool:
         block_table = self._block_table(seq)
-        eff_tokens = seq.num_tokens
-        if self.cache_role == "intermediate":
-            eff_tokens = max(seq.num_tokens, seq.num_inter_cached_tokens)
+        eff_tokens = self._effective_tokens_for_capacity(seq)
 
         # Check if sequence length + lookahead would exceed max model length
         if eff_tokens + lookahead_num_tokens > self.max_model_len:
@@ -194,9 +202,7 @@ class BlockManager:
 
     def may_append(self, seq: Sequence, lookahead_num_tokens: int = 1):
         block_table = self._block_table(seq)
-        eff_tokens = seq.num_tokens
-        if self.cache_role == "intermediate":
-            eff_tokens = max(seq.num_tokens, seq.num_inter_cached_tokens)
+        eff_tokens = self._effective_tokens_for_capacity(seq)
 
         # How many blocks do we need in total to cover current tokens + lookahead?
         target_blocks = (eff_tokens + lookahead_num_tokens +
