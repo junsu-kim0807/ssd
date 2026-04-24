@@ -517,6 +517,23 @@ class HierarchicalFusedStep(SpecDecodeStep):
 
         for u in range(r):
             _hv_rollback_committed_tape(seqs, saved)
+            if getattr(self.scheduler.config, "debug_mode", False):
+                for seq in seqs:
+                    print(
+                        "[HV_BLOCK_DEBUG:fused_round_start] "
+                        f"subround={u} "
+                        f"seq_id={seq.seq_id} "
+                        f"num_tokens={seq.num_tokens} "
+                        f"num_cached_tokens={seq.num_cached_tokens} "
+                        f"num_draft_cached_tokens={seq.num_draft_cached_tokens} "
+                        f"num_inter_cached_tokens={seq.num_inter_cached_tokens} "
+                        f"hv_num_provisional_tokens={seq.hv_num_provisional_tokens} "
+                        f"hv_round_idx={seq.hv_round_idx} "
+                        f"draft_blocks={len(seq.draft_block_table)} "
+                        f"inter_blocks={len(seq.inter_block_table)} "
+                        f"target_blocks={len(seq.block_table)}",
+                        flush=True,
+                    )
             if self._profiler_active():
                 pr.bump_draft_requests(len(seqs))
                 pr.start_stage("draft")
@@ -565,6 +582,23 @@ class HierarchicalFusedStep(SpecDecodeStep):
             )
 
         _hv_rollback_committed_tape(seqs, saved)
+        if getattr(self.scheduler.config, "debug_mode", False):
+            for seq in seqs:
+                print(
+                    "[HV_BLOCK_DEBUG:fused_round_start] "
+                    f"subround=target "
+                    f"seq_id={seq.seq_id} "
+                    f"num_tokens={seq.num_tokens} "
+                    f"num_cached_tokens={seq.num_cached_tokens} "
+                    f"num_draft_cached_tokens={seq.num_draft_cached_tokens} "
+                    f"num_inter_cached_tokens={seq.num_inter_cached_tokens} "
+                    f"hv_num_provisional_tokens={seq.hv_num_provisional_tokens} "
+                    f"hv_round_idx={seq.hv_round_idx} "
+                    f"draft_blocks={len(seq.draft_block_table)} "
+                    f"inter_blocks={len(seq.inter_block_table)} "
+                    f"target_blocks={len(seq.block_table)}",
+                    flush=True,
+                )
         if self._profiler_active():
             pr.bump_draft_requests(len(seqs))
             pr.start_stage("draft")

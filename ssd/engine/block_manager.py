@@ -196,9 +196,28 @@ class BlockManager:
 
         if target_blocks > current_blocks:
             needed = target_blocks - current_blocks
-            return len(self.free_block_ids) >= needed
+            ok = len(self.free_block_ids) >= needed
         else:
-            return True  # Current blocks are sufficient
+            ok = True  # Current blocks are sufficient
+        if self.verbose:
+            print(
+                "[HV_BLOCK_DEBUG:bms_can_append] "
+                f"role={self.cache_role} "
+                f"seq_id={seq.seq_id} "
+                f"num_tokens={seq.num_tokens} "
+                f"num_cached_tokens={seq.num_cached_tokens} "
+                f"num_draft_cached_tokens={seq.num_draft_cached_tokens} "
+                f"num_inter_cached_tokens={getattr(seq, 'num_inter_cached_tokens', None)} "
+                f"hv_num_provisional_tokens={getattr(seq, 'hv_num_provisional_tokens', 0)} "
+                f"eff_tokens={eff_tokens} "
+                f"lookahead_num_tokens={lookahead_num_tokens} "
+                f"current_blocks={current_blocks} "
+                f"target_blocks={target_blocks} "
+                f"free_blocks={len(self.free_block_ids)} "
+                f"can_append={ok}",
+                flush=True,
+            )
+        return ok
 
     def may_append(self, seq: Sequence, lookahead_num_tokens: int = 1):
         block_table = self._block_table(seq)
@@ -208,10 +227,30 @@ class BlockManager:
         target_blocks = (eff_tokens + lookahead_num_tokens +
                          self.block_size - 1) // self.block_size
         current_blocks = len(block_table)
+        if self.verbose:
+            print(
+                "[HV_BLOCK_DEBUG:bms_may_append_before] "
+                f"role={self.cache_role} "
+                f"seq_id={seq.seq_id} "
+                f"eff_tokens={eff_tokens} "
+                f"lookahead_num_tokens={lookahead_num_tokens} "
+                f"current_blocks={current_blocks} "
+                f"target_blocks={target_blocks}",
+                flush=True,
+            )
 
         if target_blocks > current_blocks:
             needed = target_blocks - current_blocks
             new_blocks = self._allocate_n_blocks(needed)
             for block in new_blocks:
                 block_table.append(block.block_id)
+        if self.verbose:
+            print(
+                "[HV_BLOCK_DEBUG:bms_may_append_after] "
+                f"role={self.cache_role} "
+                f"seq_id={seq.seq_id} "
+                f"current_blocks={len(block_table)} "
+                f"block_table={block_table}",
+                flush=True,
+            )
 

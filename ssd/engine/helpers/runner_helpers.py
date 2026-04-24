@@ -63,6 +63,9 @@ def prepare_decode_tensors_from_seqs(
     verify: bool = False,
     k: int = -1,
     is_intermediate: bool = False,
+    *,
+    hv_block_debug: bool = False,
+    decode_lookahead_hint: int = 0,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     input_ids = []
     positions = []
@@ -96,13 +99,51 @@ def prepare_decode_tensors_from_seqs(
                 last_tok = seq.last_token
                 logical_pos = len(seq) - 1
                 context_len = len(seq)
+            required_blocks_now = (context_len + block_size - 1) // block_size
+            required_blocks_with_lookahead = (
+                (context_len + decode_lookahead_hint + block_size - 1) // block_size
+                if decode_lookahead_hint > 0
+                else required_blocks_now
+            )
+
+            if hv_block_debug and (is_draft or is_intermediate):
+                _prov = int(getattr(seq, "hv_num_provisional_tokens", 0))
+                _dctx = (len(seq) - 1 + _prov) if is_draft else None
+                print(
+                    "[HV_BLOCK_DEBUG:prepare_decode] "
+                    f"seq_id={seq.seq_id} "
+                    f"is_draft={is_draft} "
+                    f"is_intermediate={is_intermediate} "
+                    f"num_tokens={seq.num_tokens} "
+                    f"num_draft_cached_tokens={seq.num_draft_cached_tokens} "
+                    f"hv_num_provisional_tokens={_prov} "
+                    f"hv_round_idx={getattr(seq, 'hv_round_idx', None)} "
+                    f"len_draft_block_table={len(seq.draft_block_table)} "
+                    f"draft_context_len={_dctx if is_draft else 'n/a'} "
+                    f"context_len={context_len} "
+                    f"logical_pos={logical_pos} "
+                    f"required_blocks={required_blocks_now} "
+                    f"decode_lookahead_hint={decode_lookahead_hint} "
+                    f"required_blocks_with_lookahead={required_blocks_with_lookahead} "
+                    f"block_table_len={len(block_table)} "
+                    f"num_inter_cached_tokens={getattr(seq, 'num_inter_cached_tokens', None)} "
+                    f"len_inter_block_table={len(getattr(seq, 'inter_block_table', []))}",
+                    flush=True,
+                )
+
             if is_draft:
-                required_blocks = (context_len + block_size - 1) // block_size
-                assert required_blocks <= len(block_table), (
-                    f"draft block_table too short: need {required_blocks}, have {len(block_table)} "
-                    f"(len={len(seq)}, prov={seq.hv_num_provisional_tokens}, "
-                    f"logical_pos={logical_pos}, context_len={context_len}, "
-                    f"num_draft_cached_tokens={seq.num_draft_cached_tokens})"
+                assert required_blocks_now <= len(block_table), (
+                    "[HV_BLOCK_ASSERT:prepare_decode] "
+                    f"seq_id={seq.seq_id} "
+                    f"num_tokens={seq.num_tokens} "
+                    f"num_draft_cached_tokens={seq.num_draft_cached_tokens} "
+                    f"hv_num_provisional_tokens={seq.hv_num_provisional_tokens} "
+                    f"context_len={context_len} "
+                    f"logical_pos={logical_pos} "
+                    f"block_idx={(logical_pos // block_size)} "
+                    f"required_blocks={required_blocks_now} "
+                    f"block_table_len={len(block_table)} "
+                    f"block_table={block_table}"
                 )
             else:
                 assert len(seq) // block_size <= len(block_table), (
@@ -116,9 +157,17 @@ def prepare_decode_tensors_from_seqs(
             block_idx = logical_pos // block_size
             pos_in_block = logical_pos % block_size
             assert block_idx < len(block_table), (
-                f"block_idx={block_idx} out of range for block_table len={len(block_table)} "
-                f"(is_draft={is_draft}, is_intermediate={is_intermediate}, "
-                f"logical_pos={logical_pos}, context_len={context_len})"
+                "[HV_BLOCK_ASSERT:block_idx] "
+                f"seq_id={seq.seq_id} "
+                f"is_draft={is_draft} "
+                f"is_intermediate={is_intermediate} "
+                f"block_idx={block_idx} "
+                f"block_table_len={len(block_table)} "
+                f"context_len={context_len} "
+                f"logical_pos={logical_pos} "
+                f"num_draft_cached_tokens={seq.num_draft_cached_tokens} "
+                f"hv_num_provisional_tokens={getattr(seq, 'hv_num_provisional_tokens', 0)} "
+                f"num_inter_cached_tokens={getattr(seq, 'num_inter_cached_tokens', None)}"
             )
             slot_mapping.append(block_table[block_idx] * block_size + pos_in_block)
     else:  # verify and glue decode prep both go here

@@ -875,11 +875,17 @@ class ModelRunner:
         return input_ids, positions
     
     def prepare_decode(self, seqs: list[Sequence], verify: bool = False):
+        _hv_dbg = bool(getattr(self.config, "debug_mode", False))
+        _lookahead_hint = (
+            int(self.config.speculate_k) + 1 if (self.is_draft and not verify) else 0
+        )
         input_ids, positions, slot_mapping, context_lens = \
             prepare_decode_tensors_from_seqs(
                 seqs, self.block_size, self.is_draft, verify,
                 self.config.speculate_k if verify else -1,
                 is_intermediate=self.intermediate_mode,
+                hv_block_debug=_hv_dbg,
+                decode_lookahead_hint=_lookahead_hint,
             )
 
         block_tables = prepare_block_tables_from_seqs(

@@ -237,11 +237,52 @@ class Scheduler:
 
             else:  # can_append = True and we didn't preempt ourselves, subtle while-else pattern 
                 num_seqs_decoded += 1
+                if getattr(self.config, "debug_mode", False):
+                    _tb, _db, _ib = (
+                        len(seq.block_table),
+                        len(seq.draft_block_table),
+                        len(seq.inter_block_table),
+                    )
+                    print(
+                        "[HV_BLOCK_DEBUG:schedule_before] "
+                        f"seq_id={seq.seq_id} "
+                        f"num_tokens={seq.num_tokens} "
+                        f"num_cached_tokens={seq.num_cached_tokens} "
+                        f"num_draft_cached_tokens={seq.num_draft_cached_tokens} "
+                        f"num_inter_cached_tokens={seq.num_inter_cached_tokens} "
+                        f"hv_num_provisional_tokens={seq.hv_num_provisional_tokens} "
+                        f"hv_round_idx={seq.hv_round_idx} "
+                        f"target_lookahead_len={target_lookahead_len} "
+                        f"draft_lookahead_len={draft_lookahead_len} "
+                        f"inter_lookahead_len={inter_lookahead_len} "
+                        f"target_blocks={_tb} "
+                        f"draft_blocks={_db} "
+                        f"inter_blocks={_ib}",
+                        flush=True,
+                    )
                 self.block_manager.may_append(seq, target_lookahead_len)
                 if self.speculate:
                     self.draft_block_manager.may_append(seq, draft_lookahead_len)
                 if self.intermediate_block_manager is not None:
                     self.intermediate_block_manager.may_append(seq, inter_lookahead_len)
+                if getattr(self.config, "debug_mode", False):
+                    print(
+                        "[HV_BLOCK_DEBUG:schedule_after] "
+                        f"seq_id={seq.seq_id} "
+                        f"num_tokens={seq.num_tokens} "
+                        f"num_cached_tokens={seq.num_cached_tokens} "
+                        f"num_draft_cached_tokens={seq.num_draft_cached_tokens} "
+                        f"num_inter_cached_tokens={seq.num_inter_cached_tokens} "
+                        f"hv_num_provisional_tokens={seq.hv_num_provisional_tokens} "
+                        f"hv_round_idx={seq.hv_round_idx} "
+                        f"target_blocks={len(seq.block_table)} "
+                        f"draft_blocks={len(seq.draft_block_table)} "
+                        f"inter_blocks={len(seq.inter_block_table)} "
+                        f"target_block_table={seq.block_table} "
+                        f"draft_block_table={seq.draft_block_table} "
+                        f"inter_block_table={seq.inter_block_table}",
+                        flush=True,
+                    )
                 scheduled_seqs.append(seq)
 
         self.running.extendleft(reversed(scheduled_seqs))
@@ -499,18 +540,44 @@ class Scheduler:
             else:
                 seq.hv_round_idx += 1
             seq.num_draft_cached_tokens = len(seq) - 1 + seq.hv_num_provisional_tokens
-            # Intermediate KV depth advances by ``accept_n + 1`` inside
-            # ``VerifierHierarchical._verify_intermediate_round`` (Fix 1). Positions in the
-            # physical write past that point are stale; trim block tail so next round
-            # re-allocates and overwrites.
-            self._hv_trim_block_tail(self.intermediate_block_manager, seq, seq.num_inter_cached_tokens)
-            # Fix 3: invalidate draft KV past the new logical draft frontier. Draft physically
-            # wrote its own speculated tail at positions [committed..committed+K], but only
-            # [committed..committed+n] match what intermediate chose; positions beyond diverge.
-            # ``num_draft_cached_tokens`` already gates attention via ``context_len``, but
-            # trim releases the surplus tail blocks so future re-allocation gives a clean
-            # write surface (no silent reliance on overwrite ordering).
-            self._hv_trim_block_tail(self.draft_block_manager, seq, seq.num_draft_cached_tokens)
+            # Intermediate / draft tail trim: on legacy HV, the next engine step re-enters
+            # ``schedule()`` and ``may_append()`` regrows block headroom. On **fused** HV,
+            # ``may_append`` ran only at this step's start; trimming here drops that headroom
+            # before later ``speculate()`` draft forwards in the same step, so skip trim when
+            # fused (attention still gated by ``context_len`` / cached frontiers). Target
+            # commit and ``preempt`` still deallocate / reconcile tables.
+            if not self.hierarchical_fused:
+                # Intermediate KV depth advances by ``accept_n + 1`` inside
+                # ``VerifierHierarchical._verify_intermediate_round`` (Fix 1). Positions in the
+                # physical write past that point are stale; trim block tail so next round
+                # re-allocates and overwrites.
+                self._hv_trim_block_tail(self.intermediate_block_manager, seq, seq.num_inter_cached_tokens)
+                # Fix 3: invalidate draft KV past the new logical draft frontier. Draft physically
+                # wrote its own speculated tail at positions [committed..committed+K], but only
+                # [committed..committed+n] match what intermediate chose; positions beyond diverge.
+                # ``num_draft_cached_tokens`` already gates attention via ``context_len``, but
+                # trim releases the surplus tail blocks so future re-allocation gives a clean
+                # write surface (no silent reliance on overwrite ordering).
+                self._hv_trim_block_tail(self.draft_block_manager, seq, seq.num_draft_cached_tokens)
+            if getattr(self.config, "debug_mode", False):
+                print(
+                    "[HV_BLOCK_DEBUG:hv_apply] "
+                    f"seq_id={seq.seq_id} "
+                    f"suffix_len={len(suffix)} "
+                    f"recovery_token={rec} "
+                    f"hv_round_idx={seq.hv_round_idx} "
+                    f"hv_num_provisional_tokens={seq.hv_num_provisional_tokens} "
+                    f"hv_provisional_token_ids={seq.hv_provisional_token_ids} "
+                    f"num_cached_tokens={seq.num_cached_tokens} "
+                    f"num_draft_cached_tokens={seq.num_draft_cached_tokens} "
+                    f"num_inter_cached_tokens={seq.num_inter_cached_tokens} "
+                    f"target_blocks={len(seq.block_table)} "
+                    f"draft_blocks={len(seq.draft_block_table)} "
+                    f"inter_blocks={len(seq.inter_block_table)} "
+                    f"draft_block_table={seq.draft_block_table} "
+                    f"inter_block_table={seq.inter_block_table}",
+                    flush=True,
+                )
 
     def postprocess_hv_intermediate_round(
         self,
