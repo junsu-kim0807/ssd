@@ -25,7 +25,8 @@ Sweep flags (optional, Cartesian product with other dimensions):
   --temp    → temperatures 0, 0.3, 0.7, 1.0
 
 Default ``--methods`` includes ``hierarchical`` (sync spec + ``--spec_policy hierarchical``)
-and ``pivot`` (async + extra flags). Override with ``--methods ar,sync`` etc.
+and planner pivot ``pivot`` (sync spec + ``--spec_policy pivot``). Legacy pivot remains
+available as ``pivot_legacy``.
 
 Adding a method
     1. Define ``extra_bench_args(k, async_fan_out) -> list[str]`` (tokens only; no ``--gpus``).
@@ -91,7 +92,7 @@ MULTI_DATASET_PROFILE_SLUGS: tuple[str, ...] = (
     "gsm8k",
     "math500",
     "codeelo",
-    "livecodebench",
+    # "livecodebench",
 )
 
 MODEL_PRESETS: dict[str, tuple[str, str, str]] = {
@@ -112,21 +113,25 @@ DEFAULT_GPU_BY_FAMILY_METHOD: dict[tuple[str, str], int] = {
     ("llama", "async"): 4,
     ("llama", "hierarchical"): 4,
     ("llama", "pivot"): 4,
+    ("llama", "pivot_legacy"): 4,
     ("qwen", "ar"): 2,
     ("qwen", "sync"): 2,
     ("qwen", "async"): 3,
     ("qwen", "hierarchical"): 2,
-    ("qwen", "pivot"): 3,
+    ("qwen", "pivot"): 2,
+    ("qwen", "pivot_legacy"): 3,
     ("gemma", "ar"): 2,
     ("gemma", "sync"): 2,
     ("gemma", "async"): 3,
     ("gemma", "hierarchical"): 2,
-    ("gemma", "pivot"): 3,
+    ("gemma", "pivot"): 2,
+    ("gemma", "pivot_legacy"): 3,
     ("vicuna13b_160m", "ar"): 2,
     ("vicuna13b_160m", "sync"): 2,
     ("vicuna13b_160m", "async"): 3,
     ("vicuna13b_160m", "hierarchical"): 2,
-    ("vicuna13b_160m", "pivot"): 3,
+    ("vicuna13b_160m", "pivot"): 2,
+    ("vicuna13b_160m", "pivot_legacy"): 3,
 }
 
 
@@ -205,6 +210,10 @@ def _args_hierarchical(k: int, _f: int) -> list[str]:
 
 
 def _args_pivot(k: int, f: int) -> list[str]:
+    return ["--spec", "--k", str(k), "--spec_policy", "pivot"]
+
+
+def _args_pivot_legacy(k: int, f: int) -> list[str]:
     return [
         "--spec",
         "--async",
@@ -249,10 +258,17 @@ METHOD_REGISTRY: dict[str, BenchMethodSpec] = {
     ),
     "pivot": BenchMethodSpec(
         id="pivot",
-        description="Async legacy pivot policy (--spec_policy pivot_legacy --spec_hive)",
+        description="Planner pivot policy (--spec_policy pivot)",
         uses_spec_k=True,
         default_k=3,
         extra_bench_args=_args_pivot,
+    ),
+    "pivot_legacy": BenchMethodSpec(
+        id="pivot_legacy",
+        description="Async legacy pivot policy (--spec_policy pivot_legacy --spec_hive)",
+        uses_spec_k=True,
+        default_k=3,
+        extra_bench_args=_args_pivot_legacy,
     ),
 }
 
@@ -665,8 +681,8 @@ def main() -> None:
         "--methods",
         type=str,
         default="ar,sync,async,hierarchical,pivot",
-        help="Comma-separated method ids: ar | sync | async | hierarchical | pivot "
-        "(pivot needs async + 3 GPUs in the default GPU table; override with --gpus).",
+        help="Comma-separated method ids: ar | sync | async | hierarchical | pivot | pivot_legacy "
+        "(pivot is sync planner policy; pivot_legacy keeps async + spec_hive path).",
     )
     p.add_argument(
         "--dataset",
