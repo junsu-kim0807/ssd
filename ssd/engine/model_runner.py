@@ -55,6 +55,8 @@ from ssd.engine.spec_policy_traits import uses_hierarchical_verify, uses_target_
 # rank0 without bench --debug. Set False or delete this block and the branch in
 # ``_debug_eager_fallback_log`` to restore debug-only logging.
 _LOG_HV_EAGER_FALLBACK_WITHOUT_DEBUG = True
+# Log draft/verification eager execution on rank0 even without debug mode.
+_LOG_EAGER_MODE_USAGE_WITHOUT_DEBUG = True
 # ---------------------------------------------------------------------------
 
 
@@ -503,6 +505,22 @@ class ModelRunner:
             and uses_hierarchical_verify(getattr(self.config, "spec_policy", ""))
         ):
             print(f"[REMOVE_ME HV_EAGER_FALLBACK_LOG] {line}", flush=True)
+
+    def _log_eager_mode_usage(self, component: str, stage: str, reason: str, **details: object) -> None:
+        """Log eager execution in draft/verification paths on rank0.
+
+        This is intentionally emitted even when ``debug_mode`` is off so cost/profile
+        runs can confirm whether hot paths bypassed CUDAGraph.
+        """
+        if getattr(self, "rank", 0) != 0:
+            return
+        if not _LOG_EAGER_MODE_USAGE_WITHOUT_DEBUG:
+            return
+        extra = "".join(f" {k}={v!r}" for k, v in details.items())
+        print(
+            f"[eager_mode] component={component} stage={stage} reason={reason!r}{extra}",
+            flush=True,
+        )
 
     def run_intermediate_verify_cudagraph(self, input_ids: torch.Tensor, positions: torch.Tensor, bucket_q_len: int):
         k1 = self.config.speculate_k + 1
@@ -986,6 +1004,12 @@ class ModelRunner:
         max_L = max(strides_eager) if strides_eager else 0
 
         def _eager_forward() -> tuple[torch.Tensor, list[int]]:
+            self._log_eager_mode_usage(
+                "run_verify_varlen",
+                "verification",
+                "varlen_verify_eager_forward",
+                nseq=len(seqs),
+            )
             eager_was = self.enforce_eager
             self.enforce_eager = True
             try:
@@ -1216,6 +1240,14 @@ class ModelRunner:
                     else False
                 ),
             )
+            self._log_eager_mode_usage(
+                "run_intermediate_verify_suffix",
+                "verification",
+                "intermediate_verify_fallback_to_eager",
+                nseq=nseq,
+                max_actual_q=max_actual_q,
+                bucket_q=bucket_q,
+            )
 
         force_eager = True
         try:
@@ -1330,6 +1362,20 @@ class ModelRunner:
         assert not (is_prefill and not last_only), "ERROR in run_model: is_prefill and not last_only"
         
         if is_prefill or self.enforce_eager:
+            if not is_prefill and self.enforce_eager:
+                if not last_only:
+                    stage = "verification"
+                elif self.is_draft:
+                    stage = "draft"
+                else:
+                    stage = "decode"
+                self._log_eager_mode_usage(
+                    "run_model",
+                    stage,
+                    "enforce_eager",
+                    is_draft=bool(self.is_draft),
+                    intermediate_mode=bool(self.intermediate_mode),
+                )
             if is_tree_decode:
                 self.eager_tree_decode_plan(input_ids, positions, tree_decode_step, cache_hits)
             

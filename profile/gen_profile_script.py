@@ -74,7 +74,7 @@ DEFAULT_TIME_LIMIT = "04:00:00"
 DEFAULT_CPUS_PER_TASK = 16
 
 BATCH_SWEEP = (1, 2, 4, 8, 16)
-K_SWEEP = (3, 5, 7, 9)
+K_SWEEP = (3, 5, 7, 9, 11)
 TEMP_SWEEP = (0.0, 0.3, 0.7, 1.0)
 
 # Hierarchical: default sweep for ``bench.py --round`` when ``--hv-rounds`` is not passed.
