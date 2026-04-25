@@ -217,6 +217,7 @@ class PivotExecutorFlat(VerifierBase):
         parent_bsz = bundle.parent_batch_size
 
         winners = [-1] * parent_bsz
+        winner_rows = [-1] * parent_bsz
         new_suffixes: list[list[int]] = [[] for _ in range(parent_bsz)]
         recovery_tokens = [0] * parent_bsz
 
@@ -244,6 +245,7 @@ class PivotExecutorFlat(VerifierBase):
                     best_key = key
                     best_row = r
             winners[pidx] = bundle.branch_index_per_parent[best_row]
+            winner_rows[pidx] = int(best_row)
             new_suffixes[pidx] = outcome.suffixes[best_row]
             recovery_tokens[pidx] = outcome.recovery[best_row]
 
@@ -258,6 +260,7 @@ class PivotExecutorFlat(VerifierBase):
                 ],
                 "expanded_request_target_acceptance_length": expanded_accept_len,
                 "selected_request_ids": [int(x) for x in winners],
+                "selected_expanded_row_ids": [int(x) for x in winner_rows],
                 "after_collapse_accepted_token_ids": [
                     [int(tok) for tok in suffix] for suffix in new_suffixes
                 ],
@@ -320,4 +323,5 @@ class PivotExecutorFlat(VerifierBase):
             profile_trace=profile_trace,
             postprocess_mode="speculate",
             winning_branch_idx_per_parent=winners,
+            winning_branch_row_idx_per_parent=winner_rows,
         )

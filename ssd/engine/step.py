@@ -130,16 +130,25 @@ class SpecDecodeStep(InferenceStep):
     ) -> None:
         """Non-hierarchical debug JSON rows mirroring HV correctness log schema."""
         spec_rows = speculate_result.speculations.detach().cpu().tolist()
+        winner_rows = getattr(out_verify_result, "winning_branch_row_idx_per_parent", None)
         for bi, seq in enumerate(seqs):
+            # Vanilla/non-pivot path: row index equals batch index.
+            # Pivot flat path: ``spec_rows`` is expanded-row shaped, so use the selected
+            # winner absolute row index for this parent request.
+            row_idx = bi
+            if winner_rows is not None and bi < len(winner_rows) and winner_rows[bi] is not None:
+                cand = int(winner_rows[bi])
+                if 0 <= cand < len(spec_rows):
+                    row_idx = cand
             row = {
                 "hv_correctness_debug": True,
                 "seq_id": seq.seq_id,
                 "hv_round_idx_at_step_start": 0,
-                "draft_spec_token_ids": spec_rows[bi],
+                "draft_spec_token_ids": spec_rows[row_idx],
                 "intermediate_verify_accepted_token_ids": None,
                 "target_verify_accepted_token_ids": out_verify_result.new_suffixes[bi],
                 # Vanilla speculative verify consumes one K+1 candidate row.
-                "target_verify_input_token_ids": spec_rows[bi],
+                "target_verify_input_token_ids": spec_rows[row_idx],
                 "verify_recovery_token_id": out_verify_result.recovery_tokens[bi],
                 "output_new_completion_token_ids": list(
                     seq.completion_token_ids[pre_comp_lens[bi] :]

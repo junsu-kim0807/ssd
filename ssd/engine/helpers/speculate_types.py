@@ -55,6 +55,8 @@ class VerifyResult:
     profile_trace: VerifyProfileTrace | None = None
     postprocess_mode: Literal["speculate", "hv_intermediate", "hv_target"] = "speculate"
     winning_branch_idx_per_parent: list[int] | None = None
+    # Pivot expanded-row debug support: absolute expanded row selected per parent.
+    winning_branch_row_idx_per_parent: list[int] | None = None
 
 
 class SpeculatorBase(ABC):
