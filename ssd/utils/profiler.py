@@ -276,8 +276,9 @@ class SSDProfiler:
         self._hv_inter_accept_samples: list[int] = []
         self._hv_target_accept_samples: list[int] = []
         self._hv_inter_target_prefix_samples: list[int] = []
-        self._pivot_expanded_request_count: int = 0
-        self._pivot_expanded_request_total: int = 0
+        self._pivot_before_expand_batch_sum: int = 0
+        self._pivot_after_expand_batch_sum: int = 0
+        self._pivot_expand_steps: int = 0
 
         # cost_breakdown / cost_metadata: scheduled decode batch size (len(seqs) per decode step)
         self._decode_sched_batch_sum: int = 0
@@ -374,11 +375,19 @@ class SSDProfiler:
                 "num_intermediate_verification": self._num_intermediate_verification_requests,
                 "num_target_verification": self._num_target_verification_requests,
                 "num_preemption": int(preempt_count),
-                "pivot_expanded_request_count": int(self._pivot_expanded_request_count),
-                "pivot_expanded_request_total": int(self._pivot_expanded_request_total),
-                "pivot_expanded_request_probability": (
-                    float(self._pivot_expanded_request_count) / float(self._pivot_expanded_request_total)
-                    if self._pivot_expanded_request_total > 0
+                "avg_before_expansion_batch_size": (
+                    float(self._pivot_before_expand_batch_sum) / float(self._pivot_expand_steps)
+                    if self._pivot_expand_steps > 0
+                    else None
+                ),
+                "avg_after_expansion_batch_size": (
+                    float(self._pivot_after_expand_batch_sum) / float(self._pivot_expand_steps)
+                    if self._pivot_expand_steps > 0
+                    else None
+                ),
+                "expansion_ratio": (
+                    float(self._pivot_after_expand_batch_sum) / float(self._pivot_before_expand_batch_sum)
+                    if self._pivot_before_expand_batch_sum > 0
                     else None
                 ),
                 "notes": {
@@ -436,13 +445,16 @@ class SSDProfiler:
                     "avg_target_accept_len": (
                         "mean of per-verify accept_len from profile traces (null if no trace rows with accept_len)"
                     ),
-                    "pivot_expanded_request_count": (
-                        "sum over decode verify rounds of expanded requests in pivot planner "
-                        "(e.g., a step with two expanded parents contributes +2)"
+                    "avg_before_expansion_batch_size": (
+                        "pivot decode steps: mean parent batch size before root expansion "
+                        "(len(pivot_branch_count))"
                     ),
-                    "pivot_expanded_request_probability": (
-                        "pivot_expanded_request_count / pivot_expanded_request_total "
-                        "(request-level expansion probability across traced decode verifies)"
+                    "avg_after_expansion_batch_size": (
+                        "pivot decode steps: mean expanded batch size after root expansion "
+                        "(sum(pivot_branch_count))"
+                    ),
+                    "expansion_ratio": (
+                        "avg_after_expansion_batch_size / avg_before_expansion_batch_size"
                     ),
                 },
             }
@@ -733,10 +745,13 @@ class SSDProfiler:
                 ial = getattr(trace, "inter_accept_len", None)
                 if ial is not None and i < len(ial) and ial[i] is not None:
                     self._hv_inter_accept_samples.append(int(ial[i]))
-        pexp = getattr(trace, "pivot_expanded", None)
-        if pexp is not None:
-            self._pivot_expanded_request_total += int(len(pexp))
-            self._pivot_expanded_request_count += int(sum(1 for x in pexp if bool(x)))
+        pbc = getattr(trace, "pivot_branch_count", None)
+        if pbc is not None:
+            before = int(len(pbc))
+            after = int(sum(int(x) for x in pbc))
+            self._pivot_before_expand_batch_sum += before
+            self._pivot_after_expand_batch_sum += after
+            self._pivot_expand_steps += 1
 
     def _accum_hv_cost_verify_batch_size(
         self, seqs: list[Any], verify_result: Any, trace: Any | None
