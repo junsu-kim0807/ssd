@@ -58,7 +58,7 @@ class Config:
     # planner-owned pivot expansion knobs (sync pivot / pivot_hierarchical)
     pivot_expansion_policy: Literal["static", "dynamic"] = "dynamic"
     pivot_expansion_criteria: Literal["top1", "residual"] = "residual"
-    pivot_expansion_pct: float = 0.0
+    pivot_expansion_pct: float = 0.2
     pivot_expansion_threshold: float = 0.8
     pivot_topk: int = 5
     pivot_max_root_branches: int | None = None
@@ -164,7 +164,8 @@ class Config:
                     )
                 if self.pivot_expansion_policy == "dynamic" and self.pivot_expansion_pct != 0.0:
                     print(
-                        "[Config] pivot_expansion_policy='dynamic': pivot_expansion_pct is unused.",
+                        "[Config] pivot_expansion_policy='dynamic': "
+                        "pivot_expansion_pct is used as a hard cap on expanded requests.",
                         flush=True,
                     )
             if is_pivot_legacy(self.spec_policy):

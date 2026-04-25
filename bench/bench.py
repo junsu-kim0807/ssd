@@ -118,7 +118,7 @@ def parse_arguments():
         default="residual",
         help="Planner uncertainty criteria for pivot expansion",
     )
-    parser.add_argument("--pivot_expansion_pct", type=float, default=0.0)
+    parser.add_argument("--pivot_expansion_pct", type=float, default=0.2)
     parser.add_argument("--pivot_expansion_threshold", type=float, default=0.8)
     parser.add_argument("--pivot_topk", type=int, default=5)
 

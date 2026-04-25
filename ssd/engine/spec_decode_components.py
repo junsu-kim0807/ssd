@@ -53,6 +53,18 @@ def build_spec_components(
             max_expand_rows = config.max_num_seqs + max(0, max_expand_reqs) * max(
                 0, int(config.pivot_topk) - 1
             )
+        print(
+            {
+                "spec_policy": config.spec_policy,
+                "pivot_expansion_policy": config.pivot_expansion_policy,
+                "pivot_expansion_pct": config.pivot_expansion_pct,
+                "pivot_expansion_threshold": config.pivot_expansion_threshold,
+                "pivot_expansion_criteria": config.pivot_expansion_criteria,
+                "pivot_topk": config.pivot_topk,
+                "max_expand_rows": max_expand_rows,
+            },
+            flush=True,
+        )
         speculator = PivotRootSpeculatorSync(
             lookahead=config.speculate_k,
             device=config.device,
