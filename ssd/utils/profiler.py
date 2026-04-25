@@ -753,6 +753,16 @@ class SSDProfiler:
             self._pivot_after_expand_batch_sum += after
             self._pivot_expand_steps += 1
 
+    def _record_pivot_expand_from_verify_result(self, verify_result: Any) -> None:
+        """Pivot expansion stats path for modes without VerifyProfileTrace (e.g. cost)."""
+        before = getattr(verify_result, "pivot_before_expansion_batch_size", None)
+        after = getattr(verify_result, "pivot_after_expansion_batch_size", None)
+        if before is None or after is None:
+            return
+        self._pivot_before_expand_batch_sum += int(before)
+        self._pivot_after_expand_batch_sum += int(after)
+        self._pivot_expand_steps += 1
+
     def _accum_hv_cost_verify_batch_size(
         self, seqs: list[Any], verify_result: Any, trace: Any | None
     ) -> None:
@@ -783,6 +793,8 @@ class SSDProfiler:
     def record_decode_verify_batch(self, seqs: list[Any], verify_result: Any) -> None:
         n = len(seqs)
         trace = getattr(verify_result, "profile_trace", None)
+        # Collect pivot expansion summary even when profile trace is disabled (cost mode).
+        self._record_pivot_expand_from_verify_result(verify_result)
         self._accum_hv_cost_verify_batch_size(seqs, verify_result, trace)
         if self._state is not None:
             self._state.num_verification_requests_step = n

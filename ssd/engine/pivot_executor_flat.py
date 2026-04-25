@@ -315,4 +315,6 @@ class PivotExecutorFlat(VerifierBase):
             postprocess_mode="speculate",
             winning_branch_idx_per_parent=winners,
             winning_branch_row_idx_per_parent=winner_rows,
+            pivot_before_expansion_batch_size=int(parent_bsz),
+            pivot_after_expansion_batch_size=int(len(bundle.parent_index_per_branch)),
         )

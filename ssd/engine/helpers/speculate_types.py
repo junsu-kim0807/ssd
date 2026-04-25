@@ -57,6 +57,9 @@ class VerifyResult:
     winning_branch_idx_per_parent: list[int] | None = None
     # Pivot expanded-row debug support: absolute expanded row selected per parent.
     winning_branch_row_idx_per_parent: list[int] | None = None
+    # Pivot batch expansion summary (works even when profile trace is disabled, e.g. cost mode).
+    pivot_before_expansion_batch_size: int | None = None
+    pivot_after_expansion_batch_size: int | None = None
 
 
 class SpeculatorBase(ABC):
