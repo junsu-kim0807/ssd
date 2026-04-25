@@ -223,6 +223,16 @@ def trace_to_row_indexed(
         row["pivot_top1_prob"] = None if ptop1 is None else ptop1[i]
         row["pivot_residual_score"] = None if pres is None else pres[i]
         row["pivot_expanded"] = None if pexp is None else pexp[i]
+        if pexp is None:
+            row["pivot_expanded_request_count_in_step"] = None
+            row["pivot_expanded_request_probability_in_step"] = None
+        else:
+            expanded_count = int(sum(1 for x in pexp if bool(x)))
+            total_count = int(len(pexp))
+            row["pivot_expanded_request_count_in_step"] = expanded_count
+            row["pivot_expanded_request_probability_in_step"] = (
+                float(expanded_count) / float(total_count) if total_count > 0 else 0.0
+            )
         row["pivot_branch_count"] = None if pbc is None else pbc[i]
         row["pivot_selected_branch_idx"] = None if psel is None else psel[i]
         row["pivot_selected_root_token_id"] = None if psel_tok is None else psel_tok[i]
@@ -245,6 +255,8 @@ def trace_to_row_indexed(
         row["pivot_top1_prob"] = None
         row["pivot_residual_score"] = None
         row["pivot_expanded"] = None
+        row["pivot_expanded_request_count_in_step"] = None
+        row["pivot_expanded_request_probability_in_step"] = None
         row["pivot_branch_count"] = None
         row["pivot_selected_branch_idx"] = None
         row["pivot_selected_root_token_id"] = None

@@ -276,6 +276,8 @@ class SSDProfiler:
         self._hv_inter_accept_samples: list[int] = []
         self._hv_target_accept_samples: list[int] = []
         self._hv_inter_target_prefix_samples: list[int] = []
+        self._pivot_expanded_request_count: int = 0
+        self._pivot_expanded_request_total: int = 0
 
         # cost_breakdown / cost_metadata: scheduled decode batch size (len(seqs) per decode step)
         self._decode_sched_batch_sum: int = 0
@@ -372,6 +374,13 @@ class SSDProfiler:
                 "num_intermediate_verification": self._num_intermediate_verification_requests,
                 "num_target_verification": self._num_target_verification_requests,
                 "num_preemption": int(preempt_count),
+                "pivot_expanded_request_count": int(self._pivot_expanded_request_count),
+                "pivot_expanded_request_total": int(self._pivot_expanded_request_total),
+                "pivot_expanded_request_probability": (
+                    float(self._pivot_expanded_request_count) / float(self._pivot_expanded_request_total)
+                    if self._pivot_expanded_request_total > 0
+                    else None
+                ),
                 "notes": {
                     "num_prefill_token": (
                         "sum over prefill engine steps of per-seq ``1 if remain==0 else remain`` "
@@ -426,6 +435,14 @@ class SSDProfiler:
                     ),
                     "avg_target_accept_len": (
                         "mean of per-verify accept_len from profile traces (null if no trace rows with accept_len)"
+                    ),
+                    "pivot_expanded_request_count": (
+                        "sum over decode verify rounds of expanded requests in pivot planner "
+                        "(e.g., a step with two expanded parents contributes +2)"
+                    ),
+                    "pivot_expanded_request_probability": (
+                        "pivot_expanded_request_count / pivot_expanded_request_total "
+                        "(request-level expansion probability across traced decode verifies)"
                     ),
                 },
             }
@@ -716,6 +733,10 @@ class SSDProfiler:
                 ial = getattr(trace, "inter_accept_len", None)
                 if ial is not None and i < len(ial) and ial[i] is not None:
                     self._hv_inter_accept_samples.append(int(ial[i]))
+        pexp = getattr(trace, "pivot_expanded", None)
+        if pexp is not None:
+            self._pivot_expanded_request_total += int(len(pexp))
+            self._pivot_expanded_request_count += int(sum(1 for x in pexp if bool(x)))
 
     def _accum_hv_cost_verify_batch_size(
         self, seqs: list[Any], verify_result: Any, trace: Any | None
