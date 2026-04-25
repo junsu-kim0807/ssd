@@ -24,7 +24,6 @@ class _BranchVerifyOutcome:
     suffixes: list[list[int]]
     recovery: list[int]
     accept_len: list[int]
-    confidence: list[float]
 
 
 class PivotExecutorFlat(VerifierBase):
@@ -205,8 +204,7 @@ class PivotExecutorFlat(VerifierBase):
             jit_speculate=False,
         )
         accept_len = [max(0, len(s) - 1) for s in suffixes]
-        conf = [float(torch.softmax(logits_p[i].float(), dim=-1).max(dim=-1).values.mean().item()) for i in range(b_exp)]
-        return _BranchVerifyOutcome(suffixes=suffixes, recovery=recovery, accept_len=accept_len, confidence=conf)
+        return _BranchVerifyOutcome(suffixes=suffixes, recovery=recovery, accept_len=accept_len)
 
     def verify(self, seqs: list[Sequence], speculate_result: SpeculateResult, eagle: bool = False) -> VerifyResult:
         bundle = speculate_result.branch_bundle

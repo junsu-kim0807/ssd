@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass
 
 from ssd.config import Config
@@ -44,6 +45,14 @@ def build_spec_components(
         )
 
     if config.spec_policy == "pivot":
+        max_expand_rows = config.max_num_seqs * max(1, int(config.pivot_topk))
+        if config.pivot_expansion_policy == "dynamic" and float(config.pivot_expansion_pct) > 0.0:
+            # For dynamic policy, reuse ``pivot_expansion_pct`` as a hard expansion cap.
+            # Added rows per expanded request are ``topk - 1`` (branch 0 already exists).
+            max_expand_reqs = int(math.floor(config.max_num_seqs * float(config.pivot_expansion_pct)))
+            max_expand_rows = config.max_num_seqs + max(0, max_expand_reqs) * max(
+                0, int(config.pivot_topk) - 1
+            )
         speculator = PivotRootSpeculatorSync(
             lookahead=config.speculate_k,
             device=config.device,
@@ -58,7 +67,7 @@ def build_spec_components(
                 threshold=config.pivot_expansion_threshold,
                 topk=config.pivot_topk,
             ),
-            max_expand_rows=config.max_num_seqs * max(1, int(config.pivot_topk)),
+            max_expand_rows=max_expand_rows,
         )
         verifier = PivotExecutorFlat(
             lookahead=config.speculate_k,

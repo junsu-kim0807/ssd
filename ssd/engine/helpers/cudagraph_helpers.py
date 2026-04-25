@@ -1,4 +1,5 @@
 import os
+import math
 import torch
 import numpy as np
 from typing import List
@@ -37,45 +38,29 @@ def run_verify_cudagraph_generic(
     wrapper_bs = next(x for x in graph_bs_list if x >= orig_bs)
     graph = graphs[wrapper_bs]
 
-    for k, v in graph_vars.items():
-        if k != "outputs":
-            v.zero_()
+    bs = wrapper_bs if wrapper_bs > orig_bs else orig_bs
+    flat_real = orig_bs * q_len
+    flat_wrap = bs * q_len
 
     if wrapper_bs > orig_bs:
-        pad_bs = wrapper_bs - orig_bs
-        pad_flat = pad_bs * q_len
-        dev = input_ids.device
+        graph_vars["input_ids"][flat_real:flat_wrap].zero_()
+        graph_vars["positions"][flat_real:flat_wrap].zero_()
+        graph_vars["slot_mapping"][flat_real:flat_wrap].fill_(-1)
+        graph_vars["context_lens"][orig_bs:bs].zero_()
+        if context.block_tables is not None:
+            graph_vars["block_tables"][orig_bs:bs, :].zero_()
 
-        input_ids = torch.cat([input_ids, torch.zeros(pad_flat, dtype=input_ids.dtype, device=dev)])
-        positions = torch.cat([positions, torch.zeros(pad_flat, dtype=positions.dtype, device=dev)])
-        slot_mapping = torch.cat(
-            [
-                context.slot_mapping,
-                torch.full((pad_flat,), -1, dtype=context.slot_mapping.dtype, device=dev),
-            ]
-        )
-        bt = context.block_tables
-        cl = context.context_lens
-        block_tables = torch.cat([bt, bt[orig_bs - 1 : orig_bs].expand(pad_bs, -1).contiguous()])
-        context_lens = torch.cat([cl, cl[orig_bs - 1 : orig_bs].expand(pad_bs).contiguous()])
-        bs = wrapper_bs
-    else:
-        slot_mapping = context.slot_mapping
-        block_tables = context.block_tables
-        context_lens = context.context_lens
-        bs = orig_bs
-
-    graph_vars["input_ids"][: bs * q_len] = input_ids
-    graph_vars["positions"][: bs * q_len] = positions
-    graph_vars["slot_mapping"][: bs * q_len] = slot_mapping
-    graph_vars["context_lens"][:bs] = context_lens
+    graph_vars["input_ids"][:flat_real] = input_ids
+    graph_vars["positions"][:flat_real] = positions
+    graph_vars["slot_mapping"][:flat_real] = context.slot_mapping
+    graph_vars["context_lens"][:orig_bs] = context.context_lens
     seqlen_q = torch.full((bs,), q_len, dtype=torch.int32, device=graph_vars["cu_seqlens_q"].device)
     cu = graph_vars["cu_seqlens_q"][: bs + 1]
     cu.zero_()
     cu[1:].copy_(torch.cumsum(seqlen_q, 0))
 
-    if block_tables is not None:
-        graph_vars["block_tables"][:bs, : block_tables.size(1)] = block_tables
+    if context.block_tables is not None:
+        graph_vars["block_tables"][:orig_bs, : context.block_tables.size(1)] = context.block_tables
 
     _pt = os.environ.get("SSD_PROFILE_TARGET", "0") == "1"
     if _pt:
@@ -128,13 +113,20 @@ def run_decode_cudagraph(model_runner, input_ids, positions, last_only, graph_va
     context = get_context()
 
     flat_batch_size = input_ids.size(0)
+    wrapper_bs = next(x for x in model_runner.graph_bs_list["decode"] if x >= flat_batch_size)
+    graph = model_runner.graphs["decode"][wrapper_bs]
 
-    graph = model_runner.graphs["decode"][next(
-        x for x in model_runner.graph_bs_list["decode"] if x >= flat_batch_size)]
-
-    for k, v in graph_vars.items():
-            if k != "outputs":
-                v.zero_()
+    # Avoid full-buffer zeroing for every replay. Clear only padding rows so stale
+    # values from previous larger batches cannot influence captured wrapper work.
+    if wrapper_bs > flat_batch_size:
+        graph_vars["input_ids"][flat_batch_size:wrapper_bs].zero_()
+        graph_vars["positions"][flat_batch_size:wrapper_bs].zero_()
+        graph_vars["slot_mapping"][flat_batch_size:wrapper_bs].fill_(-1)
+        graph_vars["context_lens"][flat_batch_size:wrapper_bs].zero_()
+        if "hidden_states" in graph_vars:
+            graph_vars["hidden_states"][flat_batch_size:wrapper_bs].zero_()
+        if context.block_tables is not None:
+            graph_vars["block_tables"][flat_batch_size:wrapper_bs, :].zero_()
 
     graph_vars["input_ids"][:flat_batch_size] = input_ids
     graph_vars["positions"][:flat_batch_size] = positions
@@ -476,12 +468,25 @@ def run_fi_tree_decode_cudagraph(model_runner, input_ids, positions, last_only, 
 def capture_cudagraph(model_runner):
     config = model_runner.config
     hf_config = model_runner.decoder_hf_config
+    max_seqs_cfg = int(model_runner.config.max_num_seqs)
+    topk_cfg = max(1, int(getattr(config, "pivot_topk", 1)))
+    policy = getattr(config, "spec_policy", "")
     branch_mult = pivot_max_branches(
-        getattr(config, "spec_policy", ""),
-        getattr(config, "pivot_topk", 1),
+        policy,
+        topk_cfg,
         getattr(config, "pivot_max_root_branches", None),
     )
-    max_seqs = min(model_runner.config.max_num_seqs * branch_mult, 512)
+    # Keep capture envelope aligned with runtime dynamic expansion cap when enabled.
+    if (
+        policy == "pivot"
+        and getattr(config, "pivot_expansion_policy", "") == "dynamic"
+        and float(getattr(config, "pivot_expansion_pct", 0.0)) > 0.0
+    ):
+        max_expand_reqs = int(math.floor(max_seqs_cfg * float(config.pivot_expansion_pct)))
+        max_rows = max_seqs_cfg + max(0, max_expand_reqs) * max(0, topk_cfg - 1)
+        max_seqs = min(max_rows, 512)
+    else:
+        max_seqs = min(max_seqs_cfg * branch_mult, 512)
     if model_runner.config.speculate and model_runner.config.draft_async and model_runner.is_draft:
         N = max_seqs * (model_runner.config.speculate_k + 1) * \
             model_runner.config.async_fan_out
@@ -588,12 +593,24 @@ def capture_verify_cudagraph_generic(
     config = model_runner.config
     hf_config = _decoder_hf_for_verify_capture(model_runner, model_override)
     config = model_runner.config
+    max_seqs_cfg = int(model_runner.config.max_num_seqs)
+    topk_cfg = max(1, int(getattr(config, "pivot_topk", 1)))
+    policy = getattr(config, "spec_policy", "")
     branch_mult = pivot_max_branches(
-        getattr(config, "spec_policy", ""),
-        getattr(config, "pivot_topk", 1),
+        policy,
+        topk_cfg,
         getattr(config, "pivot_max_root_branches", None),
     )
-    max_bs = min(model_runner.config.max_num_seqs * branch_mult, 512)
+    if (
+        policy == "pivot"
+        and getattr(config, "pivot_expansion_policy", "") == "dynamic"
+        and float(getattr(config, "pivot_expansion_pct", 0.0)) > 0.0
+    ):
+        max_expand_reqs = int(math.floor(max_seqs_cfg * float(config.pivot_expansion_pct)))
+        max_rows = max_seqs_cfg + max(0, max_expand_reqs) * max(0, topk_cfg - 1)
+        max_bs = min(max_rows, 512)
+    else:
+        max_bs = min(max_seqs_cfg * branch_mult, 512)
     dev = model_runner.device
 
     is_eagle_target = (

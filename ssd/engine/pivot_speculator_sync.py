@@ -14,6 +14,7 @@ from ssd.engine.pivot_branch_planner import (
 from ssd.engine.pivot_types import BranchForkState, PivotBranchBundle
 from ssd.engine.sequence import Sequence
 from ssd.engine.speculator_sync import SpeculatorSync
+from ssd.engine.pivot_branch_planner import PivotExpansionPlan
 
 
 class PivotRootSpeculatorSync(SpeculatorSync):
@@ -113,11 +114,12 @@ class PivotRootSpeculatorSync(SpeculatorSync):
 
         # Build deterministic keep order by low uncertainty score first.
         scores = plan.criteria_scores
-        order = sorted(range(bsz), key=lambda x: (float(scores[x].item()), x))
+        order = torch.argsort(scores, dim=0).cpu().tolist()
+        expand_mask_cpu = expand_mask.cpu().tolist()
         kept = torch.zeros_like(expand_mask)
 
         for idx in order:
-            if not bool(expand_mask[idx].item()):
+            if not bool(expand_mask_cpu[idx]):
                 continue
             seq = seqs[idx]
             required_tokens = seq.num_tokens + self.lookahead
@@ -204,6 +206,7 @@ class PivotRootSpeculatorSync(SpeculatorSync):
             top1_probs=plan.top1_probs,
             residual_scores=plan.residual_scores,
             branch_counts=bcounts,
+            branch_counts_tensor=torch.tensor(bcounts, dtype=torch.int64, device=self.device),
         )
 
     @staticmethod
@@ -296,7 +299,7 @@ class PivotRootSpeculatorSync(SpeculatorSync):
                     branch_index_per_parent.append(bidx)
                     root_token_ids.append(int(tok))
                     root_token_probs.append(float(probs[pidx, int(tok)].item()))
-            from ssd.engine.pivot_branch_planner import PivotExpansionPlan
+            
 
             plan = PivotExpansionPlan(
                 parent_batch_size=batch_size,
@@ -314,6 +317,7 @@ class PivotRootSpeculatorSync(SpeculatorSync):
                 top1_probs=torch.zeros(batch_size, dtype=torch.float32, device=self.device),
                 residual_scores=torch.zeros(batch_size, dtype=torch.float32, device=self.device),
                 branch_counts=branch_counts,
+                branch_counts_tensor=torch.tensor(branch_counts, dtype=torch.int64, device=self.device),
             )
             plan = self._apply_kv_capacity_limit(seqs, plan)
 
@@ -337,6 +341,15 @@ class PivotRootSpeculatorSync(SpeculatorSync):
         t_bm: BlockManager = self.scheduler.block_manager
         d_bm: BlockManager = self.scheduler.draft_block_manager
         i_bm: BlockManager | None = self.scheduler.intermediate_block_manager
+        target_copy_src_all: list[int] = []
+        target_copy_dst_all: list[int] = []
+        target_copy_valid_all: list[int] = []
+        draft_copy_src_all: list[int] = []
+        draft_copy_dst_all: list[int] = []
+        draft_copy_valid_all: list[int] = []
+        inter_copy_src_all: list[int] = []
+        inter_copy_dst_all: list[int] = []
+        inter_copy_valid_all: list[int] = []
 
         # Pass 1: clones for B > 0. ``parent.token_ids`` still ends at ``recovery``
         # at this point so each clone inherits a clean ``[..., recovery]`` tape.
@@ -375,29 +388,17 @@ class PivotRootSpeculatorSync(SpeculatorSync):
                 branch_seq.inter_block_table = list(i_plan.fork_block_table)
 
             if t_plan.copy_src_block_ids:
-                # Must go through ``call`` so every target TP rank copies its shard.
-                self.target_model_runner.call(
-                    "copy_kv_blocks",
-                    t_plan.copy_src_block_ids,
-                    t_plan.copy_dst_block_ids,
-                    t_plan.copy_valid_tokens,
-                    "target",
-                )
+                target_copy_src_all.extend(t_plan.copy_src_block_ids)
+                target_copy_dst_all.extend(t_plan.copy_dst_block_ids)
+                target_copy_valid_all.extend(t_plan.copy_valid_tokens)
             if d_plan.copy_src_block_ids:
-                self._copy_partial_cow_block(
-                    copy_src_block_ids=d_plan.copy_src_block_ids,
-                    copy_dst_block_ids=d_plan.copy_dst_block_ids,
-                    copy_valid_tokens=d_plan.copy_valid_tokens,
-                    kv_cache=self.draft_model_runner.kv_cache,
-                )
+                draft_copy_src_all.extend(d_plan.copy_src_block_ids)
+                draft_copy_dst_all.extend(d_plan.copy_dst_block_ids)
+                draft_copy_valid_all.extend(d_plan.copy_valid_tokens)
             if i_plan is not None and i_plan.copy_src_block_ids:
-                self.intermediate_runner.call(
-                    "copy_kv_blocks",
-                    i_plan.copy_src_block_ids,
-                    i_plan.copy_dst_block_ids,
-                    i_plan.copy_valid_tokens,
-                    "intermediate",
-                )
+                inter_copy_src_all.extend(i_plan.copy_src_block_ids)
+                inter_copy_dst_all.extend(i_plan.copy_dst_block_ids)
+                inter_copy_valid_all.extend(i_plan.copy_valid_tokens)
             branch_seq.append_token(int(root_token))
             expanded_seqs[row_idx] = branch_seq
             st = BranchForkState(
@@ -422,6 +423,31 @@ class PivotRootSpeculatorSync(SpeculatorSync):
             if i_plan is not None:
                 assert st.inter_shared_prefix_blocks == inter_cached0 // parent.block_size
             branch_states[row_idx] = st
+
+        if target_copy_src_all:
+            # Must go through ``call`` so every target TP rank copies its shard.
+            self.target_model_runner.call(
+                "copy_kv_blocks",
+                target_copy_src_all,
+                target_copy_dst_all,
+                target_copy_valid_all,
+                "target",
+            )
+        if draft_copy_src_all:
+            self._copy_partial_cow_block(
+                copy_src_block_ids=draft_copy_src_all,
+                copy_dst_block_ids=draft_copy_dst_all,
+                copy_valid_tokens=draft_copy_valid_all,
+                kv_cache=self.draft_model_runner.kv_cache,
+            )
+        if inter_copy_src_all and self.intermediate_runner is not None:
+            self.intermediate_runner.call(
+                "copy_kv_blocks",
+                inter_copy_src_all,
+                inter_copy_dst_all,
+                inter_copy_valid_all,
+                "intermediate",
+            )
 
         # Pass 2: branch 0 = parent in-place. Mutating ``parent.token_ids`` here is
         # safe — Pass 1 finished before this, and the outer step rolls the tape
