@@ -228,22 +228,13 @@ class PivotExecutorFlat(VerifierBase):
         for pidx in range(parent_bsz):
             rows = per_parent_rows[pidx]
             best_row = rows[0]
-            best_key = (
-                outcome.accept_len[best_row],
-                outcome.confidence[best_row],
-                bundle.root_token_probs[best_row],
-                -bundle.branch_index_per_parent[best_row],
-            )
+            best_accept = outcome.accept_len[best_row]
             for r in rows[1:]:
-                key = (
-                    outcome.accept_len[r],
-                    outcome.confidence[r],
-                    bundle.root_token_probs[r],
-                    -bundle.branch_index_per_parent[r],
-                )
-                if key > best_key:
-                    best_key = key
+                # Debug-friendly deterministic rule for temp=0 parity investigations:
+                # only switch away from branch 0 when acceptance length strictly improves.
+                if outcome.accept_len[r] > best_accept:
                     best_row = r
+                    best_accept = outcome.accept_len[r]
             winners[pidx] = bundle.branch_index_per_parent[best_row]
             winner_rows[pidx] = int(best_row)
             new_suffixes[pidx] = outcome.suffixes[best_row]
