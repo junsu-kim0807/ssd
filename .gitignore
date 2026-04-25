@@ -34,7 +34,8 @@ logs/
 *.log
 *.out
 *.err
-
+.pt
+.pytest_cache
 # Project runtime artifacts
 wandb/
 wandb_runs/

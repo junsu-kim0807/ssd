@@ -395,6 +395,56 @@ def _hv_rollback_committed_tape(seqs: list[Sequence], saved: list[tuple]) -> Non
             seq.num_draft_cached_tokens = orig_ndc
 
 
+def _hv_materialize_provisional_for_target_draft(
+    seqs: list[Sequence],
+) -> list[tuple[int, int, int, int, int]]:
+    """Physically append HV provisional tail before fused target draft."""
+    snap: list[tuple[int, int, int, int, int]] = []
+    for seq in seqs:
+        prov = list(seq.hv_provisional_token_ids)
+        assert prov, (
+            "target subround requires a non-empty provisional chain "
+            f"(seq_id={seq.seq_id}, hv_round_idx={seq.hv_round_idx})"
+        )
+        assert seq.recovery_token_id is not None, (
+            f"target subround requires recovery_token_id (seq_id={seq.seq_id})"
+        )
+        assert prov[-1] == seq.recovery_token_id, (
+            "last provisional token must equal current recovery "
+            f"(seq_id={seq.seq_id}, prov_tail={prov[-5:]}, recovery={seq.recovery_token_id})"
+        )
+        snap.append(
+            (
+                len(seq.token_ids),
+                seq.num_tokens,
+                int(seq.last_token),
+                seq.num_draft_cached_tokens,
+                seq.hv_num_provisional_tokens,
+            )
+        )
+        seq.token_ids.extend(prov)
+        seq.num_tokens += len(prov)
+        seq.last_token = int(prov[-1])
+        # Disable draft lazy path; run vanilla decode indexing for target subround.
+        seq.hv_num_provisional_tokens = 0
+        # Draft KV should be full context before the next token to emit.
+        seq.num_draft_cached_tokens = seq.num_tokens - 1
+    return snap
+
+
+def _hv_unmaterialize_after_target_draft(
+    seqs: list[Sequence],
+    snap: list[tuple[int, int, int, int, int]],
+) -> None:
+    """Undo temporary physical provisional append before final target commit."""
+    for seq, (orig_len, orig_nt, orig_lt, orig_ndc, orig_hvp) in zip(seqs, snap):
+        del seq.token_ids[orig_len:]
+        seq.num_tokens = orig_nt
+        seq.last_token = orig_lt
+        seq.num_draft_cached_tokens = orig_ndc
+        seq.hv_num_provisional_tokens = orig_hvp
+
+
 class HierarchicalFusedStep(SpecDecodeStep):
     """One engine step runs ``r`` intermediate verifies + one target verify (fused hierarchical)."""
 
@@ -602,8 +652,13 @@ class HierarchicalFusedStep(SpecDecodeStep):
         if self._profiler_active():
             pr.bump_draft_requests(len(seqs))
             pr.start_stage("draft")
+        materialized = _hv_materialize_provisional_for_target_draft(seqs)
         t_d0 = perf_counter()
-        speculate_result_tgt = self.speculator.speculate(seqs, in_verify_result)
+        speculate_result_tgt = self.speculator.speculate(
+            seqs,
+            in_verify_result,
+            recovery_already_appended=True,
+        )
         draft_wall_s = perf_counter() - t_d0
         if self._profiler_active():
             pr.finish_stage("draft")
@@ -630,6 +685,7 @@ class HierarchicalFusedStep(SpecDecodeStep):
         if getattr(self.scheduler.config, "debug_mode", False):
             dbg_target_cands = verifier._build_target_candidates(seqs, speculate_result_tgt)
 
+        _hv_unmaterialize_after_target_draft(seqs, materialized)
         _hv_rollback_committed_tape(seqs, saved)
 
         if self._profiler_active():

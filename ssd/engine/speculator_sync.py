@@ -22,7 +22,13 @@ class SpeculatorSync(SpeculatorBase):
 
         return SpeculateResult([], [])
 
-    def speculate(self, seqs: list[Sequence], verify_result: VerifyResult) -> SpeculateResult:
+    def speculate(
+        self,
+        seqs: list[Sequence],
+        verify_result: VerifyResult,
+        *,
+        recovery_already_appended: bool = False,
+    ) -> SpeculateResult:
         """Generate k speculative tokens using the draft model."""
         assert not verify_result.eagle_acts, "Eagle is not currently supported for synchronous speculation"
 
@@ -40,11 +46,19 @@ class SpeculatorSync(SpeculatorBase):
             if seq.recovery_token_id is None:
                 raise ValueError(f"recovery_token_id is None for seq {i}")
             recovery_tokens.append(seq.recovery_token_id)
-            # HV: intermediate recovery is already the last provisional token; do not duplicate
-            # it on ``token_ids`` before the first draft forward (prepare_decode uses prov[-1]).
-            prov = seq.hv_provisional_token_ids
-            skip_append = len(prov) > 0 and prov[-1] == seq.recovery_token_id
-            if not skip_append:
+            if recovery_already_appended:
+                assert seq.last_token == seq.recovery_token_id, (
+                    "recovery_already_appended=True requires seq.last_token == seq.recovery_token_id "
+                    f"(seq_id={seq.seq_id}, last_token={seq.last_token}, "
+                    f"recovery_token_id={seq.recovery_token_id})"
+                )
+            else:
+                # HV lazy mode: intermediate recovery may already be represented by the
+                # provisional tail; avoid duplicating it on token_ids before first draft fwd.
+                prov = seq.hv_provisional_token_ids
+                skip_append = len(prov) > 0 and prov[-1] == seq.recovery_token_id
+                if skip_append:
+                    continue
                 seq.append_token(seq.recovery_token_id)
         speculations[:, 0] = torch.tensor(
             recovery_tokens, dtype=torch.int64, device=self.device)
