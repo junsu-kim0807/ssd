@@ -1,3 +1,4 @@
+import json
 import time
 import torch
 from collections import deque
@@ -537,6 +538,16 @@ class Scheduler:
           of the scored ``(K+1)`` tail (see ``prepare_intermediate_verify_gapaware_tensors``).
         - ``nic == committed``: no action needed.
         """
+        hv_target_commit_debug = bool(getattr(self.config, "debug_mode", False))
+        raw_suffixes: list[list[int]] | None = None
+        pre_comp: list[int] | None = None
+        pre_num_tokens: list[int] | None = None
+        trunc_debug: list[tuple[list[int], bool]] | None = None
+        if hv_target_commit_debug:
+            raw_suffixes = [list(s) for s in new_suffixes]
+            pre_comp = [seq.num_completion_tokens for seq in seqs]
+            pre_num_tokens = [seq.num_tokens for seq in seqs]
+
         for seq in seqs:
             self._hv_discard_provisional(seq)
             seq.hv_round_idx = 0
@@ -548,7 +559,40 @@ class Scheduler:
             seq.num_draft_cached_tokens = len(seq)
             # NOTE: do NOT touch num_inter_cached_tokens here — postprocess_speculate does not
             # modify it, and we must preserve the physical intermediate frontier across commit.
+        if hv_target_commit_debug and raw_suffixes is not None:
+            trunc_debug = []
+            for seq, raw in zip(seqs, raw_suffixes):
+                trunc, finished = self._handle_eos_and_max_new_tokens(seq, list(raw))
+                trunc_debug.append((trunc, finished))
         self.postprocess_speculate(seqs, new_suffixes, next_recovery_tokens, eagle_acts=eagle_acts)
+        if (
+            hv_target_commit_debug
+            and raw_suffixes is not None
+            and pre_comp is not None
+            and pre_num_tokens is not None
+            and trunc_debug is not None
+        ):
+            for i, seq in enumerate(seqs):
+                raw = raw_suffixes[i]
+                trunc, finished_preview = trunc_debug[i]
+                post_delta = seq.num_completion_tokens - pre_comp[i]
+                row = {
+                    "hv_target_commit_debug": True,
+                    "seq_id": seq.seq_id,
+                    "pre_num_tokens": pre_num_tokens[i],
+                    "pre_completion_tokens": pre_comp[i],
+                    "raw_suffix_len": len(raw),
+                    "raw_suffix_head": raw[:3],
+                    "truncated_suffix_len_preview": len(trunc),
+                    "truncated_suffix_head_preview": trunc[:3],
+                    "post_completion_delta": post_delta,
+                    "post_num_tokens": seq.num_tokens,
+                    "next_recovery_token": int(next_recovery_tokens[i]),
+                    "finished_preview": bool(finished_preview),
+                    "is_finished": bool(seq.is_finished),
+                    "lost_by_truncation_or_commit": len(raw) - post_delta,
+                }
+                print(json.dumps(row, ensure_ascii=False), flush=True)
         for seq in seqs:
             seq.target_last_spec_step_accepted_len = seq.last_spec_step_accepted_len
             if self.intermediate_block_manager is not None:

@@ -211,6 +211,15 @@ class VerifierHierarchical(VerifierBase):
             offset += s
             cand = candidates[i]
             suffix, rec = verify_greedy_chain_variable(logits_i, cand)
+            if cand:
+                assert len(suffix) >= 1, (
+                    "target suffix must include candidate[0] recovery; "
+                    f"seq_idx={i} cand={cand} suffix={suffix}"
+                )
+                assert suffix[0] == cand[0], (
+                    "target suffix[0] should be previous target recovery; "
+                    f"seq_idx={i} cand0={cand[0]} suffix0={suffix[0]} cand={cand} suffix={suffix}"
+                )
             new_suffixes.append(suffix)
             recovery_tokens.append(rec)
             if self.enable_profile_trace:
@@ -218,7 +227,9 @@ class VerifierHierarchical(VerifierBase):
                 preds_row = logits_i.argmax(dim=-1)
                 tok_ids.append([int(preds_row[j].item()) for j in range(L)])
                 tok_conf.append([float(pr[j].max().item()) for j in range(L)])
-                acc_lens.append(max(0, len(suffix) - 1))
+                acc_len_excl_recovery = max(0, len(suffix) - 1)
+                acc_lens.append(acc_len_excl_recovery)
+                assert acc_lens[-1] == acc_len_excl_recovery
                 bonus_toks.append(int(preds_row[-1].item()))
                 cap_excl = L - K
                 itp = 0
