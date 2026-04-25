@@ -1,4 +1,5 @@
 from collections import deque
+from dataclasses import dataclass
 from typing import Literal
 import xxhash
 import numpy as np
@@ -6,6 +7,16 @@ import numpy as np
 from ssd.engine.sequence import Sequence
 
 CacheRole = Literal["target", "draft", "intermediate"]
+
+
+@dataclass
+class CowForkPlan:
+    fork_block_table: list[int]
+    private_tail_block_ids: list[int]
+    shared_prefix_blocks: int
+    copy_src_block_ids: list[int]
+    copy_dst_block_ids: list[int]
+    copy_valid_tokens: list[int]
 
 
 class Block:
@@ -125,6 +136,98 @@ class BlockManager:
             block.ref_count -= 1 # added this -- keeping the assert ensures we only have our fork clones pointing to each seq
             if block.ref_count == 0: 
                 self._deallocate_block(block_id)
+
+    def fork_shared_prefix(self, src_block_table: list[int], prefix_blocks: int) -> list[int]:
+        """Clone ``src`` prefix by sharing ownership (ref_count += 1)."""
+        if prefix_blocks <= 0:
+            return []
+        prefix_blocks = min(prefix_blocks, len(src_block_table))
+        out = list(src_block_table[:prefix_blocks])
+        for block_id in out:
+            self.blocks[block_id].ref_count += 1
+        return out
+
+    def allocate_private_tail(self, num_needed_blocks: int) -> list[int]:
+        if num_needed_blocks <= 0:
+            return []
+        blocks = self._allocate_n_blocks(num_needed_blocks)
+        return [b.block_id for b in blocks]
+
+    def make_fork_block_table(
+        self,
+        src_block_table: list[int],
+        required_total_blocks: int,
+        shared_prefix_blocks: int,
+    ) -> tuple[list[int], list[int]]:
+        """Build forked table as shared prefix + private tail."""
+        required_total_blocks = max(0, int(required_total_blocks))
+        shared_prefix_blocks = max(0, min(int(shared_prefix_blocks), len(src_block_table), required_total_blocks))
+        fork_prefix = self.fork_shared_prefix(src_block_table, shared_prefix_blocks)
+        tail_needed = required_total_blocks - shared_prefix_blocks
+        private_tail_ids = self.allocate_private_tail(tail_needed)
+        return fork_prefix + private_tail_ids, private_tail_ids
+
+    def make_cow_fork_block_table(
+        self,
+        src_block_table: list[int],
+        *,
+        cached_tokens: int,
+        required_total_tokens: int,
+    ) -> CowForkPlan:
+        assert cached_tokens >= 0
+        assert required_total_tokens >= cached_tokens, (
+            "COW fork requires required_total_tokens >= cached_tokens, "
+            f"got required={required_total_tokens}, cached={cached_tokens}"
+        )
+
+        block_size = self.block_size
+        required_blocks = (required_total_tokens + block_size - 1) // block_size
+        full_shared_blocks = min(
+            cached_tokens // block_size,
+            len(src_block_table),
+            required_blocks,
+        )
+        partial_tokens = cached_tokens % block_size
+
+        shared_prefix = self.fork_shared_prefix(src_block_table, full_shared_blocks)
+        private_needed = required_blocks - full_shared_blocks
+        private_tail = self.allocate_private_tail(private_needed)
+        fork_table = shared_prefix + private_tail
+
+        copy_src: list[int] = []
+        copy_dst: list[int] = []
+        copy_valid: list[int] = []
+        if partial_tokens > 0 and full_shared_blocks < required_blocks:
+            assert private_tail, "partial COW requires a private block"
+            assert full_shared_blocks < len(src_block_table)
+            assert full_shared_blocks < len(fork_table)
+            copy_src = [int(src_block_table[full_shared_blocks])]
+            copy_dst = [int(private_tail[0])]
+            copy_valid = [int(partial_tokens)]
+
+        return CowForkPlan(
+            fork_block_table=fork_table,
+            private_tail_block_ids=private_tail,
+            shared_prefix_blocks=full_shared_blocks,
+            copy_src_block_ids=copy_src,
+            copy_dst_block_ids=copy_dst,
+            copy_valid_tokens=copy_valid,
+        )
+
+    def release_fork(
+        self,
+        fork_block_table: list[int],
+        private_tail_ids: list[int],
+        shared_prefix_blocks: int,
+    ) -> None:
+        """Release forked ownership (shared prefix + private tail)."""
+        shared_prefix_blocks = max(0, min(shared_prefix_blocks, len(fork_block_table)))
+        for block_id in fork_block_table[:shared_prefix_blocks]:
+            block = self.blocks[block_id]
+            block.ref_count -= 1
+            if block.ref_count == 0:
+                self._deallocate_block(block_id)
+        self._deallocate_n_blocks(private_tail_ids)
 
 
     def _deallocate_block(self, block_id: int) -> Block:

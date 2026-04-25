@@ -282,7 +282,7 @@ def resolve_intermediate_model_path(args, cache_dir: str = HF_CACHE_DIR) -> Opti
     """Hierarchical-only: snapshot dir for ``Config.intermediate`` (empty => draft in engine)."""
     if not getattr(args, "spec", False):
         return None
-    if getattr(args, "spec_policy", "default") != "hierarchical":
+    if getattr(args, "spec_policy", "default") not in {"hierarchical", "pivot_hierarchical"}:
         return None
     explicit = getattr(args, "intermediate", None)
     if explicit and str(explicit).strip():

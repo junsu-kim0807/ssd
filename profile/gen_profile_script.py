@@ -24,8 +24,8 @@ Sweep flags (optional, Cartesian product with other dimensions):
   --length  → speculative k 3, 5, 7, 9 (methods with ``uses_spec_k``; AR keeps path segment ``kna``)
   --temp    → temperatures 0, 0.3, 0.7, 1.0
 
-Default ``--methods`` includes ``hierarchical`` (sync spec + ``--spec_policy hierarchical``); ``pivot`` is
-opt-in (async + extra flags). Override with ``--methods ar,sync`` etc.
+Default ``--methods`` includes ``hierarchical`` (sync spec + ``--spec_policy hierarchical``)
+and ``pivot`` (async + extra flags). Override with ``--methods ar,sync`` etc.
 
 Adding a method
     1. Define ``extra_bench_args(k, async_fan_out) -> list[str]`` (tokens only; no ``--gpus``).
@@ -213,7 +213,7 @@ def _args_pivot(k: int, f: int) -> list[str]:
         "--f",
         str(f),
         "--spec_policy",
-        "pivot",
+        "pivot_legacy",
         "--spec_hive",
     ]
 
@@ -249,7 +249,7 @@ METHOD_REGISTRY: dict[str, BenchMethodSpec] = {
     ),
     "pivot": BenchMethodSpec(
         id="pivot",
-        description="Async spec with pivot policy (--spec_policy pivot --spec_hive)",
+        description="Async legacy pivot policy (--spec_policy pivot_legacy --spec_hive)",
         uses_spec_k=True,
         default_k=3,
         extra_bench_args=_args_pivot,
@@ -664,7 +664,7 @@ def main() -> None:
     p.add_argument(
         "--methods",
         type=str,
-        default="ar,sync,async,hierarchical",
+        default="ar,sync,async,hierarchical,pivot",
         help="Comma-separated method ids: ar | sync | async | hierarchical | pivot "
         "(pivot needs async + 3 GPUs in the default GPU table; override with --gpus).",
     )

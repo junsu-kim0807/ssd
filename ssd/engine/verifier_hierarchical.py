@@ -153,7 +153,12 @@ class VerifierHierarchical(VerifierBase):
             )
 
         vr = VerifyResult(
-            new_suffixes, recovery_tokens, None, is_hv_intermediate=True, profile_trace=profile_trace
+            new_suffixes,
+            recovery_tokens,
+            None,
+            is_hv_intermediate=True,
+            profile_trace=profile_trace,
+            postprocess_mode="hv_intermediate",
         )
         lens = [len(s) for s in vr.new_suffixes]
         if emit_step_metrics:
@@ -256,7 +261,12 @@ class VerifierHierarchical(VerifierBase):
             )
 
         vr = VerifyResult(
-            new_suffixes, recovery_tokens, None, is_hv_intermediate=False, profile_trace=profile_trace
+            new_suffixes,
+            recovery_tokens,
+            None,
+            is_hv_intermediate=False,
+            profile_trace=profile_trace,
+            postprocess_mode="hv_target",
         )
         if emit_step_metrics:
             self.metrics.setdefault("accepted_suffix_lens_with_recovery", []).extend(

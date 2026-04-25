@@ -121,6 +121,33 @@ class SpecDecodeStep(InferenceStep):
     def _profiler_active(self) -> bool:
         return isinstance(self.profiler, SSDProfiler)
 
+    def _spec_correctness_debug_log(
+        self,
+        seqs: list[Sequence],
+        speculate_result,
+        out_verify_result,
+        pre_comp_lens: list[int],
+    ) -> None:
+        """Non-hierarchical debug JSON rows mirroring HV correctness log schema."""
+        spec_rows = speculate_result.speculations.detach().cpu().tolist()
+        for bi, seq in enumerate(seqs):
+            row = {
+                "hv_correctness_debug": True,
+                "seq_id": seq.seq_id,
+                "hv_round_idx_at_step_start": 0,
+                "draft_spec_token_ids": spec_rows[bi],
+                "intermediate_verify_accepted_token_ids": None,
+                "target_verify_accepted_token_ids": out_verify_result.new_suffixes[bi],
+                # Vanilla speculative verify consumes one K+1 candidate row.
+                "target_verify_input_token_ids": spec_rows[bi],
+                "verify_recovery_token_id": out_verify_result.recovery_tokens[bi],
+                "output_new_completion_token_ids": list(
+                    seq.completion_token_ids[pre_comp_lens[bi] :]
+                ),
+                "hv_fused_subround_idx": 0,
+            }
+            print(json.dumps(row, ensure_ascii=False), flush=True)
+
     def prefill(self, seqs: list[Sequence]) -> int:
         # Prefill timing: only the outer engine step wall (LLMEngine start_step/finish_step).
         # No inner draft_prefill/target_prefill stages and no per-request JSONL rows — all profiler modes.
@@ -151,6 +178,8 @@ class SpecDecodeStep(InferenceStep):
         return actual_prefill_tokens
 
     def decode(self, seqs: list[Sequence]) -> int:
+        if hasattr(self.speculator, "reset_step_state"):
+            self.speculator.reset_step_state()
         _prof = os.environ.get("SSD_PROFILE", "0") == "1"
         if _prof:
             torch.cuda.synchronize()
@@ -174,6 +203,9 @@ class SpecDecodeStep(InferenceStep):
         if hierarchical and getattr(self.scheduler.config, "debug_mode", False):
             dbg_hv_pre_comp = [seq.num_completion_tokens for seq in seqs]
             dbg_hv_round0 = [seq.hv_round_idx for seq in seqs]
+        dbg_spec_pre_comp: list[int] | None = None
+        if (not hierarchical) and getattr(self.scheduler.config, "debug_mode", False):
+            dbg_spec_pre_comp = [seq.num_completion_tokens for seq in seqs]
 
         if hierarchical:
             saved = [
@@ -268,10 +300,25 @@ class SpecDecodeStep(InferenceStep):
                 seq.num_cached_tokens = orig_nct
 
         #### STEP 3: POSTPROCESS ####
+        dbg_vanilla_raw_suffixes: list[list[int]] | None = None
+        dbg_vanilla_trunc_preview: list[tuple[list[int], bool]] | None = None
+        if (
+            (not hierarchical)
+            and dbg_spec_pre_comp is not None
+            and getattr(self.scheduler.config, "debug_mode", False)
+        ):
+            dbg_vanilla_raw_suffixes = [list(s) for s in out_verify_result.new_suffixes]
+            dbg_vanilla_trunc_preview = []
+            for seq, raw in zip(seqs, dbg_vanilla_raw_suffixes):
+                trunc, finished = self.scheduler._handle_eos_and_max_new_tokens(seq, list(raw))
+                dbg_vanilla_trunc_preview.append((trunc, finished))
+
         if self._profiler_active():
             pr.start_stage("postprocess")
         if hierarchical:
-            if out_verify_result.is_hv_intermediate:
+            mode = getattr(out_verify_result, "postprocess_mode", None)
+            is_inter = out_verify_result.is_hv_intermediate if mode is None else (mode == "hv_intermediate")
+            if is_inter:
                 self.scheduler.postprocess_hv_intermediate_round(
                     seqs,
                     out_verify_result.new_suffixes,
@@ -308,6 +355,42 @@ class SpecDecodeStep(InferenceStep):
                 dbg_hv_round0,
                 dbg_target_cands,
             )
+        elif (
+            (not hierarchical)
+            and dbg_spec_pre_comp is not None
+            and getattr(self.scheduler.config, "debug_mode", False)
+        ):
+            self._spec_correctness_debug_log(
+                seqs,
+                speculate_result,
+                out_verify_result,
+                dbg_spec_pre_comp,
+            )
+            if (
+                dbg_vanilla_raw_suffixes is not None
+                and dbg_vanilla_trunc_preview is not None
+            ):
+                for i, seq in enumerate(seqs):
+                    raw = dbg_vanilla_raw_suffixes[i]
+                    trunc, finished_preview = dbg_vanilla_trunc_preview[i]
+                    post_delta = seq.num_completion_tokens - dbg_spec_pre_comp[i]
+                    row = {
+                        "hv_target_commit_debug": True,
+                        "seq_id": seq.seq_id,
+                        "pre_num_tokens": int(saved[i][1]),
+                        "pre_completion_tokens": dbg_spec_pre_comp[i],
+                        "raw_suffix_len": len(raw),
+                        "raw_suffix_head": raw[:3],
+                        "truncated_suffix_len_preview": len(trunc),
+                        "truncated_suffix_head_preview": trunc[:3],
+                        "post_completion_delta": post_delta,
+                        "post_num_tokens": seq.num_tokens,
+                        "next_recovery_token": int(out_verify_result.recovery_tokens[i]),
+                        "finished_preview": bool(finished_preview),
+                        "is_finished": bool(seq.is_finished),
+                        "lost_by_truncation_or_commit": len(raw) - post_delta,
+                    }
+                    print(json.dumps(row, ensure_ascii=False), flush=True)
 
         if _prof:
             torch.cuda.synchronize()
@@ -324,6 +407,33 @@ class SpecDecodeStep(InferenceStep):
                 f_ids, f_conf, d_ids, d_conf = draft_metadata_from_logits(
                     speculate_result.logits_q, speculate_result.speculations, k
                 )
+                bundle = getattr(speculate_result, "branch_bundle", None)
+                winners = getattr(out_verify_result, "winning_branch_idx_per_parent", None)
+                if bundle is not None and winners is not None:
+                    # Collapse expanded-row draft metadata to parent winners.
+                    by_parent_rows: list[list[int]] = [[] for _ in range(len(seqs))]
+                    for row_idx, pidx in enumerate(bundle.parent_index_per_branch):
+                        by_parent_rows[int(pidx)].append(row_idx)
+                    f_ids_w: list[list[int]] = []
+                    f_conf_w: list[list[float]] = []
+                    d_ids_w: list[list[int]] = []
+                    d_conf_w: list[list[float]] = []
+                    for pidx in range(len(seqs)):
+                        rows = by_parent_rows[pidx]
+                        if rows:
+                            w = int(winners[pidx]) if pidx < len(winners) else 0
+                            w = max(0, min(w, len(rows) - 1))
+                            r = rows[w]
+                            f_ids_w.append(f_ids[r])
+                            f_conf_w.append(f_conf[r])
+                            d_ids_w.append(d_ids[r])
+                            d_conf_w.append(d_conf[r])
+                        else:
+                            f_ids_w.append([0, 0, 0, 0, 0])
+                            f_conf_w.append([0.0, 0.0, 0.0, 0.0, 0.0])
+                            d_ids_w.append([0] * k)
+                            d_conf_w.append([0.0] * k)
+                    f_ids, f_conf, d_ids, d_conf = f_ids_w, f_conf_w, d_ids_w, d_conf_w
                 B = len(seqs)
                 step_wall = pr.current_step_elapsed_s()
                 nd = st.num_draft_requests_step or B
@@ -512,6 +622,8 @@ class HierarchicalFusedStep(SpecDecodeStep):
         pr.flush_spec_decode_rows(seqs, False, rows)
 
     def decode(self, seqs: list[Sequence]) -> int:
+        if hasattr(self.speculator, "reset_step_state"):
+            self.speculator.reset_step_state()
         _prof = os.environ.get("SSD_PROFILE", "0") == "1"
         if _prof:
             torch.cuda.synchronize()

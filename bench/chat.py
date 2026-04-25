@@ -32,11 +32,21 @@ def parse_args():
     p.add_argument("--k", type=int, default=7)
     p.add_argument("--f", type=int, default=2)
     p.add_argument("--backup", type=str, default="jit")
-    p.add_argument("--spec_policy", type=str, choices=["default", "pivot"], default="default")
+    p.add_argument(
+        "--spec_policy",
+        type=str,
+        choices=["default", "pivot", "hierarchical", "pivot_hierarchical", "pivot_legacy"],
+        default="default",
+    )
     p.add_argument("--spec_hive", action="store_true")
     p.add_argument("--interval", type=int, default=0)
     p.add_argument("--threshold", type=float, default=0.8)
     p.add_argument("--expansion_pct", type=float, default=1.0)
+    p.add_argument("--pivot_expansion_policy", type=str, choices=["static", "dynamic"], default="dynamic")
+    p.add_argument("--pivot_expansion_criteria", type=str, choices=["top1", "residual"], default="residual")
+    p.add_argument("--pivot_expansion_pct", type=float, default=0.0)
+    p.add_argument("--pivot_expansion_threshold", type=float, default=0.8)
+    p.add_argument("--pivot_topk", type=int, default=5)
     p.add_argument("--b", type=int, default=1)
     p.add_argument("--x", type=float, default=None)
     p.add_argument("--eager", action="store_true")
@@ -81,7 +91,12 @@ def ssd_chat(args):
               spec_hive=args.spec_hive,
               interval=args.interval,
               threshold=args.threshold,
-              expansion_pct=args.expansion_pct)
+              expansion_pct=args.expansion_pct,
+              pivot_expansion_policy=args.pivot_expansion_policy,
+              pivot_expansion_criteria=args.pivot_expansion_criteria,
+              pivot_expansion_pct=args.pivot_expansion_pct,
+              pivot_expansion_threshold=args.pivot_expansion_threshold,
+              pivot_topk=args.pivot_topk)
 
     history = []
     print(f"\nChat via SSD. Type 'quit' to exit.\n")

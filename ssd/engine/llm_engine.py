@@ -9,12 +9,16 @@ from ssd.engine.scheduler import Scheduler
 from ssd.engine.model_runner import ModelRunner
 from ssd.engine.draft_runner import DraftRunner
 from ssd.engine.speculator_async import SpeculatorAsync
-from ssd.engine.speculator_sync import SpeculatorSync
-from ssd.engine.step import InferenceStep, AutoRegressiveStep, SpecDecodeStep, HierarchicalFusedStep
 from ssd.engine.verifier import Verifier
 from ssd.engine.verifier_pivot import VerifierPivot
-from ssd.engine.verifier_hierarchical import VerifierHierarchical
+from ssd.engine.step import InferenceStep, AutoRegressiveStep, SpecDecodeStep, HierarchicalFusedStep
 from ssd.engine.intermediate_runner import IntermediateRunner
+from ssd.engine.spec_decode_components import build_spec_components
+from ssd.engine.spec_policy_traits import (
+    is_pivot_legacy,
+    uses_hierarchical_verify,
+    uses_intermediate_runner,
+)
 from ssd.utils.profiler import make_profiler, wants_cost_aggregates, wants_profile_trace, SSDProfiler
 
 import atexit
@@ -122,7 +126,7 @@ class LLMEngine:
 
         self.intermediate_runner = None
         self.intermediate_cfg = None
-        if config.speculate and config.spec_policy == "hierarchical":
+        if config.speculate and uses_intermediate_runner(config.spec_policy):
             if getattr(self.model_runner, "_hierarchical_intermediate_parallel", False):
                 # Intermediate shards share target TP workers and ``tp_pg`` (see ModelRunner).
                 self.intermediate_runner = self.model_runner
@@ -313,7 +317,7 @@ class LLMEngine:
                 else:
                     print(
                         f"[metrics] Avg Tokens per step on Cache Hit: N/A (no cache hits)", flush=True)
-            if self.config.spec_policy == "pivot":
+            if is_pivot_legacy(self.config.spec_policy):
                 print(
                     f"[metrics] Pivot intermediate rounds: {METRICS['pivot_intermediate_rounds']}", flush=True)
                 print(
@@ -323,6 +327,10 @@ class LLMEngine:
 
     def create_inference_step(self, config: Config) -> InferenceStep:
         if config.speculate:
+            if config.spec_policy == "pivot_hierarchical":
+                raise NotImplementedError(
+                    "pivot_hierarchical requires PivotHierarchicalFusedStep with branch-local HV state"
+                )
             _ptrace = isinstance(self.profiler, SSDProfiler) and wants_profile_trace(
                 config.profiler_mode
             )
@@ -346,56 +354,48 @@ class LLMEngine:
                     profiler=self.profiler,
                     enable_async_profile_wiring=_async_wiring,
                 )
+                if is_pivot_legacy(config.spec_policy):
+                    verifier = VerifierPivot(
+                        lookahead=config.speculate_k,
+                        device=config.device,
+                        target_model_runner=self.model_runner,
+                        sampler_x=config.sampler_x,
+                        async_fan_out=config.async_fan_out,
+                        jit_speculate=config.jit_speculate,
+                        tokenizer=self.tokenizer,
+                        metrics=METRICS,
+                        interval=config.interval,
+                        threshold=config.threshold,
+                        expansion_pct=config.expansion_pct,
+                        enable_profile_trace=_ptrace,
+                    )
+                else:
+                    verifier = Verifier(
+                        lookahead=config.speculate_k,
+                        device=config.device,
+                        target_model_runner=self.model_runner,
+                        sampler_x=config.sampler_x,
+                        async_fan_out=config.async_fan_out,
+                        jit_speculate=config.jit_speculate,
+                        tokenizer=self.tokenizer,
+                        metrics=METRICS,
+                        enable_profile_trace=_ptrace,
+                    )
             else:
-                speculator = SpeculatorSync(
-                    lookahead=config.speculate_k,
-                    device=config.device,
-                    draft_model_runner=self.draft_runner,
-                )
-
-            if config.spec_policy == "hierarchical":
-                verifier = VerifierHierarchical(
-                    lookahead=config.speculate_k,
-                    device=config.device,
-                    target_model_runner=self.model_runner,
+                comps = build_spec_components(
+                    config,
+                    scheduler=self.scheduler,
+                    draft_runner=self.draft_runner,
+                    model_runner=self.model_runner,
                     intermediate_runner=self.intermediate_runner,
-                    target_verify_interval=config.target_verify_interval,
-                    sampler_x=config.sampler_x,
-                    async_fan_out=config.async_fan_out,
-                    jit_speculate=config.jit_speculate,
                     tokenizer=self.tokenizer,
                     metrics=METRICS,
                     enable_profile_trace=_ptrace,
                 )
-            elif config.spec_policy == "pivot":
-                verifier = VerifierPivot(
-                    lookahead=config.speculate_k,
-                    device=config.device,
-                    target_model_runner=self.model_runner,
-                    sampler_x=config.sampler_x,
-                    async_fan_out=config.async_fan_out,
-                    jit_speculate=config.jit_speculate,
-                    tokenizer=self.tokenizer,
-                    metrics=METRICS,
-                    interval=config.interval,
-                    threshold=config.threshold,
-                    expansion_pct=config.expansion_pct,
-                    enable_profile_trace=_ptrace,
-                )
-            else:
-                verifier = Verifier(
-                    lookahead=config.speculate_k,
-                    device=config.device,
-                    target_model_runner=self.model_runner,
-                    sampler_x=config.sampler_x,
-                    async_fan_out=config.async_fan_out,
-                    jit_speculate=config.jit_speculate,
-                    tokenizer=self.tokenizer,
-                    metrics=METRICS,
-                    enable_profile_trace=_ptrace,
-                )
+                speculator = comps.speculator
+                verifier = comps.verifier
             step_cls = SpecDecodeStep
-            if config.spec_policy == "hierarchical":
+            if uses_hierarchical_verify(config.spec_policy):
                 # Fused HV must not advance only some seqs to target round on intermediate EOS
                 # (mixed batch in verify_intermediate_round). Config.__post_init__ also sets this;
                 # force here so callers using dataclasses.replace etc. cannot violate the invariant.

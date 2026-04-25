@@ -82,7 +82,7 @@ def parse_arguments():
     parser.add_argument(
         "--spec_policy",
         type=str,
-        choices=["default", "pivot", "hierarchical"],
+        choices=["default", "pivot", "hierarchical", "pivot_hierarchical", "pivot_legacy"],
         default="default",
         help="Speculative policy to use",
     )
@@ -101,9 +101,26 @@ def parse_arguments():
         "Sets Config.target_verify_interval (default when omitted: from config, typically 1).",
     )
     parser.add_argument("--threshold", type=float, default=0.8,
-                        help="Pivot confidence threshold")
+                        help="Legacy pivot threshold (--spec_policy pivot_legacy)")
     parser.add_argument("--expansion_pct", type=float, default=1.0,
-                        help="Pivot top-k expansion percentage")
+                        help="Legacy pivot expansion percentage (--spec_policy pivot_legacy)")
+    parser.add_argument(
+        "--pivot_expansion_policy",
+        type=str,
+        choices=["static", "dynamic"],
+        default="dynamic",
+        help="Planner policy for pivot/pivot_hierarchical",
+    )
+    parser.add_argument(
+        "--pivot_expansion_criteria",
+        type=str,
+        choices=["top1", "residual"],
+        default="residual",
+        help="Planner uncertainty criteria for pivot expansion",
+    )
+    parser.add_argument("--pivot_expansion_pct", type=float, default=0.0)
+    parser.add_argument("--pivot_expansion_threshold", type=float, default=0.8)
+    parser.add_argument("--pivot_topk", type=int, default=5)
 
     # Memory and batching configuration
     parser.add_argument("--block_sz", type=int, default=256, help="KV cache block size (see config.py: kvcache_block_size)")
@@ -277,8 +294,8 @@ def parse_arguments():
             )
 
     if getattr(args, "target_verify_interval", None) is not None:
-        if not args.spec or args.spec_policy != "hierarchical":
-            parser.error("--round requires --spec and --spec_policy hierarchical")
+        if not args.spec or args.spec_policy not in {"hierarchical", "pivot_hierarchical"}:
+            parser.error("--round requires --spec and --spec_policy in {hierarchical, pivot_hierarchical}")
         if int(args.target_verify_interval) < 1:
             parser.error("--round must be >= 1")
 
@@ -429,6 +446,11 @@ def initialize_wandb(args, run_name):
             "target_verify_interval": getattr(args, "target_verify_interval", None),
             "threshold": args.threshold,
             "expansion_pct": args.expansion_pct,
+            "pivot_expansion_policy": args.pivot_expansion_policy,
+            "pivot_expansion_criteria": args.pivot_expansion_criteria,
+            "pivot_expansion_pct": args.pivot_expansion_pct,
+            "pivot_expansion_threshold": args.pivot_expansion_threshold,
+            "pivot_topk": args.pivot_topk,
             "gpu_memory_utilization_arg": getattr(args, "gpu_memory_utilization", None),
         }
     )
@@ -456,6 +478,11 @@ def create_llm_kwargs(args, draft_path):
         interval=args.interval,
         threshold=args.threshold,
         expansion_pct=args.expansion_pct,
+        pivot_expansion_policy=args.pivot_expansion_policy,
+        pivot_expansion_criteria=args.pivot_expansion_criteria,
+        pivot_expansion_pct=args.pivot_expansion_pct,
+        pivot_expansion_threshold=args.pivot_expansion_threshold,
+        pivot_topk=args.pivot_topk,
     )
 
     if getattr(args, "target_verify_interval", None) is not None:
@@ -479,7 +506,7 @@ def create_llm_kwargs(args, draft_path):
     _gmu = getattr(args, "gpu_memory_utilization", None)
     if _gmu is not None:
         llm_kwargs["gpu_memory_utilization"] = float(_gmu)
-    elif args.spec and args.spec_policy == "hierarchical":
+    elif args.spec and args.spec_policy in {"hierarchical", "pivot_hierarchical"}:
         # Sync hierarchical: GPU 0 holds target TP shard 0, DraftRunner, and IntermediateRunner; a high
         # default (0.7) often leaves too little VRAM for intermediate KV after target KV allocation.
         llm_kwargs["gpu_memory_utilization"] = _HIERARCHICAL_DEFAULT_GPU_MEMORY_UTILIZATION

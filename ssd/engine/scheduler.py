@@ -5,6 +5,7 @@ from collections import deque
 from ssd.config import Config
 from ssd.engine.sequence import Sequence, SequenceStatus
 from ssd.engine.block_manager import BlockManager
+from ssd.engine.spec_policy_traits import uses_hierarchical_verify
 
 from ssd.utils.async_helpers.async_spec_helpers import compute_megaspec_lookahead
 from ssd.utils.misc import load_auto_tokenizer
@@ -33,7 +34,7 @@ class Scheduler:
         self.verbose = config.verbose
         self.draft_async = config.draft_async
         self.hierarchical = bool(
-            config.speculate and getattr(config, "spec_policy", "") == "hierarchical"
+            config.speculate and uses_hierarchical_verify(getattr(config, "spec_policy", ""))
         )
         self.block_manager = BlockManager(
             config.num_kvcache_blocks, config.kvcache_block_size, is_draft=False, verbose=self.verbose, max_model_len=self.max_model_len)

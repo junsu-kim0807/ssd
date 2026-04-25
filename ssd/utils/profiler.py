@@ -29,6 +29,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from time import perf_counter
 from typing import Any, Literal, Protocol
+from ssd.engine.spec_policy_traits import uses_hierarchical_verify
 
 ProfilerMode = Literal["cost_breakdown", "metadata", "cost_metadata", "kernel_breakdown"]
 
@@ -429,7 +430,7 @@ class SSDProfiler:
                 },
             }
             payload["avg_target_accept_len"] = _avg(self._hv_target_accept_samples)
-            if self._spec_policy == "hierarchical":
+            if uses_hierarchical_verify(self._spec_policy):
                 payload["hierarchical_intermediate_verification_time_s"] = self._run_hv_inter_verify_s
                 payload["hierarchical_target_verification_time_s"] = self._run_hv_target_verify_s
                 payload["avg_intermediate_accept_len"] = _avg(self._hv_inter_accept_samples)
@@ -470,7 +471,7 @@ class SSDProfiler:
                 float(self._run_draft_s), nd, avg_decode_bsz_f
             )
 
-            if self._spec_policy == "hierarchical":
+            if uses_hierarchical_verify(self._spec_policy):
                 payload["avg_intermediate_verification_time_per_batch"] = _per_batch_norm_wall(
                     float(self._run_hv_inter_verify_s), nm_inter, avg_decode_bsz_f
                 )
@@ -500,11 +501,11 @@ class SSDProfiler:
             analysis: dict[str, Any] = {
                 "avg_target_accept_len": _avg_int(self._hv_target_accept_samples),
                 "avg_intermediate_accept_len": (
-                    _avg_int(self._hv_inter_accept_samples) if self._spec_policy == "hierarchical" else None
+                    _avg_int(self._hv_inter_accept_samples) if uses_hierarchical_verify(self._spec_policy) else None
                 ),
                 "avg_inter_target_prefix_accept_len": (
                     _avg_int(self._hv_inter_target_prefix_samples)
-                    if self._spec_policy == "hierarchical"
+                    if uses_hierarchical_verify(self._spec_policy)
                     else None
                 ),
                 "total_target_verification_rounds": n_tgt,
@@ -582,7 +583,7 @@ class SSDProfiler:
             self._run_sync_s += st.sync_time_s
             self._run_postprocess_s += st.postprocess_time_s
             self._run_draft_worker_s += st.draft_time_worker_s
-            if self._spec_policy == "hierarchical":
+            if uses_hierarchical_verify(self._spec_policy):
                 self._run_hv_inter_verify_s += st.hv_inter_verify_time_s
                 self._run_hv_target_verify_s += st.hv_target_verify_time_s
 
@@ -699,7 +700,7 @@ class SSDProfiler:
         vms = getattr(trace, "verification_models", None)
         if not vms:
             return
-        hier = self._spec_policy == "hierarchical"
+        hier = uses_hierarchical_verify(self._spec_policy)
         for i, vm in enumerate(vms):
             if i >= len(seqs):
                 break
@@ -719,7 +720,7 @@ class SSDProfiler:
     def _accum_hv_cost_verify_batch_size(
         self, seqs: list[Any], verify_result: Any, trace: Any | None
     ) -> None:
-        if not wants_cost_aggregates(self._mode) or self._spec_policy != "hierarchical":
+        if not wants_cost_aggregates(self._mode) or not uses_hierarchical_verify(self._spec_policy):
             return
         bsz = len(seqs)
         is_inter: bool | None = None

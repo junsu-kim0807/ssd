@@ -2,6 +2,10 @@ from dataclasses import dataclass
 import torch
 from ssd.engine.sequence import Sequence
 from abc import ABC, abstractmethod
+from typing import TYPE_CHECKING, Literal
+
+if TYPE_CHECKING:
+    from ssd.engine.pivot_types import PivotBranchBundle
 
 
 @dataclass
@@ -9,6 +13,7 @@ class SpeculateResult:
     speculations: torch.Tensor
     logits_q: torch.Tensor
     cache_hits: torch.Tensor | None = None
+    branch_bundle: "PivotBranchBundle | None" = None
 
 
 @dataclass
@@ -30,6 +35,14 @@ class VerifyProfileTrace:
     # Target HV only: consecutive greedy matches along ``candidates`` restricted to
     # indices ``j`` with ``j+1 < len(candidates) - lookahead`` (exclude last K draft tail).
     inter_target_prefix_accept_len: list[int] | None = None
+    # Planner / pivot metadata (optional).
+    pivot_criteria_score: list[float] | None = None
+    pivot_top1_prob: list[float] | None = None
+    pivot_residual_score: list[float] | None = None
+    pivot_expanded: list[bool] | None = None
+    pivot_branch_count: list[int] | None = None
+    pivot_selected_branch_idx: list[int] | None = None
+    pivot_selected_root_token_id: list[int] | None = None
 
 
 @dataclass
@@ -40,6 +53,8 @@ class VerifyResult:
     # hierarchical: intermediate round uses scheduler.postprocess_hv_intermediate_round
     is_hv_intermediate: bool = False
     profile_trace: VerifyProfileTrace | None = None
+    postprocess_mode: Literal["speculate", "hv_intermediate", "hv_target"] = "speculate"
+    winning_branch_idx_per_parent: list[int] | None = None
 
 
 class SpeculatorBase(ABC):

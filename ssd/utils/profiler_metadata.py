@@ -212,6 +212,20 @@ def trace_to_row_indexed(
             row["inter_accept_len"] = None
             row["inter_recovery_token"] = None
             row["inter_bonus_token"] = None
+        pcs = getattr(trace, "pivot_criteria_score", None)
+        ptop1 = getattr(trace, "pivot_top1_prob", None)
+        pres = getattr(trace, "pivot_residual_score", None)
+        pexp = getattr(trace, "pivot_expanded", None)
+        pbc = getattr(trace, "pivot_branch_count", None)
+        psel = getattr(trace, "pivot_selected_branch_idx", None)
+        psel_tok = getattr(trace, "pivot_selected_root_token_id", None)
+        row["pivot_criteria_score"] = None if pcs is None else pcs[i]
+        row["pivot_top1_prob"] = None if ptop1 is None else ptop1[i]
+        row["pivot_residual_score"] = None if pres is None else pres[i]
+        row["pivot_expanded"] = None if pexp is None else pexp[i]
+        row["pivot_branch_count"] = None if pbc is None else pbc[i]
+        row["pivot_selected_branch_idx"] = None if psel is None else psel[i]
+        row["pivot_selected_root_token_id"] = None if psel_tok is None else psel_tok[i]
     else:
         row["verification_model"] = None
         row["target_token_ids_per_position"] = None
@@ -227,6 +241,13 @@ def trace_to_row_indexed(
         row["inter_accept_len"] = None
         row["inter_recovery_token"] = None
         row["inter_bonus_token"] = None
+        row["pivot_criteria_score"] = None
+        row["pivot_top1_prob"] = None
+        row["pivot_residual_score"] = None
+        row["pivot_expanded"] = None
+        row["pivot_branch_count"] = None
+        row["pivot_selected_branch_idx"] = None
+        row["pivot_selected_root_token_id"] = None
 
     if cost_fields:
         row["step_wall_time_s"] = step_wall_time_s

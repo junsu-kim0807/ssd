@@ -3,6 +3,7 @@ import torch
 import numpy as np
 from typing import List
 from ssd.config import _decoder_cfg
+from ssd.engine.spec_policy_traits import pivot_max_branches
 from ssd.utils.context import set_context, get_context, reset_context
 from ssd.engine.helpers.mask_helpers import get_custom_mask
 from time import perf_counter
@@ -475,7 +476,12 @@ def run_fi_tree_decode_cudagraph(model_runner, input_ids, positions, last_only, 
 def capture_cudagraph(model_runner):
     config = model_runner.config
     hf_config = model_runner.decoder_hf_config
-    max_seqs = min(model_runner.config.max_num_seqs, 512)
+    branch_mult = pivot_max_branches(
+        getattr(config, "spec_policy", ""),
+        getattr(config, "pivot_topk", 1),
+        getattr(config, "pivot_max_root_branches", None),
+    )
+    max_seqs = min(model_runner.config.max_num_seqs * branch_mult, 512)
     if model_runner.config.speculate and model_runner.config.draft_async and model_runner.is_draft:
         N = max_seqs * (model_runner.config.speculate_k + 1) * \
             model_runner.config.async_fan_out
@@ -581,7 +587,13 @@ def capture_verify_cudagraph_generic(
     """Capture verify-style CUDAGraphs: fixed ``q_len`` tokens per sequence, varlen batch layout."""
     config = model_runner.config
     hf_config = _decoder_hf_for_verify_capture(model_runner, model_override)
-    max_bs = min(model_runner.config.max_num_seqs, 512)
+    config = model_runner.config
+    branch_mult = pivot_max_branches(
+        getattr(config, "spec_policy", ""),
+        getattr(config, "pivot_topk", 1),
+        getattr(config, "pivot_max_root_branches", None),
+    )
+    max_bs = min(model_runner.config.max_num_seqs * branch_mult, 512)
     dev = model_runner.device
 
     is_eagle_target = (

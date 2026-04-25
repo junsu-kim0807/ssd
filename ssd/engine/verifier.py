@@ -182,4 +182,5 @@ class Verifier(VerifierBase):
             recovery_tokens=recovery_tokens,
             eagle_acts=eagle_acts,
             profile_trace=profile_trace if self.enable_profile_trace and not eagle else None,
+            postprocess_mode="speculate",
         )

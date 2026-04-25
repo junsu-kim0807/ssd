@@ -34,7 +34,7 @@ logs/
 *.log
 *.out
 *.err
-.pt
+*.pt
 .pytest_cache
 # Project runtime artifacts
 wandb/
@@ -47,3 +47,4 @@ summaries/
 # Temporary / scratch
 tmp/
 tmp*/
+results.pt

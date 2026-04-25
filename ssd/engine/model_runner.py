@@ -48,6 +48,7 @@ from ssd.engine.helpers.cudagraph_helpers import (
     capture_glue_decode_cudagraph,
     get_custom_mask,
 )
+from ssd.engine.spec_policy_traits import uses_hierarchical_verify, uses_target_varlen_verify
 
 # ---------------------------------------------------------------------------
 # [REMOVE_ME HV_EAGER_FALLBACK_LOG] Hierarchical CUDAGraph→eager bypass: log on
@@ -365,7 +366,7 @@ class ModelRunner:
                 not self.is_draft
                 and not self.intermediate_mode
                 and self.config.speculate
-                and getattr(self.config, "spec_policy", "") == "hierarchical"
+                and uses_target_varlen_verify(getattr(self.config, "spec_policy", ""))
                 and not self.config.use_eagle
                 and getattr(self.config, "enable_target_verify_varlen_cudagraph", True)
             ):
@@ -384,7 +385,7 @@ class ModelRunner:
 
             if (
                 self.config.speculate
-                and getattr(self.config, "spec_policy", "") == "hierarchical"
+                and uses_hierarchical_verify(getattr(self.config, "spec_policy", ""))
                 and (
                     self.intermediate_mode
                     or getattr(self, "_hierarchical_intermediate_parallel", False)
@@ -399,7 +400,7 @@ class ModelRunner:
         return (
             not is_draft
             and config.speculate
-            and getattr(config, "spec_policy", "") == "hierarchical"
+            and uses_hierarchical_verify(getattr(config, "spec_policy", ""))
             and config.num_gpus > 1
             and getattr(config, "intermediate_hf_config", None) is not None
         )
@@ -499,7 +500,7 @@ class ModelRunner:
             return
         if (
             _LOG_HV_EAGER_FALLBACK_WITHOUT_DEBUG
-            and getattr(self.config, "spec_policy", "") == "hierarchical"
+            and uses_hierarchical_verify(getattr(self.config, "spec_policy", ""))
         ):
             print(f"[REMOVE_ME HV_EAGER_FALLBACK_LOG] {line}", flush=True)
 
@@ -784,6 +785,46 @@ class ModelRunner:
             raise AttributeError(f"Method '{method_name}' not found")
         return method(*args)
 
+    def copy_kv_blocks(
+        self,
+        src_block_ids: list[int],
+        dst_block_ids: list[int],
+        valid_tokens_per_block: list[int],
+        cache_kind: str = "target",
+    ) -> None:
+        """Copy KV prefix blocks (optionally partial final block) into new blocks.
+
+        Called via ``ModelRunner.call`` when TP>1 so every TP rank applies the same
+        block copies to its local shard cache.
+        """
+        assert len(src_block_ids) == len(dst_block_ids) == len(valid_tokens_per_block), (
+            "copy_kv_blocks: src/dst/valid lengths must match"
+        )
+        if cache_kind == "target":
+            kv_cache = self.kv_cache
+        elif cache_kind == "intermediate":
+            kv_cache = (
+                self.intermediate_kv_cache
+                if getattr(self, "intermediate_kv_cache", None) is not None
+                else self.kv_cache
+            )
+        else:
+            raise ValueError(f"copy_kv_blocks: unsupported cache_kind={cache_kind!r}")
+
+        for src, dst, n_valid in zip(src_block_ids, dst_block_ids, valid_tokens_per_block):
+            n = int(n_valid)
+            if n <= 0:
+                continue
+            kv_cache[:, :, int(dst), :n].copy_(kv_cache[:, :, int(src), :n])
+
+        # ``copy_kv_blocks`` is a pure local memory op (no implicit NCCL sync).
+        # When invoked through ``call()`` on TP runs, make completion explicit so
+        # rank 0 cannot enqueue the next command before workers finish copying.
+        if self.world_size > 1 and self.tp_pg is not None:
+            # Ensure local KV copy kernels complete before entering TP barrier.
+            torch.cuda.current_stream().synchronize()
+            dist.barrier(group=self.tp_pg, device_ids=[self.rank])
+
     def warmup_model(self):
         torch.cuda.empty_cache()
         torch.cuda.reset_peak_memory_stats()
@@ -955,7 +996,7 @@ class ModelRunner:
                 self.enforce_eager = eager_was
                 reset_context()
 
-        hv = getattr(self.config, "spec_policy", "") == "hierarchical"
+        hv = uses_target_varlen_verify(getattr(self.config, "spec_policy", ""))
         if not hv:
             return _eager_forward()
 
