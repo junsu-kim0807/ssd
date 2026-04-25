@@ -34,8 +34,10 @@ Output top-level schema:
 
 Notes:
   - "motivation" reads analysis.jsonl and drops the "notes" field.
-  - "insight" reads metadata.jsonl and computes misspeculation top-k inclusiveness
-    and confidence correlation rows for target_accept_len == 0.
+  - "insight" reads metadata.jsonl and computes:
+      1) misspeculation top-k inclusiveness for target_accept_len == 0 rows,
+      2) misspeculation confidence correlation for target_accept_len == 0 rows,
+      3) confidence_distribution for all metadata rows.
   - "trace" reads metadata.jsonl and stores target_accept_len for request IDs
     4..14 and step IDs 1..20 by default. Missing steps are stored as None.
   - "results" reads cost_breakdown.json and drops the "notes" field.
@@ -255,18 +257,37 @@ def compute_topk_inclusiveness(miss_rows: List[Dict[str, Any]], max_topk: int = 
     return out
 
 
+def extract_first_draft_confidence_pair(row: Dict[str, Any]) -> Tuple[Any, Any]:
+    """
+    Extract confidence values from one metadata row.
+
+    Returns:
+      top1_confidence = first_draft_token_confidence[0]
+      residual_confidence = first_draft_token_confidence[0] - first_draft_token_confidence[1]
+
+    Missing or malformed values are returned as None.
+    """
+    confs = row.get("first_draft_token_confidence") or []
+
+    if not isinstance(confs, list) or len(confs) < 1:
+        return None, None
+
+    top1_confidence = confs[0]
+
+    if len(confs) >= 2 and confs[0] is not None and confs[1] is not None:
+        residual_confidence = confs[0] - confs[1]
+    else:
+        residual_confidence = None
+
+    return top1_confidence, residual_confidence
+
+
 def compute_confidence_correlation_rows(miss_rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """Confidence rows over only misspeculation rows, target_accept_len == 0."""
     rows: List[Dict[str, Any]] = []
 
     for row in miss_rows:
-        confs = row.get("first_draft_token_confidence") or []
-
-        if not isinstance(confs, list) or len(confs) < 1:
-            top1_confidence = None
-            residual_confidence = None
-        else:
-            top1_confidence = confs[0]
-            residual_confidence = (confs[0] - confs[1]) if len(confs) >= 2 else None
+        top1_confidence, residual_confidence = extract_first_draft_confidence_pair(row)
 
         rows.append(
             {
@@ -275,6 +296,36 @@ def compute_confidence_correlation_rows(miss_rows: List[Dict[str, Any]]) -> List
                 "top1_confidence": top1_confidence,
                 "residual_confidence": residual_confidence,
                 "target_recovery_token": row.get("target_recovery_token"),
+                "first_draft_token_ids": row.get("first_draft_token_ids"),
+                "first_draft_token_confidence": row.get("first_draft_token_confidence"),
+            }
+        )
+
+    return rows
+
+
+def compute_confidence_distribution_rows(all_rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """
+    Confidence rows over all metadata rows.
+
+    For each row:
+      top1_confidence = first_draft_token_confidence[0]
+      residual_confidence = first_draft_token_confidence[0] - first_draft_token_confidence[1]
+    """
+    rows: List[Dict[str, Any]] = []
+
+    for row in all_rows:
+        top1_confidence, residual_confidence = extract_first_draft_confidence_pair(row)
+
+        rows.append(
+            {
+                "step_id": row.get("step_id"),
+                "request_id": row.get("request_id"),
+                "verification_model": row.get("verification_model"),
+                "target_accept_len": row.get("target_accept_len"),
+                "inter_accept_len": row.get("inter_accept_len"),
+                "top1_confidence": top1_confidence,
+                "residual_confidence": residual_confidence,
                 "first_draft_token_ids": row.get("first_draft_token_ids"),
                 "first_draft_token_confidence": row.get("first_draft_token_confidence"),
             }
@@ -292,6 +343,7 @@ def build_insight_entry(metadata_path: Path, ctx: Dict[str, Any]) -> Dict[str, A
     entry["num_misspeculation_steps"] = len(miss_rows)
     entry["misspeculation_topk_inclusiveness"] = compute_topk_inclusiveness(miss_rows, max_topk=5)
     entry["misspeculation_confidence_correlation"] = compute_confidence_correlation_rows(miss_rows)
+    entry["confidence_distribution"] = compute_confidence_distribution_rows(rows)
 
     return entry
 
