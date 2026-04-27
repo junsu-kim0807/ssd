@@ -322,6 +322,70 @@ class SSDProfiler:
             except Exception:
                 self._kernel_prof = None
 
+    def _load_pivot_microcost_summary(self) -> dict[str, Any]:
+        rows: list[dict[str, Any]] = []
+        for path in self._sink.root.glob("pivot_draft_microcost.worker_*.jsonl"):
+            try:
+                with open(path, "r", encoding="utf-8") as f:
+                    for line in f:
+                        line = line.strip()
+                        if line:
+                            rows.append(json.loads(line))
+            except FileNotFoundError:
+                continue
+
+        if not rows:
+            return {}
+
+        def fsum(key: str) -> float:
+            return float(sum(float(r.get(key, 0.0) or 0.0) for r in rows))
+
+        def isum(key: str) -> int:
+            return int(sum(int(r.get(key, 0) or 0) for r in rows))
+
+        n = len(rows)
+        pivot_branch_construct_s = fsum("pivot_branch_construct_s")
+        pivot_cow_copy_s = fsum("pivot_cow_copy_s")
+        pivot_branch0_setup_s = fsum("pivot_branch0_setup_s")
+        pivot_expand_pack_s = fsum("pivot_expand_pack_s")
+        pivot_cow_plus_expansion_s = (
+            pivot_branch_construct_s
+            + pivot_cow_copy_s
+            + pivot_branch0_setup_s
+            + pivot_expand_pack_s
+        )
+        pivot_full_expansion_overhead_s = (
+            fsum("pivot_plan_build_s")
+            + fsum("pivot_capacity_clamp_s")
+            + fsum("pivot_branch0_override_s")
+            + pivot_cow_plus_expansion_s
+        )
+
+        return {
+            "pivot_microcost_steps": n,
+            "pivot_plan_build_time_s": fsum("pivot_plan_build_s"),
+            "pivot_capacity_clamp_time_s": fsum("pivot_capacity_clamp_s"),
+            "pivot_branch0_override_time_s": fsum("pivot_branch0_override_s"),
+            "pivot_branch_construct_time_s": pivot_branch_construct_s,
+            "pivot_cow_copy_time_s": pivot_cow_copy_s,
+            "pivot_branch0_setup_time_s": pivot_branch0_setup_s,
+            "pivot_expand_pack_time_s": pivot_expand_pack_s,
+            "pivot_cow_plus_expansion_time_s": pivot_cow_plus_expansion_s,
+            "pivot_full_expansion_overhead_time_s": pivot_full_expansion_overhead_s,
+            "pivot_tail_draft_forward_time_s": fsum("pivot_tail_draft_forward_s"),
+            "pivot_extra_draft_forward_time_s": fsum("pivot_extra_draft_forward_s"),
+            "pivot_num_nonzero_branches": isum("num_nonzero_branches"),
+            "pivot_num_target_cow_copy_blocks": isum("num_target_cow_copy_blocks"),
+            "pivot_num_draft_cow_copy_blocks": isum("num_draft_cow_copy_blocks"),
+            "pivot_num_inter_cow_copy_blocks": isum("num_inter_cow_copy_blocks"),
+            "avg_pivot_cow_plus_expansion_time_per_step": (
+                pivot_cow_plus_expansion_s / n if n > 0 else None
+            ),
+            "avg_pivot_full_expansion_overhead_time_per_step": (
+                pivot_full_expansion_overhead_s / n if n > 0 else None
+            ),
+        }
+
     def finish_run(self, *, preempt_count: int = 0) -> None:
         if self._kernel_prof is not None:
             try:
@@ -512,6 +576,29 @@ class SSDProfiler:
                 tgt_n = nm_tgt if nm_tgt > 0 else nm_ver
                 payload["avg_target_verification_time_per_batch"] = _per_batch_norm_wall(
                     float(self._run_verify_s), tgt_n, avg_decode_bsz_f
+                )
+
+            pivot_microcost = self._load_pivot_microcost_summary()
+            if pivot_microcost:
+                payload.update(pivot_microcost)
+                payload["notes"].update(
+                    {
+                        "pivot_cow_copy_time_s": (
+                            "sum of partial COW KV copy wall time from pivot_draft_microcost JSONL; "
+                            "set SSD_PROFILE_PIVOT_SYNC=1 for synchronized GPU timing"
+                        ),
+                        "pivot_expand_pack_time_s": (
+                            "sum of pivot_initial_pack_s + pivot_final_pack_s"
+                        ),
+                        "pivot_cow_plus_expansion_time_s": (
+                            "pivot_branch_construct_time_s + pivot_cow_copy_time_s + "
+                            "pivot_branch0_setup_time_s + pivot_expand_pack_time_s"
+                        ),
+                        "pivot_full_expansion_overhead_time_s": (
+                            "pivot plan build + capacity clamp + branch0 override + "
+                            "pivot_cow_plus_expansion_time_s; excludes expanded draft forward time"
+                        ),
+                    }
                 )
 
             self._sink.write_cost_breakdown(payload)

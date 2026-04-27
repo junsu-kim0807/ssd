@@ -149,6 +149,16 @@ class LLMEngine:
         )
         assert config.max_model_len == self.scheduler.max_model_len
 
+        # Pivot microcost timing sync is meaningful only for profiled pivot runs.
+        # Force deterministic behavior for every run so stale shell env does not leak.
+        _profile_enabled = bool(
+            getattr(config, "profiler_output_dir", None)
+            and str(getattr(config, "profiler_output_dir")).strip()
+        )
+        os.environ["SSD_PROFILE_PIVOT_SYNC"] = (
+            "1" if (_profile_enabled and config.spec_policy == "pivot") else "0"
+        )
+
         self.profiler = make_profiler(config)
 
         print(f"[LLMEngine] finished llm_engine init", flush=True)

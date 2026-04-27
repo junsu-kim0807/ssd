@@ -313,6 +313,54 @@ def test_cost_breakdown_hierarchical_fields(tmp_path):
     assert abs(data["avg_target_verification_time_per_batch"] - 0.05) < 1e-9
 
 
+def test_cost_breakdown_merges_pivot_microcost_summary(tmp_path):
+    p = SSDProfiler(
+        _prof_cfg(
+            profiler_mode="cost_breakdown",
+            profiler_output_dir=str(tmp_path),
+            spec_policy="pivot",
+        )
+    )
+
+    class S:
+        seq_id = 0
+
+    p.start_run(SimpleNamespace(), None)
+    p.start_step([S()], is_prefill=False)
+    p.finish_step(1)
+    (tmp_path / "pivot_draft_microcost.worker_1.jsonl").write_text(
+        json.dumps(
+            {
+                "pivot_plan_build_s": 1.0,
+                "pivot_capacity_clamp_s": 2.0,
+                "pivot_branch0_override_s": 3.0,
+                "pivot_branch_construct_s": 4.0,
+                "pivot_cow_copy_s": 5.0,
+                "pivot_branch0_setup_s": 6.0,
+                "pivot_expand_pack_s": 7.0,
+                "pivot_tail_draft_forward_s": 8.0,
+                "pivot_extra_draft_forward_s": 9.0,
+                "num_nonzero_branches": 10,
+                "num_target_cow_copy_blocks": 11,
+                "num_draft_cow_copy_blocks": 12,
+                "num_inter_cow_copy_blocks": 13,
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    p.finish_run()
+
+    data = json.loads((tmp_path / "cost_breakdown.json").read_text())
+    assert data["pivot_microcost_steps"] == 1
+    assert abs(data["pivot_cow_plus_expansion_time_s"] - 22.0) < 1e-9
+    assert abs(data["pivot_full_expansion_overhead_time_s"] - 28.0) < 1e-9
+    assert abs(data["pivot_tail_draft_forward_time_s"] - 8.0) < 1e-9
+    assert abs(data["pivot_extra_draft_forward_time_s"] - 9.0) < 1e-9
+    assert data["pivot_num_target_cow_copy_blocks"] == 11
+    assert "pivot_cow_plus_expansion_time_s" in data["notes"]
+
+
 def test_profile_greedy_token_confidence_not_all_ones():
     from ssd.utils.profiler_metadata import profile_greedy_token_confidence
 
