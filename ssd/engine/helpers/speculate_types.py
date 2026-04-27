@@ -23,9 +23,12 @@ class VerifyProfileTrace:
     verification_models: list[str]
     token_ids_per_position: list[list[int]]
     token_confidence_per_position: list[list[float]]
-    accept_len: list[int]
     recovery_tokens: list[int]
     bonus_tokens: list[int | None]
+    # Target / pivot_target rounds: per-row greedy accept lengths (excludes recovery column).
+    # Intermediate rounds: leave ``None`` (use ``inter_accept_len`` only) so downstream does not
+    # treat placeholder zeros as target misspeculations.
+    accept_len: list[int] | None = None
     # Optional hierarchical / pivot intermediate columns (per batch row; None if N/A)
     inter_token_ids_per_position: list[list[int] | None] | None = None
     inter_token_confidence_per_position: list[list[float] | None] | None = None

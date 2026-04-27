@@ -131,9 +131,9 @@ class Verifier(VerifierBase):
                 verification_models=["target"] * batch_size,
                 token_ids_per_position=token_ids_per_position,
                 token_confidence_per_position=token_confidence_per_position,
-                accept_len=accept_len,
                 recovery_tokens=list(recovery_tokens),
                 bonus_tokens=bonus_tokens,
+                accept_len=accept_len,
             )
 
         self.metrics["target_verify_times"].append(perf_counter() - _tv0)

@@ -193,7 +193,11 @@ def trace_to_row_indexed(
             row["target_token_confidence_per_position"] = (
                 list(trace.token_confidence_per_position[i]) if trace.token_confidence_per_position[i] else None
             )
-            row["target_accept_len"] = trace.accept_len[i]
+            al = trace.accept_len
+            if al is not None and i < len(al):
+                row["target_accept_len"] = al[i]
+            else:
+                row["target_accept_len"] = None
             row["target_recovery_token"] = trace.recovery_tokens[i]
             row["target_bonus_token"] = trace.bonus_tokens[i]
             itp = getattr(trace, "inter_target_prefix_accept_len", None)

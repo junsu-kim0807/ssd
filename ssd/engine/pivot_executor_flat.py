@@ -278,9 +278,9 @@ class PivotExecutorFlat(VerifierBase):
                 verification_models=["target"] * parent_bsz,
                 token_ids_per_position=[[] for _ in range(parent_bsz)],
                 token_confidence_per_position=[[] for _ in range(parent_bsz)],
-                accept_len=[max(0, len(s) - 1) for s in new_suffixes],
                 recovery_tokens=list(recovery_tokens),
                 bonus_tokens=[None for _ in range(parent_bsz)],
+                accept_len=[max(0, len(s) - 1) for s in new_suffixes],
                 pivot_criteria_score=(
                     list(bundle.criteria_scores)
                     if bundle.criteria_scores is not None

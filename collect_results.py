@@ -227,7 +227,9 @@ def build_motivation_entries(analysis_path: Path, ctx: Dict[str, Any]) -> List[D
 
 
 def is_target_misspeculation_row(row: Dict[str, Any]) -> bool:
-    """A misspeculation row is target_accept_len == 0."""
+    """A misspeculation row is a *target* verify slot with target_accept_len == 0."""
+    if row.get("verification_model") not in ("target", "pivot_target"):
+        return False
     return row.get("target_accept_len") == 0
 
 
@@ -373,6 +375,8 @@ def build_trace_entry(
     seen: set[Tuple[int, int]] = set()
 
     for row in iter_jsonl(metadata_path):
+        if row.get("verification_model") not in ("target", "pivot_target"):
+            continue
         req = row.get("request_id")
         step = row.get("step_id")
         accept_len = row.get("target_accept_len")

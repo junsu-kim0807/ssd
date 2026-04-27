@@ -142,9 +142,9 @@ class VerifierHierarchical(VerifierBase):
                 verification_models=["intermediate"] * batch_size,
                 token_ids_per_position=token_ids_per_position,
                 token_confidence_per_position=token_confidence_per_position,
-                accept_len=[0] * batch_size,
                 recovery_tokens=list(recovery_tokens),
                 bonus_tokens=bonus_tokens,
+                accept_len=None,
                 inter_token_ids_per_position=inter_token_ids_per_position,
                 inter_token_confidence_per_position=inter_token_confidence_per_position,
                 inter_accept_len=[int(accept_n_list[b]) for b in range(batch_size)],
@@ -234,7 +234,6 @@ class VerifierHierarchical(VerifierBase):
                 tok_conf.append([float(pr[j].max().item()) for j in range(L)])
                 acc_len_excl_recovery = max(0, len(suffix) - 1)
                 acc_lens.append(acc_len_excl_recovery)
-                assert acc_lens[-1] == acc_len_excl_recovery
                 bonus_toks.append(int(preds_row[-1].item()))
                 cap_excl = L - K
                 itp = 0
@@ -254,9 +253,9 @@ class VerifierHierarchical(VerifierBase):
                 verification_models=["target"] * batch_size,
                 token_ids_per_position=tok_ids,
                 token_confidence_per_position=tok_conf,
-                accept_len=acc_lens,
                 recovery_tokens=list(recovery_tokens),
                 bonus_tokens=bonus_toks,
+                accept_len=acc_lens,
                 inter_target_prefix_accept_len=inter_target_prefix_accepts,
             )
 

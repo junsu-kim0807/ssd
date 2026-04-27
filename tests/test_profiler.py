@@ -104,6 +104,10 @@ def test_metadata_finish_run_writes_analysis_jsonl(tmp_path):
     line = ap.read_text(encoding="utf-8").strip().splitlines()[-1]
     data = json.loads(line)
     assert data["total_target_verification_rounds"] == 2
+    assert data["total_intermediate_profile_verification_rounds"] == 0
+    assert data["total_verification_profile_rounds"] == 2
+    assert abs(data["avg_target_accept_len"] - 1.5) < 1e-9
+    assert abs(data["avg_target_accept_len_incl_recovery"] - 2.5) < 1e-9
     assert data["misspeculation_rounds"] == 1
     assert abs(data["misspeculation_probability"] - 0.5) < 1e-9
     tbd = data["target_batch_accept_distributions"]
@@ -190,7 +194,7 @@ def test_metadata_analysis_hierarchical_avgs(tmp_path):
     p.start_step([S()], is_prefill=False)
     tr_i = SimpleNamespace(
         verification_models=["intermediate"],
-        accept_len=[0],
+        accept_len=None,
         inter_accept_len=[2],
         inter_target_prefix_accept_len=None,
     )
@@ -208,6 +212,10 @@ def test_metadata_analysis_hierarchical_avgs(tmp_path):
     assert abs(data["avg_intermediate_accept_len"] - 2.0) < 1e-9
     assert abs(data["avg_target_accept_len"] - 1.0) < 1e-9
     assert abs(data["avg_inter_target_prefix_accept_len"] - 5.0) < 1e-9
+    assert abs(data["avg_target_accept_len_incl_recovery"] - 2.0) < 1e-9
+    assert data["total_target_verification_rounds"] == 1
+    assert data["total_intermediate_profile_verification_rounds"] == 1
+    assert data["total_verification_profile_rounds"] == 2
 
 
 def test_cost_metadata_does_not_write_analysis_jsonl(tmp_path):

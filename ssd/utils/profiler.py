@@ -294,6 +294,7 @@ class SSDProfiler:
 
         # metadata-mode analysis.jsonl (record_decode_verify_batch)
         self._meta_target_verification_rounds: int = 0
+        self._meta_intermediate_profile_rounds: int = 0
         self._meta_misspeculation_rounds: int = 0
         self._meta_batch_hist_sums: defaultdict[str, float] = defaultdict(float)
         self._meta_batch_hist_union: set[str] = set()
@@ -615,7 +616,10 @@ class SSDProfiler:
                 tgt_samples, int(self._speculate_k)
             )
             analysis: dict[str, Any] = {
-                "avg_target_accept_len": _avg_int(self._hv_target_accept_samples),
+                "avg_target_accept_len": _avg_int(tgt_samples),
+                "avg_target_accept_len_incl_recovery": (
+                    _avg_int([x + 1 for x in tgt_samples]) if tgt_samples else None
+                ),
                 "avg_intermediate_accept_len": (
                     _avg_int(self._hv_inter_accept_samples) if uses_hierarchical_verify(self._spec_policy) else None
                 ),
@@ -625,6 +629,12 @@ class SSDProfiler:
                     else None
                 ),
                 "total_target_verification_rounds": n_tgt,
+                "total_intermediate_profile_verification_rounds": int(
+                    self._meta_intermediate_profile_rounds
+                ),
+                "total_verification_profile_rounds": int(
+                    self._meta_target_verification_rounds + self._meta_intermediate_profile_rounds
+                ),
                 "misspeculation_rounds": n_miss,
                 "misspeculation_probability": (float(n_miss) / float(n_tgt)) if n_tgt > 0 else None,
                 "accept_rate_per_position": rate_pos,
@@ -653,9 +663,24 @@ class SSDProfiler:
                         "(VerifyProfileTrace.accept_len present); can differ from total_target_verification_rounds "
                         "if accept_len was missing for some target rows."
                     ),
+                    "avg_target_accept_len_incl_recovery": (
+                        "Mean of (target accept_len + 1) over the same samples as avg_target_accept_len: "
+                        "recovery column plus accepted speculative tail length in tokens per target verify row."
+                    ),
                     "target_batch_accept_distributions": (
                         "Mean over decode steps of per-batch accept_len histograms (batch_size>1, all target rounds); "
                         "each step histogram is accept_len counts / batch_size; missing keys in a step count as 0."
+                    ),
+                    "total_target_verification_rounds": (
+                        "Count of profile trace slots with verification_models in {target, pivot_target} only; "
+                        "excludes hierarchical intermediate subrounds."
+                    ),
+                    "total_intermediate_profile_verification_rounds": (
+                        "Count of profile trace slots with verification_models in {intermediate, pivot_intermediate}."
+                    ),
+                    "total_verification_profile_rounds": (
+                        "total_target_verification_rounds + total_intermediate_profile_verification_rounds "
+                        "(all traced verify slots; hierarchical fused has ~r intermediates + 1 target per engine step)."
                     ),
                 },
             }
@@ -784,13 +809,16 @@ class SSDProfiler:
         B = min(len(seqs), len(vms))
         accept_lens = getattr(trace, "accept_len", None)
         target_vm = frozenset({"target", "pivot_target"})
+        inter_vm = frozenset({"intermediate", "pivot_intermediate"})
         for i in range(B):
-            if vms[i] not in target_vm:
-                continue
-            self._meta_target_verification_rounds += 1
-            if accept_lens is not None and i < len(accept_lens):
-                if int(accept_lens[i]) == 0:
-                    self._meta_misspeculation_rounds += 1
+            vm = vms[i]
+            if vm in target_vm:
+                self._meta_target_verification_rounds += 1
+                if accept_lens is not None and i < len(accept_lens):
+                    if int(accept_lens[i]) == 0:
+                        self._meta_misspeculation_rounds += 1
+            elif vm in inter_vm:
+                self._meta_intermediate_profile_rounds += 1
         if B > 1 and all(vms[i] in target_vm for i in range(B)):
             vals: list[int] = []
             if accept_lens is not None:
