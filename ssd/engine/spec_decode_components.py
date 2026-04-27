@@ -80,6 +80,7 @@ def build_spec_components(
                 topk=config.pivot_topk,
             ),
             max_expand_rows=max_expand_rows,
+            enable_profile_trace=enable_profile_trace,
         )
         verifier = PivotExecutorFlat(
             lookahead=config.speculate_k,

@@ -30,9 +30,38 @@ if "ssd.engine.model_runner" not in sys.modules:
     sys.modules["ssd.engine.model_runner"] = types.SimpleNamespace(ModelRunner=object)
 
 from ssd.engine.block_manager import BlockManager
+from ssd.engine.pivot_branch_planner import PivotHostPlan
 from ssd.engine.pivot_executor_flat import PivotExecutorFlat
 from ssd.engine.pivot_types import BranchForkState, PivotBranchBundle
 from ssd.engine.sequence import Sequence
+
+
+def _mk_bundle(
+    *,
+    parent_batch_size: int,
+    parent_index_per_branch: list[int],
+    branch_index_per_parent: list[int],
+    branch_counts: list[int],
+    root_token_ids: list[int],
+    root_token_probs: list[float],
+    expanded_seqs,
+    branch_states,
+) -> PivotBranchBundle:
+    host_plan = PivotHostPlan(
+        parent_index_per_branch=parent_index_per_branch,
+        branch_index_per_parent=branch_index_per_parent,
+        root_token_ids=root_token_ids,
+        branch_counts=branch_counts,
+        expand_mask=[c > 1 for c in branch_counts],
+        criteria_scores=[0.0] * parent_batch_size,
+        root_token_probs=root_token_probs,
+    )
+    return PivotBranchBundle(
+        parent_batch_size=parent_batch_size,
+        host_plan=host_plan,
+        expanded_seqs=expanded_seqs,
+        branch_states=branch_states,
+    )
 
 
 class _DummyRunner:
@@ -95,7 +124,7 @@ def test_alternative_winner_commit_grafts_winner_and_frees_loser():
     loser_seq.block_table = list(loser_table_t)
     loser_seq.draft_block_table = list(loser_table_d)
 
-    bundle = PivotBranchBundle(
+    bundle = _mk_bundle(
         parent_batch_size=1,
         parent_index_per_branch=[0, 0],
         branch_index_per_parent=[1, 2],
@@ -173,7 +202,7 @@ def test_branch0_winner_keeps_parent_and_releases_alternatives():
     alt_seq.draft_block_table = list(alt_table_d)
 
     branch0_seq = parent
-    bundle = PivotBranchBundle(
+    bundle = _mk_bundle(
         parent_batch_size=1,
         parent_index_per_branch=[0, 0],
         branch_index_per_parent=[0, 1],

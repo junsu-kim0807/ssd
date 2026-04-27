@@ -39,6 +39,27 @@ class PivotExpansionConfig:
 
 
 @dataclass
+class PivotHostPlan:
+    """Host-side mirror of a pivot plan.
+
+    All fields are plain Python lists materialized from GPU tensors via a
+    single batched transfer. Reused across capacity clamp, branch construction,
+    and bundle output to avoid scattered ``.tolist()`` / ``.item()`` calls.
+    """
+    parent_index_per_branch: list[int]
+    branch_index_per_parent: list[int]
+    root_token_ids: list[int]
+    branch_counts: list[int]
+    expand_mask: list[bool]
+    # ``criteria_scores`` is required by capacity clamping (deterministic ordering)
+    # so it is always materialized. Other profile fields are optional.
+    criteria_scores: list[float] | None = None
+    root_token_probs: list[float] | None = None
+    top1_probs: list[float] | None = None
+    residual_scores: list[float] | None = None
+
+
+@dataclass
 class PivotExpansionPlan:
     parent_batch_size: int
     expanded_batch_size: int
@@ -52,6 +73,7 @@ class PivotExpansionPlan:
     residual_scores: torch.Tensor  # [B], float
     branch_counts: list[int]  # len B
     branch_counts_tensor: torch.Tensor  # [B], int64
+    host: PivotHostPlan | None = None
 
 
 def _clamp_prob_open_interval(p: float) -> float:
@@ -151,6 +173,8 @@ def build_pivot_expansion_plan(
     cfg: PivotExpansionConfig,
     *,
     max_expand_rows: int | None = None,
+    materialize_host: bool = True,
+    profile_metadata: bool = False,
 ) -> PivotExpansionPlan:
     if first_step_logits.ndim != 2:
         raise ValueError(
@@ -188,17 +212,74 @@ def build_pivot_expansion_plan(
         torch.full((bsz,), topk, dtype=torch.int64, device=device),
         torch.ones((bsz,), dtype=torch.int64, device=device),
     )
+    # One explicit sync to obtain expanded_batch_size; pass it to repeat_interleave
+    # so PyTorch does not insert hidden syncs to compute output sizes.
+    expanded_batch_size = int(branch_counts_t.sum().item())
     parent_ids = torch.arange(bsz, dtype=torch.int64, device=device)
-    parent_index_per_branch = torch.repeat_interleave(parent_ids, branch_counts_t)
+    parent_index_per_branch = torch.repeat_interleave(
+        parent_ids, branch_counts_t, output_size=expanded_batch_size
+    )
     cum = torch.cumsum(branch_counts_t, dim=0)
     starts = cum - branch_counts_t
     branch_index_per_parent = (
-        torch.arange(parent_index_per_branch.numel(), dtype=torch.int64, device=device)
-        - torch.repeat_interleave(starts, branch_counts_t)
+        torch.arange(expanded_batch_size, dtype=torch.int64, device=device)
+        - torch.repeat_interleave(starts, branch_counts_t, output_size=expanded_batch_size)
     )
     root_token_ids = topk_ids[parent_index_per_branch, branch_index_per_parent]
     root_token_probs = topk_probs[parent_index_per_branch, branch_index_per_parent]
-    expanded_batch_size = int(parent_index_per_branch.numel())
+
+    host: PivotHostPlan | None = None
+    if materialize_host:
+        # Batch all int-typed fields into one D2H copy, and all float-typed
+        # fields into another. Splitting back is O(B) on host. This collapses
+        # what would otherwise be ~6-9 separate ``.tolist()`` syncs into 2
+        # (or 3 when profile metadata is on for [B_exp]-shaped probs).
+        b_exp = expanded_batch_size
+
+        # ---- int fields: indices [B_exp]*3 + branch_counts [B] + expand_mask [B]
+        int_blob = torch.empty(3 * b_exp + 2 * bsz, dtype=torch.int64, device=device)
+        int_blob[0:b_exp] = parent_index_per_branch
+        int_blob[b_exp:2 * b_exp] = branch_index_per_parent
+        int_blob[2 * b_exp:3 * b_exp] = root_token_ids
+        int_blob[3 * b_exp:3 * b_exp + bsz] = branch_counts_t
+        int_blob[3 * b_exp + bsz:3 * b_exp + 2 * bsz] = expand_mask.to(torch.int64)
+        int_host = int_blob.tolist()
+
+        host_parent_index = int_host[0:b_exp]
+        host_branch_index = int_host[b_exp:2 * b_exp]
+        host_root_ids = int_host[2 * b_exp:3 * b_exp]
+        host_branch_counts = int_host[3 * b_exp:3 * b_exp + bsz]
+        host_expand_mask = [bool(x) for x in int_host[3 * b_exp + bsz:3 * b_exp + 2 * bsz]]
+
+        # ---- float fields: criteria_scores [B] (always); profile fields [B] when on
+        if profile_metadata:
+            float_blob = torch.empty(3 * bsz, dtype=torch.float32, device=device)
+            float_blob[0:bsz] = criteria_scores.to(torch.float32)
+            float_blob[bsz:2 * bsz] = top1_probs.to(torch.float32)
+            float_blob[2 * bsz:3 * bsz] = residual_scores.to(torch.float32)
+            float_host = float_blob.tolist()
+            host_criteria = float_host[0:bsz]
+            host_top1 = float_host[bsz:2 * bsz]
+            host_residual = float_host[2 * bsz:3 * bsz]
+            # ``root_token_probs`` is shaped [B_exp], can't fit into [B]-blob; one extra.
+            host_root_probs = root_token_probs.to(torch.float32).tolist()
+        else:
+            host_criteria = criteria_scores.to(torch.float32).tolist()
+            host_top1 = None
+            host_residual = None
+            host_root_probs = None
+
+        host = PivotHostPlan(
+            parent_index_per_branch=host_parent_index,
+            branch_index_per_parent=host_branch_index,
+            root_token_ids=host_root_ids,
+            branch_counts=host_branch_counts,
+            expand_mask=host_expand_mask,
+            criteria_scores=host_criteria,
+            root_token_probs=host_root_probs,
+            top1_probs=host_top1,
+            residual_scores=host_residual,
+        )
     return PivotExpansionPlan(
         parent_batch_size=bsz,
         expanded_batch_size=expanded_batch_size,
@@ -210,6 +291,7 @@ def build_pivot_expansion_plan(
         criteria_scores=criteria_scores,
         top1_probs=top1_probs,
         residual_scores=residual_scores,
-        branch_counts=branch_counts_t.cpu().tolist(),
+        branch_counts=(host.branch_counts if host is not None else branch_counts_t.tolist()),
         branch_counts_tensor=branch_counts_t,
+        host=host,
     )
