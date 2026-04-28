@@ -306,6 +306,96 @@ def build_target_scratch_packed_inputs(
     )
 
 
+def build_target_scratch_packed_inputs_from_paths(
+    parent_seqs: list[Sequence],
+    path_parent_seq_idx: list[int],
+    path_token_ids: list[list[int]],
+    path_node_ids: list[list[int]],
+    block_manager: "BlockManager",
+    *,
+    block_size: int,
+    device: torch.device,
+    lookahead: int,
+) -> TargetScratchPackedInputs:
+    """Phase-2A target scratch packer using parent sequences (no expanded_seqs)."""
+    if not path_token_ids:
+        z = torch.empty((0,), dtype=torch.int64, device=device)
+        zi = torch.zeros((1,), dtype=torch.int32, device=device)
+        return TargetScratchPackedInputs(
+            input_ids=z,
+            positions=z,
+            slot_mapping=z,
+            context_lens=torch.empty((0,), dtype=torch.int32, device=device),
+            block_tables=torch.empty((0, 0), dtype=torch.int32, device=device),
+            cu_seqlens_q=zi,
+            max_seqlen_q=0,
+            tree_attn_mask=None,
+            target_node_to_slot={},
+            scratch_owner=ScratchOwner(target_block_ids=[], draft_block_ids=[]),
+        )
+    row_len = lookahead + 1
+    bsz = len(path_token_ids)
+    assert len(path_node_ids) == bsz
+    input_ids = torch.tensor(path_token_ids, dtype=torch.int64, device=device).reshape(-1)
+    context_lens = torch.empty((bsz,), dtype=torch.int32, device=device)
+    block_tables_host: list[list[int]] = []
+    positions_host: list[int] = []
+    slot_mapping_host: list[int] = []
+    target_node_to_slot: dict[int, tuple[int, int]] = {}
+    all_scratch: list[int] = []
+    nscratch = (row_len + block_size - 1) // block_size
+    pos0_per_row: list[int] = []
+    try:
+        for r in range(bsz):
+            pidx = int(path_parent_seq_idx[r])
+            seq = parent_seqs[pidx]
+            pos0 = int(seq.num_tokens)
+            pos0_per_row.append(pos0)
+            assert int(seq.num_cached_tokens) == pos0
+            assert pos0 % block_size == 0
+            context_lens[r] = pos0 + row_len
+            n_pref = pos0 // block_size
+            prefix_blocks = [int(x) for x in seq.block_table[:n_pref]]
+            scratch_blocks = block_manager.allocate_scratch_blocks(nscratch)
+            all_scratch.extend(scratch_blocks)
+            row_bt = prefix_blocks + scratch_blocks
+            block_tables_host.append(row_bt)
+            for j in range(row_len):
+                pos = pos0 + j
+                positions_host.append(pos)
+                bidx = pos // block_size
+                off = pos % block_size
+                bid = int(row_bt[bidx])
+                slot_mapping_host.append(bid * block_size + off)
+                nid = int(path_node_ids[r][j])
+                target_node_to_slot[nid] = (bid, off)
+    except Exception:
+        block_manager.release_scratch_blocks(all_scratch)
+        raise
+    max_blocks = max(len(t) for t in block_tables_host)
+    block_tables = torch.full((bsz, max_blocks), -1, dtype=torch.int32, device=device)
+    for i, row in enumerate(block_tables_host):
+        if row:
+            block_tables[i, : len(row)] = torch.tensor(row, dtype=torch.int32, device=device)
+    positions = torch.tensor(positions_host, dtype=torch.int64, device=device)
+    slot_mapping = torch.tensor(slot_mapping_host, dtype=torch.int64, device=device)
+    cu = torch.arange(0, bsz + 1, dtype=torch.int32, device=device) * row_len
+    mask = build_rowwise_prefix_candidate_mask(pos0_per_row, row_len, device=device)
+    owner = ScratchOwner(target_block_ids=list(all_scratch), draft_block_ids=[])
+    return TargetScratchPackedInputs(
+        input_ids=input_ids,
+        positions=positions,
+        slot_mapping=slot_mapping,
+        context_lens=context_lens,
+        block_tables=block_tables,
+        cu_seqlens_q=cu,
+        max_seqlen_q=row_len,
+        tree_attn_mask=mask,
+        target_node_to_slot=target_node_to_slot,
+        scratch_owner=owner,
+    )
+
+
 def build_draft_scratch_packed_inputs(
     expanded_seqs: list[Sequence],
     path_token_ids: list[list[int]],

@@ -503,10 +503,10 @@ class Scheduler:
                         f"len(nodes)={len(tgt_nodes_full)}, len(new_suffix)={len(new_suffix)}"
                     )
                     tgt_nodes = tgt_nodes_full[: len(new_suffix)]
-                    src_block_ids: list[int] = []
-                    src_offsets: list[int] = []
-                    dst_block_ids: list[int] = []
-                    dst_offsets: list[int] = []
+                    target_src_block_ids: list[int] = []
+                    target_src_offsets: list[int] = []
+                    target_dst_block_ids: list[int] = []
+                    target_dst_offsets: list[int] = []
                     for j, node_id in enumerate(tgt_nodes):
                         assert node_id in commit_bundle.target_node_slot, (
                             f"target node id {node_id} missing from target_node_slot"
@@ -522,22 +522,39 @@ class Scheduler:
                         assert int(sb) not in seq.block_table, (
                             f"scratch source block leaked into parent target block_table: sb={int(sb)}"
                         )
-                        src_block_ids.append(int(sb))
-                        src_offsets.append(int(so))
-                        dst_block_ids.append(dst_bid)
-                        dst_offsets.append(dst_off)
+                        target_src_block_ids.append(int(sb))
+                        target_src_offsets.append(int(so))
+                        target_dst_block_ids.append(dst_bid)
+                        target_dst_offsets.append(dst_off)
                     if tgt_nodes:
-                        assert len(src_block_ids) == len(new_suffix), (
-                            f"target scratch commit alignment mismatch: copied={len(src_block_ids)}, "
+                        assert len(target_src_block_ids) == len(new_suffix), (
+                            f"target scratch commit alignment mismatch: copied={len(target_src_block_ids)}, "
                             f"accepted={len(new_suffix)}"
                         )
-                    if src_block_ids:
+                    if target_src_block_ids:
+                        if bool(getattr(self.config, "debug_mode", False)):
+                            print(
+                                json.dumps(
+                                    {
+                                        "pivot_tree_scratch_commit_debug": True,
+                                        "cache_kind": "target",
+                                        "seq_id": int(seq.seq_id),
+                                        "accepted_len": int(len(new_suffix)),
+                                        "target_copy_slots": int(len(tgt_nodes)),
+                                        "draft_copy_slots": 0,
+                                        "pre_num_tokens": int(seq.num_tokens),
+                                        "target_dst_blocks": list(target_dst_block_ids),
+                                    },
+                                    ensure_ascii=False,
+                                ),
+                                flush=True,
+                            )
                         target_model_runner.call(
                             "copy_kv_slots",
-                            src_block_ids,
-                            src_offsets,
-                            dst_block_ids,
-                            dst_offsets,
+                            target_src_block_ids,
+                            target_src_offsets,
+                            target_dst_block_ids,
+                            target_dst_offsets,
                             "target",
                         )
                 if (
@@ -550,10 +567,10 @@ class Scheduler:
                         f"len(nodes)={len(dr_nodes_full)}, len(new_suffix)={len(new_suffix)}"
                     )
                     dr_nodes = dr_nodes_full[: len(new_suffix)]
-                    src_block_ids = []
-                    src_offsets = []
-                    dst_block_ids = []
-                    dst_offsets = []
+                    draft_src_block_ids: list[int] = []
+                    draft_src_offsets: list[int] = []
+                    draft_dst_block_ids: list[int] = []
+                    draft_dst_offsets: list[int] = []
                     for j, node_id in enumerate(dr_nodes):
                         assert node_id in commit_bundle.draft_node_slot, (
                             f"draft node id {node_id} missing from draft_node_slot"
@@ -569,21 +586,38 @@ class Scheduler:
                         assert int(sb) not in seq.draft_block_table, (
                             f"scratch source block leaked into parent draft block_table: sb={int(sb)}"
                         )
-                        src_block_ids.append(int(sb))
-                        src_offsets.append(int(so))
-                        dst_block_ids.append(dst_bid)
-                        dst_offsets.append(dst_off)
+                        draft_src_block_ids.append(int(sb))
+                        draft_src_offsets.append(int(so))
+                        draft_dst_block_ids.append(dst_bid)
+                        draft_dst_offsets.append(dst_off)
                     if dr_nodes:
-                        assert len(src_block_ids) == len(new_suffix), (
-                            f"draft scratch commit alignment mismatch: copied={len(src_block_ids)}, "
+                        assert len(draft_src_block_ids) == len(new_suffix), (
+                            f"draft scratch commit alignment mismatch: copied={len(draft_src_block_ids)}, "
                             f"accepted={len(new_suffix)}"
                         )
-                    if src_block_ids:
+                    if draft_src_block_ids:
+                        if bool(getattr(self.config, "debug_mode", False)):
+                            print(
+                                json.dumps(
+                                    {
+                                        "pivot_tree_scratch_commit_debug": True,
+                                        "cache_kind": "draft",
+                                        "seq_id": int(seq.seq_id),
+                                        "accepted_len": int(len(new_suffix)),
+                                        "target_copy_slots": 0,
+                                        "draft_copy_slots": int(len(dr_nodes)),
+                                        "pre_num_tokens": int(seq.num_tokens),
+                                        "draft_dst_blocks": list(draft_dst_block_ids),
+                                    },
+                                    ensure_ascii=False,
+                                ),
+                                flush=True,
+                            )
                         draft_model_runner.copy_kv_slots(
-                            src_block_ids,
-                            src_offsets,
-                            dst_block_ids,
-                            dst_offsets,
+                            draft_src_block_ids,
+                            draft_src_offsets,
+                            draft_dst_block_ids,
+                            draft_dst_offsets,
                             "draft",
                         )
                 elif getattr(commit_bundle, "draft_node_slot", None):

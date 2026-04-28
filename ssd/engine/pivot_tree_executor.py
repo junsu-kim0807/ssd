@@ -22,7 +22,7 @@ from ssd.utils.verify import verify
 
 
 class PivotTreeScratchExecutor(VerifierBase):
-    """Target-tree pivot executor with phase-1 hybrid commit split."""
+    """Target-tree pivot executor for phase-1/phase-2 scratch commit paths."""
 
     def __init__(
         self,
@@ -315,15 +315,13 @@ class PivotTreeScratchExecutor(VerifierBase):
                     )
 
     @staticmethod
-    def _make_target_scratch_commit_bundle(
+    def _build_scratch_commit_bundle(
         bundle: PivotTreeScratchBundle,
         winner_rows: list[int],
         new_suffixes: list[list[int]],
     ) -> PivotTreeCommitBundle:
-        assert not bundle.draft_node_to_slot, (
-            "Phase-2 draft scratch is disabled until draft scratch forward writes KV"
-        )
         won_tgt: list[list[int]] = []
+        won_draft: list[list[int]] = []
         for pidx in range(bundle.parent_batch_size):
             row = int(winner_rows[pidx])
             L = len(new_suffixes[pidx])
@@ -339,11 +337,19 @@ class PivotTreeScratchExecutor(VerifierBase):
                     f"target node id {nid} missing from target_node_to_slot"
                 )
             won_tgt.append(nodes)
+            if bundle.draft_node_to_slot:
+                for nid in nodes:
+                    assert nid in bundle.draft_node_to_slot, (
+                        f"draft node id {nid} missing from draft_node_to_slot"
+                    )
+                won_draft.append(list(nodes))
+            else:
+                won_draft.append([])
         return PivotTreeCommitBundle(
             winner_target_node_ids=won_tgt,
-            winner_draft_node_ids=[[] for _ in range(bundle.parent_batch_size)],
+            winner_draft_node_ids=won_draft,
             target_node_slot=bundle.target_node_to_slot,
-            draft_node_slot={},
+            draft_node_slot=bundle.draft_node_to_slot,
             raw_suffix_lens=[len(s) for s in new_suffixes],
             scratch_owner=bundle.scratch_owner,
         )
@@ -388,12 +394,13 @@ class PivotTreeScratchExecutor(VerifierBase):
             for s, nc in zip(expanded, snap_nc):
                 s.num_cached_tokens = int(nc)
 
-    def _verify_target_scratch_phase1(
+    def _verify_with_target_scratch(
         self,
         seqs: list[Sequence],
         speculate_result: SpeculateResult,
         bundle: PivotTreeScratchBundle,
     ) -> VerifyResult:
+        assert bundle.draft_node_to_slot or bundle.expanded_seqs is not None
         assert bundle.target_scratch_packed is not None
         if not bool(getattr(self.target_model_runner, "enforce_eager", False)):
             raise RuntimeError(
@@ -497,12 +504,14 @@ class PivotTreeScratchExecutor(VerifierBase):
             f"logits_p {logits_p.shape[:2]} vs speculations {speculate_result.speculations.shape[:2]}"
         )
         self._phase1a_debug_logits_compare_flat_vs_scratch(bundle, logits_p)
-        expanded_seqs = bundle.expanded_seqs
-        assert expanded_seqs is not None
-        temps_target = [s.temperature for s in expanded_seqs]
+        temps_target = [seqs[int(pidx)].temperature for pidx in bundle.path_parent_seq_idx]
         temps_draft = [
-            s.draft_temperature if s.draft_temperature is not None else s.temperature
-            for s in expanded_seqs
+            (
+                seqs[int(pidx)].draft_temperature
+                if seqs[int(pidx)].draft_temperature is not None
+                else seqs[int(pidx)].temperature
+            )
+            for pidx in bundle.path_parent_seq_idx
         ]
         temperatures_target = torch.tensor(temps_target, dtype=torch.float32, device=self.device)
         temperatures_draft = torch.tensor(temps_draft, dtype=torch.float32, device=self.device)
@@ -548,8 +557,9 @@ class PivotTreeScratchExecutor(VerifierBase):
             new_suffixes[pidx] = suffixes[best_row]
             recovery_tokens[pidx] = recovery[best_row]
 
-        self._commit_phase1_draft_graft_and_release_forks(seqs, bundle, winners)
-        commit_bundle = self._make_target_scratch_commit_bundle(bundle, winner_rows, new_suffixes)
+        if not bundle.draft_node_to_slot:
+            self._commit_phase1_draft_graft_and_release_forks(seqs, bundle, winners)
+        commit_bundle = self._build_scratch_commit_bundle(bundle, winner_rows, new_suffixes)
 
         if bool(getattr(getattr(self.scheduler, "config", None), "debug_mode", False)):
             spec_rows = speculate_result.speculations.detach().cpu().tolist()
@@ -601,19 +611,17 @@ class PivotTreeScratchExecutor(VerifierBase):
 
     def verify(self, seqs: list[Sequence], speculate_result: SpeculateResult, eagle: bool = False) -> VerifyResult:
         bundle = speculate_result.branch_bundle
-        if not isinstance(bundle, PivotTreeScratchBundle) or bundle.expanded_seqs is None:
-            raise ValueError("PivotTreeScratchExecutor requires PivotTreeScratchBundle with expanded_seqs")
-        assert bundle.branch_states is not None, "Phase-0 fallback requires branch_states"
+        if not isinstance(bundle, PivotTreeScratchBundle):
+            raise ValueError("PivotTreeScratchExecutor requires PivotTreeScratchBundle")
 
         has_target_scratch = bool(bundle.target_node_to_slot)
-        has_draft_scratch = bool(bundle.draft_node_to_slot)
+        _has_draft_scratch = bool(bundle.draft_node_to_slot)
         if has_target_scratch:
-            assert not has_draft_scratch
             assert bundle.target_scratch_packed is not None
-            return self._verify_target_scratch_phase1(seqs, speculate_result, bundle)
+            return self._verify_with_target_scratch(seqs, speculate_result, bundle)
         # Explicit Phase-0 safety-mode invariants.
-        assert not has_target_scratch
-        assert not has_draft_scratch
+        assert bundle.expanded_seqs is not None
+        assert bundle.branch_states is not None, "Phase-0 fallback requires branch_states"
         assert bundle.scratch_owner is None
 
         self._phase0_compare_logits_flat_vs_tree(bundle.expanded_seqs, speculate_result)

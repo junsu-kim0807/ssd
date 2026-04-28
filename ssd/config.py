@@ -98,10 +98,8 @@ class Config:
     # Phase-1A debug compare runs an extra target forward and can perturb KV state.
     # Keep this opt-in and disabled by default.
     debug_phase1a_flat_compare: bool = False
-    # Phase-2 shadow only: run draft scratch packed forward and compare against
-    # flat draft rollout logits_q. Never affects production commit path.
-    enable_pivot_draft_scratch_shadow: bool = False
-    debug_pivot_draft_scratch_compare: bool = False
+    # Phase-2 draft scratch production gate (off by default).
+    enable_pivot_draft_scratch_phase2: bool = False
 
     # Profiling (disabled when profiler_output_dir is empty / None)
     profiler_mode: Literal[
