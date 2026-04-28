@@ -1478,15 +1478,32 @@ class ModelRunner:
                     < counts[:, None]
                 )
                 kv_indices = ctx.block_tables[mask]
+                if kv_indices.numel() > 0:
+                    assert int(kv_indices.min().item()) >= 0
+                    assert int(kv_indices.max().item()) < self.kv_cache.shape[2], (
+                        f"kv_indices out of range for kv_cache blocks: "
+                        f"min={int(kv_indices.min().item())}, "
+                        f"max={int(kv_indices.max().item())}, "
+                        f"num_blocks={self.kv_cache.shape[2]}"
+                    )
                 kv_last_page_len = (ctx.context_lens % self.block_size)
                 kv_last_page_len[kv_last_page_len == 0] = self.block_size
+                num_q_heads_local = self.decoder_hf_config.num_attention_heads // self.num_tp_gpus
+                num_kv_heads_local = self.decoder_hf_config.num_key_value_heads // self.num_tp_gpus
+                assert self.kv_cache.shape[-2] == num_kv_heads_local, (
+                    f"FlashInfer plan KV head mismatch: "
+                    f"kv_cache local={self.kv_cache.shape[-2]}, "
+                    f"plan local={num_kv_heads_local}, "
+                    f"global={self.decoder_hf_config.num_key_value_heads}, "
+                    f"tp={self.num_tp_gpus}"
+                )
                 self.only_prefill_wrapper.plan(
                     ctx.cu_seqlens_q.to(torch.int32),
                     kv_indptr,
                     kv_indices.to(torch.int32),
                     kv_last_page_len.to(torch.int32),
-                    self.decoder_hf_config.num_attention_heads,
-                    self.decoder_hf_config.num_key_value_heads,
+                    num_q_heads_local,
+                    num_kv_heads_local,
                     self.decoder_hf_config.head_dim,
                     self.block_size,
                     custom_mask=ctx.custom_mask,
