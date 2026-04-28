@@ -97,6 +97,43 @@ class PivotTreeScratchExecutor(VerifierBase):
             device=self.device,
             use_draft_table=False,
         )
+        q_indptr = packed.cu_seqlens_q
+        q_lens = (q_indptr[1:] - q_indptr[:-1]).to(torch.int64)
+        kv_lens = packed.context_lens.to(torch.int64)
+        expected_mask_len = int((q_lens * kv_lens).sum().item())
+        actual_mask_len = (
+            int(packed.tree_attn_mask.numel())
+            if packed.tree_attn_mask is not None
+            else -1
+        )
+        if bool(getattr(getattr(self.scheduler, "config", None), "debug_mode", False)):
+            print(
+                json.dumps(
+                    {
+                        "phase0_packed_debug": True,
+                        "q_lens": q_lens.detach().cpu().tolist(),
+                        "kv_lens": kv_lens.detach().cpu().tolist(),
+                        "expected_mask_len": expected_mask_len,
+                        "actual_mask_len": actual_mask_len,
+                        "input_ids_numel": int(packed.input_ids.numel()),
+                        "positions_numel": int(packed.positions.numel()),
+                        "slot_mapping_numel": int(packed.slot_mapping.numel()),
+                        "block_tables_shape": list(packed.block_tables.shape),
+                    },
+                    ensure_ascii=False,
+                ),
+                flush=True,
+            )
+        assert actual_mask_len == expected_mask_len, (
+            "phase0 tree_attn_mask length mismatch: "
+            f"expected={expected_mask_len}, actual={actual_mask_len}, "
+            f"q_lens={q_lens.detach().cpu().tolist()}, "
+            f"kv_lens={kv_lens.detach().cpu().tolist()}"
+        )
+        q_total = int(q_lens.sum().item())
+        assert int(packed.input_ids.numel()) == q_total
+        assert int(packed.positions.numel()) == q_total
+        assert int(packed.slot_mapping.numel()) == q_total
         logits_flat = self.target_model_runner.call("run", expanded_seqs, False, False, True)
         logits_flat = logits_flat.view(len(expanded_seqs), self.lookahead + 1, -1)
         logits_tree = self.target_model_runner.call(
@@ -356,6 +393,40 @@ class PivotTreeScratchExecutor(VerifierBase):
                 "(speculator must use fork_target_kv=False / shared-prefix target tables)."
             )
         packed = bundle.target_scratch_packed
+        q_indptr = packed.cu_seqlens_q
+        q_lens = (q_indptr[1:] - q_indptr[:-1]).to(torch.int64)
+        kv_lens = packed.context_lens.to(torch.int64)
+        expected_mask_len = int((q_lens * kv_lens).sum().item())
+        actual_mask_len = (
+            int(packed.tree_attn_mask.numel())
+            if packed.tree_attn_mask is not None
+            else -1
+        )
+        if bool(getattr(getattr(self.scheduler, "config", None), "debug_mode", False)):
+            print(
+                json.dumps(
+                    {
+                        "packed_debug": True,
+                        "q_lens": q_lens.detach().cpu().tolist(),
+                        "kv_lens": kv_lens.detach().cpu().tolist(),
+                        "expected_mask_len": expected_mask_len,
+                        "actual_mask_len": actual_mask_len,
+                        "input_ids_numel": int(packed.input_ids.numel()),
+                        "positions_numel": int(packed.positions.numel()),
+                        "slot_mapping_numel": int(packed.slot_mapping.numel()),
+                        "block_tables_shape": list(packed.block_tables.shape),
+                    },
+                    ensure_ascii=False,
+                ),
+                flush=True,
+            )
+        assert actual_mask_len == expected_mask_len, (
+            f"tree_attn_mask length mismatch: expected {expected_mask_len}, got {actual_mask_len}"
+        )
+        q_total = int(q_lens.sum().item())
+        assert int(packed.input_ids.numel()) == q_total
+        assert int(packed.positions.numel()) == q_total
+        assert int(packed.slot_mapping.numel()) == q_total
         logits_tree_flat = self.target_model_runner.call(
             "run_packed_tree_decode",
             packed.input_ids,
