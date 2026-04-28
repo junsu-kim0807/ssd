@@ -454,6 +454,7 @@ def download_codeelo_data(num_samples=None):
 
 
 GOVREPORT_MAX_REPORT_CHARS = 48000
+GOVREPORT_MAX_DOWNLOAD_DOC_CHARS = 4000
 
 
 def download_govreport_data(num_samples=None):
@@ -469,31 +470,61 @@ def download_govreport_data(num_samples=None):
     if os.path.exists(output_file):
         print(f"File {output_file} already exists. Skipping download.")
         return output_file
-    print("Loading ccdv/govreport-summarization (train split)...")
+    split_name = "test"
+    print(f"Loading ccdv/govreport-summarization ({split_name} split)...")
     try:
         raw = load_dataset("ccdv/govreport-summarization", trust_remote_code=True)
     except Exception as e:
         print(f"Error loading govreport-summarization: {e}")
         raise
-    dataset = _select_split(raw, ("train", "test", "validation"))
+    if hasattr(raw, "keys"):
+        if split_name not in raw:
+            raise RuntimeError(
+                f"Expected split '{split_name}' in ccdv/govreport-summarization, "
+                f"but only found: {list(raw.keys())}"
+            )
+        dataset = raw[split_name]
+    else:
+        dataset = raw
     total = len(dataset)
-    n = min(num_samples, total)
+    target_n = min(num_samples, total)
     prefix = (
         "Summarize the following government report in clear, structured prose. "
         "Focus on main findings and policy implications.\n\n---\n\n"
     )
-    print(f"Processing {n} samples from {total} total...")
+    print(
+        f"Collecting up to {target_n} samples from {total} total "
+        f"(report length <= {GOVREPORT_MAX_DOWNLOAD_DOC_CHARS} chars)..."
+    )
+    written = 0
+    skipped_long = 0
+    skipped_empty = 0
     with open(output_file, "w", encoding="utf-8") as f:
-        for i in range(n):
+        for i in range(total):
             ex = dataset[i]
             report = str(ex.get("report") or "").strip()
+            if not report:
+                skipped_empty += 1
+                continue
+            if len(report) > GOVREPORT_MAX_DOWNLOAD_DOC_CHARS:
+                skipped_long += 1
+                continue
             if len(report) > GOVREPORT_MAX_REPORT_CHARS:
                 report = report[:GOVREPORT_MAX_REPORT_CHARS] + "\n\n[... document truncated ...]"
             text = prefix + report
             f.write(json.dumps({"text": text}, ensure_ascii=False) + "\n")
+            written += 1
+            if written >= target_n:
+                break
             if i % 500 == 0:
-                print(f"Processed {i}/{n}...")
-    print(f"Saved {n} GovReport samples to {output_file}")
+                print(
+                    f"Scanned {i}/{total} rows | written={written} "
+                    f"(skipped_long={skipped_long}, skipped_empty={skipped_empty})..."
+                )
+    print(
+        f"Saved {written} GovReport samples to {output_file} "
+        f"(skipped_long={skipped_long}, skipped_empty={skipped_empty})"
+    )
     return output_file
 
 
