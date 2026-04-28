@@ -162,6 +162,65 @@ class ProfilerSink:
         return self._kernel_dir
 
 
+def summarize_pivot_microcost_rows(rows: list[dict[str, Any]]) -> dict[str, Any]:
+    """Aggregate per-step pivot microcost dicts into run-level fields for ``cost_breakdown.json``."""
+
+    if not rows:
+        return {}
+
+    def fsum(key: str) -> float:
+        return float(sum(float(r.get(key, 0.0) or 0.0) for r in rows))
+
+    def isum(key: str) -> int:
+        return int(sum(int(r.get(key, 0) or 0) for r in rows))
+
+    n = len(rows)
+    pivot_branch_construct_s = fsum("pivot_branch_construct_s")
+    pivot_cow_copy_s = fsum("pivot_cow_copy_s")
+    pivot_branch0_setup_s = fsum("pivot_branch0_setup_s")
+    pivot_expand_pack_s = fsum("pivot_expand_pack_s")
+    pivot_cow_plus_expansion_s = (
+        pivot_branch_construct_s
+        + pivot_cow_copy_s
+        + pivot_branch0_setup_s
+        + pivot_expand_pack_s
+    )
+    pivot_full_expansion_overhead_s = (
+        fsum("pivot_plan_build_s")
+        + fsum("pivot_capacity_clamp_s")
+        + fsum("pivot_branch0_override_s")
+        + pivot_cow_plus_expansion_s
+    )
+
+    return {
+        "pivot_microcost_steps": n,
+        "pivot_plan_build_time_s": fsum("pivot_plan_build_s"),
+        "pivot_capacity_clamp_time_s": fsum("pivot_capacity_clamp_s"),
+        "pivot_branch0_override_time_s": fsum("pivot_branch0_override_s"),
+        "pivot_branch_construct_time_s": pivot_branch_construct_s,
+        "pivot_cow_copy_time_s": pivot_cow_copy_s,
+        "pivot_branch0_setup_time_s": pivot_branch0_setup_s,
+        "pivot_expand_pack_time_s": pivot_expand_pack_s,
+        "pivot_cow_plus_expansion_time_s": pivot_cow_plus_expansion_s,
+        "pivot_full_expansion_overhead_time_s": pivot_full_expansion_overhead_s,
+        "pivot_tail_draft_forward_time_s": fsum("pivot_tail_draft_forward_s"),
+        "pivot_extra_draft_forward_time_s": fsum("pivot_extra_draft_forward_s"),
+        "pivot_num_nonzero_branches": isum("num_nonzero_branches"),
+        "pivot_num_target_cow_copy_blocks": isum("num_target_cow_copy_blocks"),
+        "pivot_num_draft_cow_copy_blocks": isum("num_draft_cow_copy_blocks"),
+        "pivot_num_inter_cow_copy_blocks": isum("num_inter_cow_copy_blocks"),
+        "avg_pivot_cow_plus_expansion_time_per_step": (
+            pivot_cow_plus_expansion_s / n if n > 0 else None
+        ),
+        "avg_pivot_full_expansion_overhead_time_per_step": (
+            pivot_full_expansion_overhead_s / n if n > 0 else None
+        ),
+        # Plain names for cost reports: expansion wall (branch fork + pack + COW, no draft tail forward).
+        "pivot_expansion_time_s": pivot_cow_plus_expansion_s,
+        "pivot_cow_time_s": pivot_cow_copy_s,
+    }
+
+
 class _ProfilerProtocol(Protocol):
     def start_run(self, config: Any, tokenizer: Any) -> None: ...
     def finish_run(self, *, preempt_count: int = 0) -> None: ...
@@ -180,6 +239,7 @@ class _ProfilerProtocol(Protocol):
     def inter_target_counts_for_seq(self, seq_id: int) -> tuple[int, int]: ...
     def accum_hierarchical_verify_time(self, dt: float, is_intermediate: bool) -> None: ...
     def decode_metadata_step_id(self) -> int: ...
+    def accumulate_pivot_microcost_row(self, row: dict[str, Any]) -> None: ...
 
 
 @dataclass
@@ -234,6 +294,9 @@ class _NoOpProfiler:
 
     def decode_metadata_step_id(self) -> int:
         return 0
+
+    def accumulate_pivot_microcost_row(self, row: dict[str, Any]) -> None:
+        return
 
 
 NOOP_PROFILER: _ProfilerProtocol = _NoOpProfiler()
@@ -301,6 +364,13 @@ class SSDProfiler:
         self._meta_batch_hist_batches: int = 0
 
         self._kernel_prof: Any | None = None
+        self._pivot_microcost_rows: list[dict[str, Any]] = []
+
+    def accumulate_pivot_microcost_row(self, row: dict[str, Any]) -> None:
+        """PivotRootSpeculatorSync pushes one row per root expansion when cost aggregates are enabled."""
+        if not wants_cost_aggregates(self._mode):
+            return
+        self._pivot_microcost_rows.append(dict(row))
 
     def start_run(self, config: Any, tokenizer: Any) -> None:
         self._tokenizer = tokenizer
@@ -323,7 +393,7 @@ class SSDProfiler:
             except Exception:
                 self._kernel_prof = None
 
-    def _load_pivot_microcost_summary(self) -> dict[str, Any]:
+    def _read_pivot_microcost_jsonl_rows(self) -> list[dict[str, Any]]:
         rows: list[dict[str, Any]] = []
         for path in self._sink.root.glob("pivot_draft_microcost.worker_*.jsonl"):
             try:
@@ -334,58 +404,11 @@ class SSDProfiler:
                             rows.append(json.loads(line))
             except FileNotFoundError:
                 continue
+        return rows
 
-        if not rows:
-            return {}
-
-        def fsum(key: str) -> float:
-            return float(sum(float(r.get(key, 0.0) or 0.0) for r in rows))
-
-        def isum(key: str) -> int:
-            return int(sum(int(r.get(key, 0) or 0) for r in rows))
-
-        n = len(rows)
-        pivot_branch_construct_s = fsum("pivot_branch_construct_s")
-        pivot_cow_copy_s = fsum("pivot_cow_copy_s")
-        pivot_branch0_setup_s = fsum("pivot_branch0_setup_s")
-        pivot_expand_pack_s = fsum("pivot_expand_pack_s")
-        pivot_cow_plus_expansion_s = (
-            pivot_branch_construct_s
-            + pivot_cow_copy_s
-            + pivot_branch0_setup_s
-            + pivot_expand_pack_s
-        )
-        pivot_full_expansion_overhead_s = (
-            fsum("pivot_plan_build_s")
-            + fsum("pivot_capacity_clamp_s")
-            + fsum("pivot_branch0_override_s")
-            + pivot_cow_plus_expansion_s
-        )
-
-        return {
-            "pivot_microcost_steps": n,
-            "pivot_plan_build_time_s": fsum("pivot_plan_build_s"),
-            "pivot_capacity_clamp_time_s": fsum("pivot_capacity_clamp_s"),
-            "pivot_branch0_override_time_s": fsum("pivot_branch0_override_s"),
-            "pivot_branch_construct_time_s": pivot_branch_construct_s,
-            "pivot_cow_copy_time_s": pivot_cow_copy_s,
-            "pivot_branch0_setup_time_s": pivot_branch0_setup_s,
-            "pivot_expand_pack_time_s": pivot_expand_pack_s,
-            "pivot_cow_plus_expansion_time_s": pivot_cow_plus_expansion_s,
-            "pivot_full_expansion_overhead_time_s": pivot_full_expansion_overhead_s,
-            "pivot_tail_draft_forward_time_s": fsum("pivot_tail_draft_forward_s"),
-            "pivot_extra_draft_forward_time_s": fsum("pivot_extra_draft_forward_s"),
-            "pivot_num_nonzero_branches": isum("num_nonzero_branches"),
-            "pivot_num_target_cow_copy_blocks": isum("num_target_cow_copy_blocks"),
-            "pivot_num_draft_cow_copy_blocks": isum("num_draft_cow_copy_blocks"),
-            "pivot_num_inter_cow_copy_blocks": isum("num_inter_cow_copy_blocks"),
-            "avg_pivot_cow_plus_expansion_time_per_step": (
-                pivot_cow_plus_expansion_s / n if n > 0 else None
-            ),
-            "avg_pivot_full_expansion_overhead_time_per_step": (
-                pivot_full_expansion_overhead_s / n if n > 0 else None
-            ),
-        }
+    def _load_pivot_microcost_summary(self) -> dict[str, Any]:
+        """Legacy: pivot_draft_microcost JSONL on disk. Prefer in-memory ``_pivot_microcost_rows``."""
+        return summarize_pivot_microcost_rows(self._read_pivot_microcost_jsonl_rows())
 
     def finish_run(self, *, preempt_count: int = 0) -> None:
         if self._kernel_prof is not None:
@@ -579,14 +602,22 @@ class SSDProfiler:
                     float(self._run_verify_s), tgt_n, avg_decode_bsz_f
                 )
 
-            pivot_microcost = self._load_pivot_microcost_summary()
+            pivot_rows = list(self._pivot_microcost_rows)
+            if not pivot_rows:
+                pivot_rows = self._read_pivot_microcost_jsonl_rows()
+            pivot_microcost = summarize_pivot_microcost_rows(pivot_rows)
             if pivot_microcost:
                 payload.update(pivot_microcost)
                 payload["notes"].update(
                     {
                         "pivot_cow_copy_time_s": (
-                            "sum of partial COW KV copy wall time from pivot_draft_microcost JSONL; "
-                            "set SSD_PROFILE_PIVOT_SYNC=1 for synchronized GPU timing"
+                            "partial COW KV copy wall time summed over pivot root-expansion steps "
+                            "(in-memory during the run, or legacy pivot_draft_microcost JSONL); "
+                            "alias: pivot_cow_time_s. Set SSD_PROFILE_PIVOT_SYNC=1 for synchronized GPU timing"
+                        ),
+                        "pivot_expansion_time_s": (
+                            "wall time for branch fork + COW + branch-0 in-place + host/GPU pack "
+                            "(same as pivot_cow_plus_expansion_time_s; excludes tail/extra draft forwards)"
                         ),
                         "pivot_expand_pack_time_s": (
                             "sum of pivot_initial_pack_s + pivot_final_pack_s"

@@ -165,6 +165,11 @@ class LLMEngine:
         )
 
         self.profiler = make_profiler(config)
+        setattr(
+            self.scheduler,
+            "_ssd_profiler",
+            self.profiler if isinstance(self.profiler, SSDProfiler) else None,
+        )
 
         print(f"[LLMEngine] finished llm_engine init", flush=True)
 

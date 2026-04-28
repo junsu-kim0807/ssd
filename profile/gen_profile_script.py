@@ -172,6 +172,17 @@ def temp_path_tag(temp: float) -> str:
     return "t" + s.replace(".", "p")
 
 
+def pct_path_component(pct: float) -> str:
+    s = f"{pct:.6f}".rstrip("0").rstrip(".")
+    if not s:
+        s = "0"
+    return "pct" + s.replace(".", "p")
+
+
+def uses_pivot_profiler_layout(method_id: str) -> bool:
+    return method_id in {"pivot", "pivot_legacy"}
+
+
 def shell_quote_single(s: str) -> str:
     return "'" + str(s).replace("'", "'\"'\"'") + "'"
 
@@ -337,21 +348,39 @@ def profiler_rel_dir(
     temp: float,
     dataset_slug: str | None = None,
     hv_round: int | None = None,
+    pivot_round: str = "na",
+    pivot_topk: int = 5,
+    pivot_expansion_pct: float = 0.2,
 ) -> str:
     """Path relative to bench cwd (``profile_mode``: cost | metadata | cost_metadata).
 
     When ``hv_round`` is set (hierarchical jobs), insert ``r<hv_round>/`` (``--round`` value) after
     the temperature tag and before the optional dataset slug.
+
+    For ``pivot`` / ``pivot_legacy``, results go under
+    ``.../<pair>/<t*temp>/r_<round>/topk<k>/<pct*>/[<dataset>]`` (matches ``--temp``, ``--pivot_topk``,
+    ``--pivot_expansion_pct``; ``r_<round>`` is from ``--pivot-profiler-round`` here, not bench ``--round``).
     """
-    parts = [
+    base = [
         "results",
         profile_mode,
         method_id,
         f"b{int(batch_size)}",
         k_path_token,
         pair_slug,
-        temp_path_tag(temp),
     ]
+    if uses_pivot_profiler_layout(method_id):
+        parts = [
+            *base,
+            temp_path_tag(temp),
+            f"r_{sanitize_path_component(str(pivot_round))}",
+            f"topk{int(pivot_topk)}",
+            pct_path_component(float(pivot_expansion_pct)),
+        ]
+        if dataset_slug:
+            parts.append(sanitize_path_component(dataset_slug))
+        return os.path.join(*parts)
+    parts = [*base, temp_path_tag(temp)]
     if hv_round is not None:
         parts.append(f"r{int(hv_round)}")
     if dataset_slug:
@@ -375,6 +404,8 @@ def build_bench_argv(
     profiler_output_dir: str,
     extra_bench_args: Sequence[str],
     hv_target_verify_interval: int | None = None,
+    pivot_topk: int | None = None,
+    pivot_expansion_pct: float | None = None,
 ) -> list[str]:
     argv: list[str] = [
         "python",
@@ -396,6 +427,17 @@ def build_bench_argv(
     ]
     if method.id == "hierarchical" and hv_target_verify_interval is not None:
         argv.extend(["--round", str(int(hv_target_verify_interval))])
+    if uses_pivot_profiler_layout(method.id):
+        if pivot_topk is None or pivot_expansion_pct is None:
+            raise ValueError("pivot_topk and pivot_expansion_pct required for pivot profiler layout")
+        argv.extend(
+            [
+                "--pivot_topk",
+                str(int(pivot_topk)),
+                "--pivot_expansion_pct",
+                str(float(pivot_expansion_pct)),
+            ]
+        )
     argv.extend(
         [
             "--profile",
@@ -467,6 +509,9 @@ def profiler_mkdirs_block_for_datasets(
     temp: float,
     dataset_slugs: Sequence[str],
     hv_round: int | None = None,
+    pivot_round: str = "na",
+    pivot_topk: int = 5,
+    pivot_expansion_pct: float = 0.2,
 ) -> str:
     lines: list[str] = []
     for ds in dataset_slugs:
@@ -479,6 +524,9 @@ def profiler_mkdirs_block_for_datasets(
             temp=temp,
             dataset_slug=ds,
             hv_round=hv_round,
+            pivot_round=pivot_round,
+            pivot_topk=pivot_topk,
+            pivot_expansion_pct=pivot_expansion_pct,
         ).replace(os.sep, "/")
         lines.append(f'mkdir -p "${{BENCH_DIR}}/{rel}"')
     return ("\n".join(lines) + "\n") if lines else ""
@@ -499,6 +547,8 @@ def build_multi_dataset_profile_loop_sh(
     profiler_base_rel: str,
     extra_bench_args: Sequence[str],
     hv_target_verify_interval: int | None = None,
+    pivot_topk: int | None = None,
+    pivot_expansion_pct: float | None = None,
 ) -> str:
     """Bash loop: ``--profiler_output_dir`` = ``$PROFILE_BASE/$dataset`` (``dataset`` in MULTI_DATASET_PROFILE_SLUGS)."""
     prof_base_q = shell_quote_single("./" + profiler_base_rel.replace(os.sep, "/"))
@@ -530,6 +580,11 @@ def build_multi_dataset_profile_loop_sh(
         body_lines.append(f"    {shlex.quote(str(tok))} \\")
     if method.id == "hierarchical" and hv_target_verify_interval is not None:
         body_lines.append(f"    --round {int(hv_target_verify_interval)} \\")
+    if uses_pivot_profiler_layout(method.id):
+        if pivot_topk is None or pivot_expansion_pct is None:
+            raise ValueError("pivot_topk and pivot_expansion_pct required for pivot multi-dataset loop")
+        body_lines.append(f"    --pivot_topk {int(pivot_topk)} \\")
+        body_lines.append(f"    --pivot_expansion_pct {float(pivot_expansion_pct)} \\")
     for tok in extra_bench_args:
         body_lines.append(f"    {shlex.quote(str(tok))} \\")
     body_lines += [
@@ -728,6 +783,24 @@ def main() -> None:
         help="Hierarchical method only: comma-separated bench.py --round values (>=1). Each R adds "
         ".../t<tag>/r<R>/ to job, log, and profiler paths. Default when empty: sweep 1,2,3.",
     )
+    p.add_argument(
+        "--pivot-topk",
+        type=int,
+        default=5,
+        help="pivot / pivot_legacy: bench.py --pivot_topk and profiler path segment topk<N> (default 5).",
+    )
+    p.add_argument(
+        "--pivot-expansion-pct",
+        type=float,
+        default=0.2,
+        help="pivot / pivot_legacy: bench.py --pivot_expansion_pct and profiler pct* segment (default 0.2).",
+    )
+    p.add_argument(
+        "--pivot-profiler-round",
+        type=str,
+        default="na",
+        help="pivot / pivot_legacy: profiler directory r_<value> after t<temp> (not bench --round). Default na.",
+    )
 
     p.add_argument(
         "--profile-mode",
@@ -749,6 +822,9 @@ def main() -> None:
     p.add_argument("--extra-bench-arg", action="append", default=[], help="Extra bench.py token (repeatable)")
     p.add_argument("--dry-run", action="store_true")
     args = p.parse_args()
+
+    if int(args.pivot_topk) < 1:
+        p.error("--pivot-topk must be >= 1")
 
     if str(args.hv_rounds).strip():
         hv_rounds_parsed = parse_csv_ints(args.hv_rounds)
@@ -816,6 +892,12 @@ def main() -> None:
 
             prof_hv_kw = int(hv_round) if hv_round is not None else None
 
+            pivot_prof_kwargs = dict(
+                pivot_round=str(args.pivot_profiler_round),
+                pivot_topk=int(args.pivot_topk),
+                pivot_expansion_pct=float(args.pivot_expansion_pct),
+            )
+
             prof_base_rel = profiler_rel_dir(
                 profile_mode=args.profile_mode,
                 method_id=spec.id,
@@ -825,10 +907,14 @@ def main() -> None:
                 temp=temp_val,
                 dataset_slug=None,
                 hv_round=prof_hv_kw,
+                **pivot_prof_kwargs,
             )
             prof_rel = "./" + prof_base_rel.replace(os.sep, "/")
 
             gpu_n = gpus_global if gpus_global is not None else DEFAULT_GPU_BY_FAMILY_METHOD[(fam, spec.id)]
+
+            pivot_bench_topk = int(args.pivot_topk) if uses_pivot_profiler_layout(spec.id) else None
+            pivot_bench_pct = float(args.pivot_expansion_pct) if uses_pivot_profiler_layout(spec.id) else None
 
             bench_argv = build_bench_argv(
                 model_flag=flag_name,
@@ -845,14 +931,30 @@ def main() -> None:
                 profiler_output_dir=prof_rel,
                 extra_bench_args=tuple(args.extra_bench_arg),
                 hv_target_verify_interval=hv_round,
+                pivot_topk=pivot_bench_topk,
+                pivot_expansion_pct=pivot_bench_pct,
             )
 
             temp_tag = temp_path_tag(temp_val)
             r_tag = f"r{int(hv_round)}" if hv_round is not None else ""
 
-            rel_bits = Path(args.profile_mode) / fam / spec.id / f"b{b_val}" / k_path / pair_slug / temp_tag
-            if hv_round is not None:
-                rel_bits = rel_bits / r_tag
+            if uses_pivot_profiler_layout(spec.id):
+                rel_bits = (
+                    Path(args.profile_mode)
+                    / fam
+                    / spec.id
+                    / f"b{b_val}"
+                    / k_path
+                    / pair_slug
+                    / temp_tag
+                    / f"r_{sanitize_path_component(str(args.pivot_profiler_round))}"
+                    / f"topk{int(args.pivot_topk)}"
+                    / pct_path_component(float(args.pivot_expansion_pct))
+                )
+            else:
+                rel_bits = Path(args.profile_mode) / fam / spec.id / f"b{b_val}" / k_path / pair_slug / temp_tag
+                if hv_round is not None:
+                    rel_bits = rel_bits / r_tag
             job_dir = job_root / rel_bits
             out_log_dir = out_log_root / rel_bits
             err_log_dir = err_log_root / rel_bits
@@ -879,6 +981,7 @@ def main() -> None:
                     temp=temp_val,
                     dataset_slugs=MULTI_DATASET_PROFILE_SLUGS,
                     hv_round=prof_hv_kw,
+                    **pivot_prof_kwargs,
                 )
                 custom_body = build_multi_dataset_profile_loop_sh(
                     model_flag=flag_name,
@@ -894,6 +997,8 @@ def main() -> None:
                     profiler_base_rel=prof_base_rel,
                     extra_bench_args=tuple(args.extra_bench_arg),
                     hv_target_verify_interval=hv_round,
+                    pivot_topk=pivot_bench_topk,
+                    pivot_expansion_pct=pivot_bench_pct,
                 )
                 text = make_slurm_script(
                     job_name=job_name,
@@ -932,6 +1037,7 @@ def main() -> None:
                         temp=temp_val,
                         dataset_slug=ds,
                         hv_round=prof_hv_kw,
+                        **pivot_prof_kwargs,
                     ).replace(os.sep, "/")
                     job_name = f"{ds}_{fam}_{spec.id}_b{b_val}_{k_path}_{temp_tag}{'_' + r_tag if r_tag else ''}"[:64]
                     script_path = job_dir / f"{job_name}.sh"
@@ -950,6 +1056,8 @@ def main() -> None:
                         profiler_output_dir=prof_rel_ds,
                         extra_bench_args=tuple(args.extra_bench_arg),
                         hv_target_verify_interval=hv_round,
+                        pivot_topk=pivot_bench_topk,
+                        pivot_expansion_pct=pivot_bench_pct,
                     )
                     text = make_slurm_script(
                         job_name=job_name,

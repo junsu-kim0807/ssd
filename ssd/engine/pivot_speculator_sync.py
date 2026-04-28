@@ -64,9 +64,11 @@ class PivotRootSpeculatorSync(SpeculatorSync):
             torch.cuda.synchronize()
 
     def _write_pivot_cost_row(self, row: dict) -> None:
-        # Disabled: do not write legacy pivot microcost JSONL rows.
-        _ = row
-        return
+        if not self._pivot_cost_enabled():
+            return
+        prof = getattr(self.scheduler, "_ssd_profiler", None)
+        if prof is not None and hasattr(prof, "accumulate_pivot_microcost_row"):
+            prof.accumulate_pivot_microcost_row(row)
 
     def _debug_pivot_expansion(
         self,
