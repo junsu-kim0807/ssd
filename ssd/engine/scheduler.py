@@ -483,6 +483,13 @@ class Scheduler:
                     getattr(commit_bundle, "target_node_slot", None)
                     or getattr(commit_bundle, "draft_node_slot", None)
                 )
+                if getattr(commit_bundle, "target_node_slot", None):
+                    assert target_model_runner is not None, (
+                        "target scratch commit requires target_model_runner"
+                    )
+                    assert i < len(commit_bundle.winner_target_node_ids), (
+                        "target scratch commit missing winner_target_node_ids row"
+                    )
                 # Phase-0 safe fallback: commit bundle is None or has no scratch slots.
                 raw_len = int(commit_bundle.raw_suffix_lens[i]) if i < len(commit_bundle.raw_suffix_lens) else len(new_suffix)
                 assert raw_len >= len(new_suffix)
@@ -490,22 +497,40 @@ class Scheduler:
                     target_model_runner is not None
                     and i < len(commit_bundle.winner_target_node_ids)
                 ):
-                    tgt_nodes = commit_bundle.winner_target_node_ids[i][: len(new_suffix)]
+                    tgt_nodes_full = commit_bundle.winner_target_node_ids[i]
+                    assert len(tgt_nodes_full) >= len(new_suffix), (
+                        f"winner_target_node_ids shorter than accepted suffix: "
+                        f"len(nodes)={len(tgt_nodes_full)}, len(new_suffix)={len(new_suffix)}"
+                    )
+                    tgt_nodes = tgt_nodes_full[: len(new_suffix)]
                     src_block_ids: list[int] = []
                     src_offsets: list[int] = []
                     dst_block_ids: list[int] = []
                     dst_offsets: list[int] = []
                     for j, node_id in enumerate(tgt_nodes):
-                        if node_id not in commit_bundle.target_node_slot:
-                            continue
+                        assert node_id in commit_bundle.target_node_slot, (
+                            f"target node id {node_id} missing from target_node_slot"
+                        )
                         sb, so = commit_bundle.target_node_slot[node_id]
                         dst_pos = seq.num_tokens + j
+                        assert (dst_pos // self.block_size) < len(seq.block_table), (
+                            f"target dst block OOB: dst_pos={dst_pos}, "
+                            f"len(block_table)={len(seq.block_table)}, block_size={self.block_size}"
+                        )
                         dst_bid = int(seq.block_table[dst_pos // self.block_size])
                         dst_off = int(dst_pos % self.block_size)
+                        assert int(sb) not in seq.block_table, (
+                            f"scratch source block leaked into parent target block_table: sb={int(sb)}"
+                        )
                         src_block_ids.append(int(sb))
                         src_offsets.append(int(so))
                         dst_block_ids.append(dst_bid)
                         dst_offsets.append(dst_off)
+                    if tgt_nodes:
+                        assert len(src_block_ids) == len(new_suffix), (
+                            f"target scratch commit alignment mismatch: copied={len(src_block_ids)}, "
+                            f"accepted={len(new_suffix)}"
+                        )
                     if src_block_ids:
                         target_model_runner.call(
                             "copy_kv_slots",

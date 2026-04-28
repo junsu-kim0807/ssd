@@ -324,7 +324,18 @@ class PivotTreeScratchExecutor(VerifierBase):
         for pidx in range(bundle.parent_batch_size):
             row = int(winner_rows[pidx])
             L = len(new_suffixes[pidx])
-            won_tgt.append([int(x) for x in bundle.path_node_ids[row][:L]])
+            assert 0 <= row < len(bundle.path_node_ids), (
+                f"winner row out of range: row={row}, n_rows={len(bundle.path_node_ids)}"
+            )
+            nodes = [int(x) for x in bundle.path_node_ids[row][:L]]
+            assert len(nodes) == L, (
+                f"winner_target_node_ids length mismatch: len(nodes)={len(nodes)}, expected={L}"
+            )
+            for nid in nodes:
+                assert nid in bundle.target_node_to_slot, (
+                    f"target node id {nid} missing from target_node_to_slot"
+                )
+            won_tgt.append(nodes)
         return PivotTreeCommitBundle(
             winner_target_node_ids=won_tgt,
             winner_draft_node_ids=[[] for _ in range(bundle.parent_batch_size)],
@@ -439,8 +450,9 @@ class PivotTreeScratchExecutor(VerifierBase):
         )
         if bool(getattr(getattr(self.scheduler, "config", None), "debug_mode", False)):
             torch.cuda.synchronize()
-        flat_node_ids = [int(n) for row in bundle.path_node_ids for n in row]
         expected_q = int(packed.input_ids.numel())
+        n_rows = len(bundle.path_node_ids)
+        row_len = len(bundle.path_node_ids[0]) if n_rows else 0
         if bool(getattr(getattr(self.scheduler, "config", None), "debug_mode", False)):
             print(
                 json.dumps(
@@ -448,37 +460,36 @@ class PivotTreeScratchExecutor(VerifierBase):
                         "phase1a_logits_shape_debug": True,
                         "logits_tree_shape": list(logits_tree_flat.shape),
                         "expected_q": expected_q,
-                        "num_flat_node_ids": len(flat_node_ids),
-                        "min_node_id": (min(flat_node_ids) if flat_node_ids else None),
-                        "max_node_id": (max(flat_node_ids) if flat_node_ids else None),
-                        "path_rows": len(bundle.path_node_ids),
-                        "path_row_len": (len(bundle.path_node_ids[0]) if bundle.path_node_ids else 0),
+                        "path_rows": n_rows,
+                        "path_row_len": row_len,
                         "packed_input_ids_numel": int(packed.input_ids.numel()),
                     },
                     ensure_ascii=False,
                 ),
                 flush=True,
             )
-        assert logits_tree_flat.ndim == 2, (
-            f"expected flat logits [N,V], got shape={list(logits_tree_flat.shape)}"
-        )
-        assert int(logits_tree_flat.shape[0]) == expected_q, (
-            f"logits rows mismatch: logits={int(logits_tree_flat.shape[0])}, expected_q={expected_q}"
-        )
-        assert len(flat_node_ids) == expected_q
-        if flat_node_ids:
-            assert min(flat_node_ids) >= 0
-            assert max(flat_node_ids) < int(logits_tree_flat.shape[0]), (
-                f"path_node_ids OOB: max_node_id={max(flat_node_ids)}, "
-                f"logits_rows={int(logits_tree_flat.shape[0])}"
-            )
-        n_rows = len(bundle.path_node_ids)
-        row_len = len(bundle.path_node_ids[0]) if n_rows else 0
         assert n_rows * row_len == expected_q, (
             f"Phase1A row geometry mismatch: n_rows={n_rows}, row_len={row_len}, "
             f"expected_q={expected_q}"
         )
-        logits_p = logits_tree_flat.view(n_rows, row_len, -1)
+        # run_packed_tree_decode can return either flattened [N,V] or row-shaped [B_exp,K+1,V].
+        if logits_tree_flat.ndim == 2:
+            assert int(logits_tree_flat.shape[0]) == expected_q, (
+                f"logits rows mismatch: logits={int(logits_tree_flat.shape[0])}, expected_q={expected_q}"
+            )
+            logits_p = logits_tree_flat.view(n_rows, row_len, -1)
+        elif logits_tree_flat.ndim == 3:
+            assert int(logits_tree_flat.shape[0]) == n_rows, (
+                f"logits batch mismatch: logits={int(logits_tree_flat.shape[0])}, n_rows={n_rows}"
+            )
+            assert int(logits_tree_flat.shape[1]) == row_len, (
+                f"logits row_len mismatch: logits={int(logits_tree_flat.shape[1])}, row_len={row_len}"
+            )
+            logits_p = logits_tree_flat
+        else:
+            raise AssertionError(
+                f"unexpected logits shape from run_packed_tree_decode: {list(logits_tree_flat.shape)}"
+            )
         assert logits_p.shape[:2] == speculate_result.speculations.shape, (
             f"logits_p {logits_p.shape[:2]} vs speculations {speculate_result.speculations.shape[:2]}"
         )
