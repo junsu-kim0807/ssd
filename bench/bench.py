@@ -82,9 +82,17 @@ def parse_arguments():
     parser.add_argument(
         "--spec_policy",
         type=str,
-        choices=["default", "pivot", "hierarchical", "pivot_hierarchical", "pivot_legacy"],
+        choices=[
+            "default",
+            "pivot",
+            "pivot_tree_scratch",
+            "pivot_opt",
+            "hierarchical",
+            "pivot_hierarchical",
+            "pivot_legacy",
+        ],
         default="default",
-        help="Speculative policy to use",
+        help="Speculative policy to use (pivot_opt is an alias of pivot_tree_scratch)",
     )
     parser.add_argument("--spec_hive", action="store_true",
                         help="Enable spec_hive mode for pivot policy")
@@ -274,6 +282,8 @@ def parse_arguments():
         assert args.llama, "Eagle currently only supports llama models"
         assert args.temp == 0.0 and args.dtemp is None, "Eagle currently only supports greedy decoding (temp=0)"
         assert getattr(args, 'async', False), "Eagle currently only supports async speculative decoding"
+    if args.spec_policy == "pivot_opt":
+        args.spec_policy = "pivot_tree_scratch"
 
     _n_ds = sum(
         bool(x)
