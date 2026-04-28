@@ -15,6 +15,7 @@ from ssd.engine.helpers.pivot_tree_helpers import (
     can_use_target_scratch_phase1a,
 )
 from ssd.engine.pivot_branch_planner import (
+    PivotExpansionConfig,
     PivotExpansionPlan,
     PivotHostPlan,
     build_pivot_expansion_plan,
@@ -31,6 +32,32 @@ class PivotTreeScratchSpeculator(PivotRootSpeculatorSync):
     Phase 1A: flat draft rollout + target scratch verify.
     Phase 2A: draft scratch rollout + target scratch verify, no branch Sequence/COW.
     """
+
+    def __init__(
+        self,
+        lookahead: int,
+        device: torch.device,
+        draft_model_runner,
+        target_model_runner,
+        intermediate_runner,
+        scheduler,
+        expansion_cfg: PivotExpansionConfig,
+        max_expand_rows: int | None = None,
+        enable_profile_trace: bool = False,
+        metrics: dict | None = None,
+    ):
+        super().__init__(
+            lookahead=lookahead,
+            device=device,
+            draft_model_runner=draft_model_runner,
+            target_model_runner=target_model_runner,
+            intermediate_runner=intermediate_runner,
+            scheduler=scheduler,
+            expansion_cfg=expansion_cfg,
+            max_expand_rows=max_expand_rows,
+            enable_profile_trace=enable_profile_trace,
+        )
+        self.metrics = metrics if metrics is not None else {}
 
     def prefill(self, seqs, verify_result: VerifyResult) -> SpeculateResult:
         return super().prefill(seqs, verify_result)

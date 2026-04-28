@@ -117,6 +117,7 @@ def build_spec_components(
             ),
             max_expand_rows=max_expand_rows,
             enable_profile_trace=enable_profile_trace,
+            metrics=metrics,
         )
         verifier = PivotTreeScratchExecutor(
             lookahead=config.speculate_k,
