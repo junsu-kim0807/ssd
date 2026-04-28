@@ -642,12 +642,23 @@ class PivotTreeScratchSpeculator(PivotRootSpeculatorSync):
     ) -> SpeculateResult:
         phase2a = self._phase2_draft_scratch_enabled(seqs)
         if phase2a:
+            self.metrics.setdefault("pivot_tree_phase2a_steps", []).append(1)
+            self.metrics.setdefault("pivot_tree_phase1a_steps", []).append(0)
+            self.metrics.setdefault("pivot_tree_fallback_steps", []).append(0)
             return self._speculate_phase2a_draft_scratch(
                 seqs,
                 verify_result,
                 recovery_already_appended=recovery_already_appended,
             )
         phase1a = self._phase1a_target_scratch_eligible(seqs)
+        if phase1a:
+            self.metrics.setdefault("pivot_tree_phase2a_steps", []).append(0)
+            self.metrics.setdefault("pivot_tree_phase1a_steps", []).append(1)
+            self.metrics.setdefault("pivot_tree_fallback_steps", []).append(0)
+        else:
+            self.metrics.setdefault("pivot_tree_phase2a_steps", []).append(0)
+            self.metrics.setdefault("pivot_tree_phase1a_steps", []).append(0)
+            self.metrics.setdefault("pivot_tree_fallback_steps", []).append(1)
         if phase1a and seqs:
             bs0 = int(seqs[0].block_size)
             k1 = int(self.lookahead) + 1

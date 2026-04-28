@@ -512,6 +512,18 @@ def initialize_wandb(args, run_name):
 
 def create_llm_kwargs(args, draft_path):
     """Create LLM initialization arguments."""
+    print(
+        {
+            "effective_spec_policy": args.spec_policy,
+            "enable_pivot_draft_scratch_phase2": bool(
+                getattr(args, "enable_pivot_draft_scratch_phase2", False)
+            ),
+            "enforce_eager": bool(getattr(args, "eager", False)),
+            "pivot_topk": int(getattr(args, "pivot_topk", 0)),
+            "pivot_expansion_pct": float(getattr(args, "pivot_expansion_pct", 0.0)),
+        },
+        flush=True,
+    )
     llm_kwargs = dict(
         enforce_eager=args.eager,
         num_gpus=args.gpus,
