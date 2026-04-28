@@ -246,6 +246,31 @@ class BlockManager:
                 self._deallocate_block(block_id)
         self._deallocate_n_blocks(private_tail_ids)
 
+    def release_shared_prefix_n(
+        self,
+        block_table: list[int],
+        shared_prefix_blocks: int,
+        count: int,
+    ) -> None:
+        """Decrement ``ref_count`` by ``count`` for each shared prefix block.
+
+        Equivalent to calling ``release_fork(block_table, [], shared_prefix_blocks)``
+        ``count`` times (when every fork shares the same prefix block ids), but
+        does a single ref-count decrement per block. Used by pivot collapse to
+        release all alt branches' shared prefix in one pass.
+        """
+        if count <= 0 or shared_prefix_blocks <= 0:
+            return
+        shared_prefix_blocks = min(shared_prefix_blocks, len(block_table))
+        for block_id in block_table[:shared_prefix_blocks]:
+            block = self.blocks[block_id]
+            block.ref_count -= count
+            assert block.ref_count >= 0, (
+                f"ref_count underflow on block {block_id}: count={count}"
+            )
+            if block.ref_count == 0:
+                self._deallocate_block(block_id)
+
 
     def _deallocate_block(self, block_id: int) -> Block:
         assert self.blocks[block_id].ref_count == 0

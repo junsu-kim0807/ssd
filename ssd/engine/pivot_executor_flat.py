@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+from collections import defaultdict
 from dataclasses import dataclass
 
 import torch
@@ -66,7 +67,10 @@ class PivotExecutorFlat(VerifierBase):
             block.ref_count -= 1
             if block.ref_count == 0:
                 bm._deallocate_block(block_id)
-        return list(parent_block_table[:shared_prefix_blocks]) + list(winner_private_tail)
+        # Both operands are owned/fresh lists (slice creates a new list;
+        # ``winner_private_tail`` is the CowForkPlan's owned list). The ``+``
+        # produces a new list, so no aliasing with caller-side state.
+        return parent_block_table[:shared_prefix_blocks] + winner_private_tail
 
     def _commit_winner_and_release_forks(
         self,
@@ -125,41 +129,79 @@ class PivotExecutorFlat(VerifierBase):
                     st.inter_private_tail_block_ids,
                 )
 
-        # Pass 2: release winner shared-prefix refs (private tails were
-        # transferred in Pass 1) and fully release every loser fork. Skip
-        # parent-in-place branches in both cases — they were never forked.
+        # Pass 2: release shared-prefix refs and dealloc loser private tails.
+        # Skip parent-in-place branches — they were never forked.
+        #
+        # Optimization: every alt branch of a given parent shares the SAME
+        # prefix block ids and prefix length (they all forked from the same
+        # parent state). The naive loop calls ``release_fork`` once per branch
+        # and decrements each prefix block's ``ref_count`` one at a time. Group
+        # by parent and decrement by ``count`` once per prefix block instead.
+        # Also flatten loser private tails into per-BM lists so each BM only
+        # walks its dealloc loop once.
+        #
+        # Winners' private tails were grafted to the parent in Pass 1 (caller
+        # owns them now), so winners contribute only to the shared-prefix
+        # release count, not to private-tail dealloc.
+        parent_alt_count_t: dict[int, int] = defaultdict(int)
+        parent_alt_count_d: dict[int, int] = defaultdict(int)
+        parent_alt_count_i: dict[int, int] = defaultdict(int)
+        parent_t_shared: dict[int, int] = {}
+        parent_d_shared: dict[int, int] = {}
+        parent_i_shared: dict[int, int] = {}
+        loser_t_tails: list[int] = []
+        loser_d_tails: list[int] = []
+        loser_i_tails: list[int] = []
+        has_inter = i_bm is not None
+
         for seq, st in zip(bundle.expanded_seqs, bundle.branch_states):
             if st.is_parent_inplace:
                 continue
-            winner_b_idx = winners_per_parent[st.parent_seq_idx]
-            is_winner = st.branch_idx == winner_b_idx
-            if is_winner:
-                # Private tail belongs to the parent now — release shared prefix only.
-                t_bm.release_fork(seq.block_table, [], st.target_shared_prefix_blocks)
-                d_bm.release_fork(
-                    seq.draft_block_table, [], st.draft_shared_prefix_blocks
+            pidx = st.parent_seq_idx
+            parent_alt_count_t[pidx] += 1
+            parent_alt_count_d[pidx] += 1
+            # ``shared_prefix_blocks`` is a function of parent state alone, so
+            # all alt branches of a parent agree; storing per-parent is fine.
+            parent_t_shared[pidx] = st.target_shared_prefix_blocks
+            parent_d_shared[pidx] = st.draft_shared_prefix_blocks
+            if has_inter:
+                parent_alt_count_i[pidx] += 1
+                parent_i_shared[pidx] = st.inter_shared_prefix_blocks
+
+            if st.branch_idx != winners_per_parent[pidx]:
+                # Loser: private tails dealloc'd in bulk below.
+                loser_t_tails.extend(st.target_private_tail_block_ids)
+                loser_d_tails.extend(st.draft_private_tail_block_ids)
+                if has_inter:
+                    loser_i_tails.extend(st.inter_private_tail_block_ids)
+            # Winner: private tail already owned by parent — nothing else to do.
+
+        # Batched shared-prefix ref_count decrement per parent.
+        # parent.block_table[:shared] holds the shared prefix block ids
+        # (Pass 1's graft only replaces the tail).
+        for pidx, count in parent_alt_count_t.items():
+            t_bm.release_shared_prefix_n(
+                parent_seqs[pidx].block_table, parent_t_shared[pidx], count
+            )
+        for pidx, count in parent_alt_count_d.items():
+            d_bm.release_shared_prefix_n(
+                parent_seqs[pidx].draft_block_table, parent_d_shared[pidx], count
+            )
+        if has_inter:
+            for pidx, count in parent_alt_count_i.items():
+                i_bm.release_shared_prefix_n(
+                    parent_seqs[pidx].inter_block_table,
+                    parent_i_shared[pidx],
+                    count,
                 )
-                if i_bm is not None:
-                    i_bm.release_fork(
-                        seq.inter_block_table, [], st.inter_shared_prefix_blocks
-                    )
-            else:
-                t_bm.release_fork(
-                    seq.block_table,
-                    st.target_private_tail_block_ids,
-                    st.target_shared_prefix_blocks,
-                )
-                d_bm.release_fork(
-                    seq.draft_block_table,
-                    st.draft_private_tail_block_ids,
-                    st.draft_shared_prefix_blocks,
-                )
-                if i_bm is not None:
-                    i_bm.release_fork(
-                        seq.inter_block_table,
-                        st.inter_private_tail_block_ids,
-                        st.inter_shared_prefix_blocks,
-                    )
+
+        # Bulk dealloc all losers' private tails (one walk per BM).
+        if loser_t_tails:
+            t_bm._deallocate_n_blocks(loser_t_tails)
+        if loser_d_tails:
+            d_bm._deallocate_n_blocks(loser_d_tails)
+        if has_inter and loser_i_tails:
+            i_bm._deallocate_n_blocks(loser_i_tails)
 
     def prefill(self, seqs: list[Sequence], eagle: bool = False) -> VerifyResult:
         token_ids = self.target_model_runner.call("run", seqs, True)
