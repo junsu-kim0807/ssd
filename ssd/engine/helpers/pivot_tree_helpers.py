@@ -67,7 +67,7 @@ def build_tree_mask(path_node_ids: list[list[int]], *, device: torch.device) -> 
     FlashInfer expects per-row masks sized ``(K+1) * (pos0 + K + 1)`` flattened.
     """
     if not path_node_ids:
-        return torch.empty((0,), dtype=torch.uint8, device=device)
+        return torch.empty((0,), dtype=torch.bool, device=device)
     row_len = len(path_node_ids[0])
     n_rows = len(path_node_ids)
     q = n_rows * row_len
@@ -78,7 +78,7 @@ def build_tree_mask(path_node_ids: list[list[int]], *, device: torch.device) -> 
         for j in range(row_len):
             cur = base + j
             mask[cur, base : cur + 1] = True
-    return mask.flatten().to(torch.uint8)
+    return mask.flatten()
 
 
 def build_rowwise_prefix_candidate_mask(
@@ -94,7 +94,7 @@ def build_rowwise_prefix_candidate_mask(
     Query ``j`` may attend to keys ``0 .. pos0 + j`` inclusive.
     """
     if not pos0_per_row:
-        return torch.empty((0,), dtype=torch.uint8, device=device)
+        return torch.empty((0,), dtype=torch.bool, device=device)
     chunks: list[torch.Tensor] = []
     for pos0 in pos0_per_row:
         p0 = int(pos0)
@@ -103,7 +103,7 @@ def build_rowwise_prefix_candidate_mask(
         for j in range(k1):
             m[j, : p0 + j + 1] = True
         chunks.append(m.reshape(-1))
-    return torch.cat(chunks).to(torch.uint8)
+    return torch.cat(chunks).to(torch.bool)
 
 
 def build_phase0_packed_inputs(

@@ -1497,6 +1497,23 @@ class ModelRunner:
                     f"global={self.decoder_hf_config.num_key_value_heads}, "
                     f"tp={self.num_tp_gpus}"
                 )
+                if ctx.custom_mask is not None:
+                    assert ctx.custom_mask.dtype == torch.bool, (
+                        f"FlashInfer custom_mask must be bool, got {ctx.custom_mask.dtype}. "
+                        "Use packed_custom_mask only for flashinfer.quantization.packbits() output."
+                    )
+                    expected_mask_len = int(
+                        (
+                            (ctx.cu_seqlens_q[1:] - ctx.cu_seqlens_q[:-1]).to(torch.int64)
+                            * ctx.context_lens.to(torch.int64)
+                        )
+                        .sum()
+                        .item()
+                    )
+                    assert int(ctx.custom_mask.numel()) == expected_mask_len, (
+                        f"custom_mask length mismatch: got {int(ctx.custom_mask.numel())}, "
+                        f"expected {expected_mask_len}"
+                    )
                 self.only_prefill_wrapper.plan(
                     ctx.cu_seqlens_q.to(torch.int32),
                     kv_indptr,
