@@ -269,15 +269,6 @@ class SpecDecodeStep(InferenceStep):
                 torch.cuda.synchronize()
                 _t1 = perf_counter()
 
-            if __debug__:
-                speculations = speculate_result.speculations
-                print(f"[SpecDecodeStep] speculations: {speculations}", flush=True)
-                speculations_list = speculations.tolist()
-
-                for i, speculation in enumerate(speculations_list):
-                    decoded_tokens = decode_tokens(speculation, self.tokenizer)
-                    print(f"[SpecDecodeStep] speculation {i}: {decoded_tokens}", flush=True)
-
             #### STEP 2: VERIFY ####
             if self._profiler_active():
                 if hierarchical:
@@ -301,13 +292,6 @@ class SpecDecodeStep(InferenceStep):
             if _prof:
                 torch.cuda.synchronize()
                 _t2 = perf_counter()
-
-            if __debug__:
-                recovery_tokens = out_verify_result.recovery_tokens
-                new_suffixes = out_verify_result.new_suffixes
-                for i, new_suffix in enumerate(new_suffixes):
-                    decoded_tokens = decode_tokens(new_suffix + [recovery_tokens[i]], self.tokenizer)
-                    print(f"[SpecDecodeStep] verification {i}: {decoded_tokens}", flush=True)
 
             if hierarchical and getattr(self.scheduler.config, "debug_mode", False):
                 if isinstance(self.verifier, VerifierHierarchical) and not out_verify_result.is_hv_intermediate:

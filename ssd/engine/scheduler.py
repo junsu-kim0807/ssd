@@ -532,23 +532,6 @@ class Scheduler:
                             f"accepted={len(new_suffix)}"
                         )
                     if target_src_block_ids:
-                        if bool(getattr(self.config, "debug_mode", False)):
-                            print(
-                                json.dumps(
-                                    {
-                                        "pivot_tree_scratch_commit_debug": True,
-                                        "cache_kind": "target",
-                                        "seq_id": int(seq.seq_id),
-                                        "accepted_len": int(len(new_suffix)),
-                                        "target_copy_slots": int(len(tgt_nodes)),
-                                        "draft_copy_slots": 0,
-                                        "pre_num_tokens": int(seq.num_tokens),
-                                        "target_dst_blocks": list(target_dst_block_ids),
-                                    },
-                                    ensure_ascii=False,
-                                ),
-                                flush=True,
-                            )
                         target_model_runner.call(
                             "copy_kv_slots",
                             target_src_block_ids,
@@ -596,23 +579,6 @@ class Scheduler:
                             f"accepted={len(new_suffix)}"
                         )
                     if draft_src_block_ids:
-                        if bool(getattr(self.config, "debug_mode", False)):
-                            print(
-                                json.dumps(
-                                    {
-                                        "pivot_tree_scratch_commit_debug": True,
-                                        "cache_kind": "draft",
-                                        "seq_id": int(seq.seq_id),
-                                        "accepted_len": int(len(new_suffix)),
-                                        "target_copy_slots": 0,
-                                        "draft_copy_slots": int(len(dr_nodes)),
-                                        "pre_num_tokens": int(seq.num_tokens),
-                                        "draft_dst_blocks": list(draft_dst_block_ids),
-                                    },
-                                    ensure_ascii=False,
-                                ),
-                                flush=True,
-                            )
                         draft_model_runner.copy_kv_slots(
                             draft_src_block_ids,
                             draft_src_offsets,

@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import json
 import torch
 
 from ssd.engine.block_manager import BlockManager
@@ -105,24 +104,6 @@ class PivotTreeScratchExecutor(VerifierBase):
             if packed.tree_attn_mask is not None
             else -1
         )
-        if bool(getattr(getattr(self.scheduler, "config", None), "debug_mode", False)):
-            print(
-                json.dumps(
-                    {
-                        "phase0_packed_debug": True,
-                        "q_lens": q_lens.detach().cpu().tolist(),
-                        "kv_lens": kv_lens.detach().cpu().tolist(),
-                        "expected_mask_len": expected_mask_len,
-                        "actual_mask_len": actual_mask_len,
-                        "input_ids_numel": int(packed.input_ids.numel()),
-                        "positions_numel": int(packed.positions.numel()),
-                        "slot_mapping_numel": int(packed.slot_mapping.numel()),
-                        "block_tables_shape": list(packed.block_tables.shape),
-                    },
-                    ensure_ascii=False,
-                ),
-                flush=True,
-            )
         assert actual_mask_len == expected_mask_len, (
             "phase0 tree_attn_mask length mismatch: "
             f"expected={expected_mask_len}, actual={actual_mask_len}, "
@@ -147,19 +128,7 @@ class PivotTreeScratchExecutor(VerifierBase):
             packed.tree_attn_mask,
         )
         logits_tree = logits_tree.view(len(expanded_seqs), self.lookahead + 1, -1)
-        diff = torch.max(torch.abs(logits_tree - logits_flat)).item()
-        print(
-            json.dumps(
-                {
-                    "pivot_tree_phase0_logits_compare": True,
-                    "batch_size_expanded": int(len(expanded_seqs)),
-                    "lookahead": int(self.lookahead),
-                    "max_abs_diff": float(diff),
-                },
-                ensure_ascii=False,
-            ),
-            flush=True,
-        )
+        _ = torch.max(torch.abs(logits_tree - logits_flat)).item()
 
     @staticmethod
     def _replace_parent_tail(
@@ -359,40 +328,7 @@ class PivotTreeScratchExecutor(VerifierBase):
         bundle: PivotTreeScratchBundle,
         logits_p_scratch: torch.Tensor,
     ) -> None:
-        """Optional ``debug_mode`` check: flat target verify vs packed scratch logits."""
-        cfg = getattr(self.scheduler, "config", None)
-        # Disabled by default: flat compare performs an additional target forward
-        # and may mutate KV/frontier assumptions in Phase-1A.
-        if not bool(getattr(cfg, "debug_phase1a_flat_compare", False)):
-            return
-        expanded = bundle.expanded_seqs
-        if expanded is None:
-            return
-        snap_nc = [int(s.num_cached_tokens) for s in expanded]
-        try:
-            b_exp = len(expanded)
-            logits_flat = self.target_model_runner.call("run", expanded, False, False, True)
-            for s in expanded:
-                s.num_cached_tokens += self.lookahead + 1
-            logits_flat = logits_flat.view(b_exp, self.lookahead + 1, -1)
-            diff = float(
-                (logits_flat.float() - logits_p_scratch.float()).abs().max().item()
-            )
-            print(
-                json.dumps(
-                    {
-                        "pivot_tree_phase1a_logits_compare": True,
-                        "max_abs_diff": diff,
-                        "batch_expanded": int(b_exp),
-                        "lookahead": int(self.lookahead),
-                    },
-                    ensure_ascii=False,
-                ),
-                flush=True,
-            )
-        finally:
-            for s, nc in zip(expanded, snap_nc):
-                s.num_cached_tokens = int(nc)
+        return
 
     def _verify_with_target_scratch(
         self,
@@ -422,24 +358,6 @@ class PivotTreeScratchExecutor(VerifierBase):
             if packed.tree_attn_mask is not None
             else -1
         )
-        if bool(getattr(getattr(self.scheduler, "config", None), "debug_mode", False)):
-            print(
-                json.dumps(
-                    {
-                        "packed_debug": True,
-                        "q_lens": q_lens.detach().cpu().tolist(),
-                        "kv_lens": kv_lens.detach().cpu().tolist(),
-                        "expected_mask_len": expected_mask_len,
-                        "actual_mask_len": actual_mask_len,
-                        "input_ids_numel": int(packed.input_ids.numel()),
-                        "positions_numel": int(packed.positions.numel()),
-                        "slot_mapping_numel": int(packed.slot_mapping.numel()),
-                        "block_tables_shape": list(packed.block_tables.shape),
-                    },
-                    ensure_ascii=False,
-                ),
-                flush=True,
-            )
         assert actual_mask_len == expected_mask_len, (
             f"tree_attn_mask length mismatch: expected {expected_mask_len}, got {actual_mask_len}"
         )
@@ -458,26 +376,9 @@ class PivotTreeScratchExecutor(VerifierBase):
             packed.max_seqlen_q,
             packed.tree_attn_mask,
         )
-        if bool(getattr(getattr(self.scheduler, "config", None), "debug_mode", False)):
-            torch.cuda.synchronize()
         expected_q = int(packed.input_ids.numel())
         n_rows = len(bundle.path_node_ids)
         row_len = len(bundle.path_node_ids[0]) if n_rows else 0
-        if bool(getattr(getattr(self.scheduler, "config", None), "debug_mode", False)):
-            print(
-                json.dumps(
-                    {
-                        "phase1a_logits_shape_debug": True,
-                        "logits_tree_shape": list(logits_tree_flat.shape),
-                        "expected_q": expected_q,
-                        "path_rows": n_rows,
-                        "path_row_len": row_len,
-                        "packed_input_ids_numel": int(packed.input_ids.numel()),
-                    },
-                    ensure_ascii=False,
-                ),
-                flush=True,
-            )
         assert n_rows * row_len == expected_q, (
             f"Phase1A row geometry mismatch: n_rows={n_rows}, row_len={row_len}, "
             f"expected_q={expected_q}"
@@ -561,21 +462,6 @@ class PivotTreeScratchExecutor(VerifierBase):
             self._commit_phase1_draft_graft_and_release_forks(seqs, bundle, winners)
         commit_bundle = self._build_scratch_commit_bundle(bundle, winner_rows, new_suffixes)
 
-        if bool(getattr(getattr(self.scheduler, "config", None), "debug_mode", False)):
-            spec_rows = speculate_result.speculations.detach().cpu().tolist()
-            print(
-                json.dumps(
-                    {
-                        "pivot_round_debug": True,
-                        "stage": "collapse_phase1_scratch",
-                        "selected_request_ids": [int(x) for x in winners],
-                        "selected_expanded_row_ids": [int(x) for x in winner_rows],
-                        "spec_rows": [[int(t) for t in row] for row in spec_rows],
-                    },
-                    ensure_ascii=False,
-                ),
-                flush=True,
-            )
 
         profile_trace = None
         if self.enable_profile_trace:
@@ -650,19 +536,6 @@ class PivotTreeScratchExecutor(VerifierBase):
             recovery_tokens[pidx] = outcome.recovery[best_row]
 
         self._commit_winner_and_release_forks(seqs, bundle, winners)
-
-        if bool(getattr(getattr(self.scheduler, "config", None), "debug_mode", False)):
-            spec_rows = speculate_result.speculations.detach().cpu().tolist()
-            collapse_row = {
-                "pivot_round_debug": True,
-                "stage": "collapse",
-                "expanded_request_speculative_token_ids": [
-                    [int(tok) for tok in row] for row in spec_rows
-                ],
-                "selected_request_ids": [int(x) for x in winners],
-                "selected_expanded_row_ids": [int(x) for x in winner_rows],
-            }
-            print(json.dumps(collapse_row, ensure_ascii=False), flush=True)
 
         profile_trace = None
         if self.enable_profile_trace:

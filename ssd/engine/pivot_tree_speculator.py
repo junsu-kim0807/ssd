@@ -1,6 +1,4 @@
 from __future__ import annotations
-
-import json
 import math
 from time import perf_counter
 
@@ -466,27 +464,6 @@ class PivotTreeScratchSpeculator(PivotRootSpeculatorSync):
                     f"expected={expected_mask_len}, actual={actual_mask_len}, depth={depth}"
                 )
                 assert int(block_tables.shape[0]) == b_exp
-                if bool(getattr(getattr(self.scheduler, "config", None), "debug_mode", False)):
-                    print(
-                        json.dumps(
-                            {
-                                "pivot_tree_phase2_draft_packed_debug": True,
-                                "depth": int(depth),
-                                "batch_expanded": int(b_exp),
-                                "q_lens": q_lens.detach().cpu().tolist(),
-                                "kv_lens": kv_lens.detach().cpu().tolist(),
-                                "expected_mask_len": int(expected_mask_len),
-                                "actual_mask_len": int(actual_mask_len),
-                                "input_ids_numel": int(input_ids.numel()),
-                                "positions_numel": int(positions.numel()),
-                                "slot_mapping_numel": int(slot_mapping.numel()),
-                                "block_tables_shape": list(block_tables.shape),
-                                "max_seqlen_q": 1,
-                            },
-                            ensure_ascii=False,
-                        ),
-                        flush=True,
-                    )
                 logits = self.draft_model_runner.call(
                     "run_packed_tree_decode",
                     input_ids,
@@ -498,20 +475,6 @@ class PivotTreeScratchSpeculator(PivotRootSpeculatorSync):
                     1,
                     mask,
                 )
-                if bool(getattr(getattr(self.scheduler, "config", None), "debug_mode", False)):
-                    torch.cuda.synchronize()
-                    print(
-                        json.dumps(
-                            {
-                                "pivot_tree_phase2_draft_logits_shape_debug": True,
-                                "depth": int(depth),
-                                "logits_shape": list(logits.shape),
-                                "expected_rows": int(b_exp),
-                            },
-                            ensure_ascii=False,
-                        ),
-                        flush=True,
-                    )
                 if logits.ndim == 2:
                     assert int(logits.shape[0]) == b_exp, (
                         "phase2 draft logits rows mismatch: "
@@ -657,28 +620,6 @@ class PivotTreeScratchSpeculator(PivotRootSpeculatorSync):
             assert speculations.shape == (b_exp, k1)
             assert logits_q.shape[:2] == (b_exp, self.lookahead)
             assert all(-1 not in row for row in path_token_ids), path_token_ids
-            if bool(getattr(getattr(self.scheduler, "config", None), "debug_mode", False)):
-                print(
-                    json.dumps(
-                        {
-                            "pivot_tree_phase2_bundle_debug": True,
-                            "parent_batch_size": int(len(seqs)),
-                            "expanded_batch_size": int(b_exp),
-                            "lookahead": int(self.lookahead),
-                            "num_nodes": int(b_exp * k1),
-                            "num_target_scratch_blocks": len(scratch_owner.target_block_ids),
-                            "num_draft_scratch_blocks": len(scratch_owner.draft_block_ids),
-                            "expanded_seqs_is_none": bundle.expanded_seqs is None,
-                            "branch_states_is_none": bundle.branch_states is None,
-                            "target_node_to_slot_size": len(bundle.target_node_to_slot),
-                            "draft_node_to_slot_size": len(bundle.draft_node_to_slot),
-                            "speculations_shape": list(speculations.shape),
-                            "logits_q_shape": list(logits_q.shape),
-                        },
-                        ensure_ascii=False,
-                    ),
-                    flush=True,
-                )
             return SpeculateResult(
                 speculations=speculations,
                 logits_q=logits_q,
