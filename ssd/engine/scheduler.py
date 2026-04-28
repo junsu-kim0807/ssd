@@ -477,7 +477,13 @@ class Scheduler:
             zip(seqs, new_suffixes, next_recovery_tokens)
         ):
             new_suffix, finished = self._handle_eos_and_max_new_tokens(seq, new_suffix)
+            has_scratch_slots = False
             if commit_bundle is not None:
+                has_scratch_slots = bool(
+                    getattr(commit_bundle, "target_node_slot", None)
+                    or getattr(commit_bundle, "draft_node_slot", None)
+                )
+                # Phase-0 safe fallback: commit bundle is None or has no scratch slots.
                 raw_len = int(commit_bundle.raw_suffix_lens[i]) if i < len(commit_bundle.raw_suffix_lens) else len(new_suffix)
                 assert raw_len >= len(new_suffix)
                 if (
@@ -535,8 +541,14 @@ class Scheduler:
                             src_offsets,
                             dst_block_ids,
                             dst_offsets,
-                            "target",
+                            "draft",
                         )
+            # Phase-0 mode intentionally does not perform slot-copy.
+            if commit_bundle is not None and not has_scratch_slots:
+                assert (
+                    not getattr(commit_bundle, "winner_target_node_ids", [])
+                    or not getattr(commit_bundle, "target_node_slot", {})
+                )
             self._update_kv_caches(seq, new_suffix)
             self._update_sequence_metadata(seq, new_suffix, next_recovery_token)
             assert seq.num_cached_tokens <= seq.num_tokens

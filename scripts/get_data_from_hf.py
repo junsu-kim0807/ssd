@@ -497,6 +497,50 @@ def download_govreport_data(num_samples=None):
     return output_file
 
 
+def download_natural_questions_data(num_samples=None):
+    """sentence-transformers/natural-questions → JSONL QA prompts with {"text": question}."""
+    output_dir = os.path.join(get_base_output_dir(), "natural_questions")
+    os.makedirs(output_dir, exist_ok=True)
+    max_samples = 10000
+    if num_samples is None:
+        num_samples = max_samples
+    else:
+        num_samples = min(num_samples, max_samples)
+    output_file = os.path.join(output_dir, "natural_questions_data_10000.jsonl")
+    if os.path.exists(output_file):
+        print(f"File {output_file} already exists. Skipping download.")
+        return output_file
+    print("Loading sentence-transformers/natural-questions...")
+    try:
+        raw = load_dataset("sentence-transformers/natural-questions", trust_remote_code=True)
+    except Exception as e:
+        print(f"Error loading natural-questions: {e}")
+        raise
+    dataset = _select_split(raw, ("train", "validation", "test"))
+    total = len(dataset)
+    n = min(num_samples, total)
+    print(f"Processing {n} samples from {total} total...")
+    with open(output_file, "w", encoding="utf-8") as f:
+        for i in range(n):
+            ex = dataset[i]
+            # Keep extraction resilient across dataset schema changes.
+            question = (
+                ex.get("question")
+                or ex.get("query")
+                or ex.get("text")
+                or ex.get("sentence")
+                or ""
+            )
+            question = str(question).strip()
+            if not question:
+                continue
+            f.write(json.dumps({"text": question}, ensure_ascii=False) + "\n")
+            if i % 500 == 0:
+                print(f"Processed {i}/{n}...")
+    print(f"Saved up to {n} Natural Questions samples to {output_file}")
+    return output_file
+
+
 def download_all_datasets(num_samples=None):
     """Download all datasets."""
     print("Downloading all datasets...")
@@ -512,6 +556,7 @@ def download_all_datasets(num_samples=None):
         ("MATH500", download_math500_data),
         ("CodeElo", download_codeelo_data),
         ("GovReport", download_govreport_data),
+        ("NaturalQuestionsQA", download_natural_questions_data),
     ]
     
     output_files = {}
@@ -544,6 +589,9 @@ DOWNLOADERS_BY_KEY = {
     "math500": download_math500_data,
     "codeelo": download_codeelo_data,
     "govreport": download_govreport_data,
+    "qa": download_natural_questions_data,
+    "natural_questions": download_natural_questions_data,
+    "natural-questions": download_natural_questions_data,
 }
 
 

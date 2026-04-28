@@ -65,4 +65,5 @@ DATASET_PATHS = {
     "codeelo":       f"{DATASET_DIR}/codeelo/codeelo_data_10000.jsonl",
     "math500":       f"{DATASET_DIR}/math500/math500_data_10000.jsonl",
     "govreport":     f"{DATASET_DIR}/govreport/govreport_data_10000.jsonl",
+    "qa":            f"{DATASET_DIR}/natural_questions/natural_questions_data_10000.jsonl",
 }

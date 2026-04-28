@@ -174,7 +174,13 @@ class PivotRootSpeculatorSync(SpeculatorSync):
             for row_idx, prob in zip(rows_to_patch, probs_host):
                 host.root_token_probs[row_idx] = float(prob)
 
-    def _apply_kv_capacity_limit(self, seqs: list[Sequence], plan: PivotExpansionPlan) -> PivotExpansionPlan:
+    def _apply_kv_capacity_limit(
+        self,
+        seqs: list[Sequence],
+        plan: PivotExpansionPlan,
+        *,
+        fork_target_kv: bool = True,
+    ) -> PivotExpansionPlan:
         """Clamp expansion by BM free blocks and max_model_len in addition to row cap.
 
         All ordering / per-parent decisions run on the host plan to avoid GPU
@@ -205,6 +211,19 @@ class PivotRootSpeculatorSync(SpeculatorSync):
         free_d = len(d_bm.free_block_ids)
         free_i = len(i_bm.free_block_ids) if i_bm is not None else 10**12
 
+        block_size0 = int(seqs[0].block_size)
+        nscratch0 = (self.lookahead + 1 + block_size0 - 1) // block_size0
+        if not fork_target_kv:
+            # Phase-1A: every expanded row allocates ``nscratch`` target scratch blocks.
+            # Reserve one row per parent up front; loop below charges (topk-1) extras
+            # when expansion is approved for a parent.
+            baseline_t = bsz * nscratch0
+            scratch_baseline_ok = baseline_t <= free_t
+            if scratch_baseline_ok:
+                free_t -= baseline_t
+        else:
+            scratch_baseline_ok = True
+
         # Deterministic keep order by ascending criteria score: lower logit
         # margin == higher uncertainty, so high-uncertainty parents are
         # allocated KV budget first. Tie-break by index for determinism.
@@ -219,11 +238,12 @@ class PivotRootSpeculatorSync(SpeculatorSync):
             seq = seqs[idx]
             required_tokens = seq.num_tokens + self.lookahead
 
-            per_extra_t = self._private_blocks_needed(
-                seq.num_cached_tokens,
-                required_tokens,
-                seq.block_size,
-            )
+            if fork_target_kv:
+                per_extra_t = self._private_blocks_needed(
+                    seq.num_cached_tokens,
+                    required_tokens,
+                    seq.block_size,
+                )
             per_extra_d = self._private_blocks_needed(
                 seq.num_draft_cached_tokens,
                 required_tokens,
@@ -239,7 +259,12 @@ class PivotRootSpeculatorSync(SpeculatorSync):
                 else 0
             )
             extras = topk - 1
-            need_t = per_extra_t * extras
+            if fork_target_kv:
+                need_t = per_extra_t * extras
+            elif scratch_baseline_ok:
+                need_t = nscratch0 * extras
+            else:
+                need_t = 10**18
             need_d = per_extra_d * extras
             need_i = per_extra_i * extras
             if need_t <= free_t and need_d <= free_d and need_i <= free_i:
@@ -372,6 +397,7 @@ class PivotRootSpeculatorSync(SpeculatorSync):
         verify_result: VerifyResult,
         *,
         recovery_already_appended: bool = False,
+        fork_target_kv: bool = True,
     ) -> SpeculateResult:
         assert not verify_result.eagle_acts, "Eagle is not supported for pivot sync speculation"
         batch_size = len(seqs)
@@ -410,7 +436,7 @@ class PivotRootSpeculatorSync(SpeculatorSync):
             )
             t_plan1 = perf_counter()
             t_cap0 = perf_counter()
-            plan = self._apply_kv_capacity_limit(seqs, plan)
+            plan = self._apply_kv_capacity_limit(seqs, plan, fork_target_kv=fork_target_kv)
             t_cap1 = perf_counter()
             # Vanilla parity: branch 0 must equal the sampler's first_token_ids,
             # not the planner's float-topk argmax. Apply on every speculate()
@@ -489,7 +515,7 @@ class PivotRootSpeculatorSync(SpeculatorSync):
             )
             t_plan1 = perf_counter()
             t_cap0 = perf_counter()
-            plan = self._apply_kv_capacity_limit(seqs, plan)
+            plan = self._apply_kv_capacity_limit(seqs, plan, fork_target_kv=fork_target_kv)
             t_cap1 = perf_counter()
             # Same vanilla parity override on the cached path: the cached
             # branches >=1 stay fixed across rounds, but branch 0 must follow
@@ -555,11 +581,27 @@ class PivotRootSpeculatorSync(SpeculatorSync):
             inter_cached0 = parent.num_inter_cached_tokens
             branch_seq = parent.clone_spec()
             required_tokens = parent.num_tokens + self.lookahead
-            t_plan = t_bm.make_cow_fork_block_table(
-                parent.block_table,
-                cached_tokens=target_cached0,
-                required_total_tokens=required_tokens,
-            )
+            if fork_target_kv:
+                t_plan = t_bm.make_cow_fork_block_table(
+                    parent.block_table,
+                    cached_tokens=target_cached0,
+                    required_total_tokens=required_tokens,
+                )
+            else:
+                # Phase-1: share parent's committed target prefix only (no target COW).
+                n_share = min(
+                    target_cached0 // parent.block_size,
+                    len(parent.block_table),
+                )
+                fork_bt = t_bm.fork_shared_prefix(parent.block_table, n_share)
+                t_plan = CowForkPlan(
+                    fork_block_table=list(fork_bt),
+                    private_tail_block_ids=[],
+                    shared_prefix_blocks=int(n_share),
+                    copy_src_block_ids=[],
+                    copy_dst_block_ids=[],
+                    copy_valid_tokens=[],
+                )
             d_plan = d_bm.make_cow_fork_block_table(
                 parent.draft_block_table,
                 cached_tokens=draft_cached0,

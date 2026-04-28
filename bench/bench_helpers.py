@@ -111,6 +111,8 @@ def benchmark_dataset_label(args) -> str:
         return "math500"
     if getattr(args, "govreport", False):
         return "govreport"
+    if getattr(args, "qa", False):
+        return "qa"
     return "gsm"
 
 
@@ -128,6 +130,7 @@ def ensure_benchmark_dataset(args) -> None:
             "codeelo",
             "math500",
             "govreport",
+        "qa",
             "livecodebench_lite",
         ):
             _ensure_single_dataset_file(name, m)
@@ -159,6 +162,7 @@ def _ensure_single_dataset_file(dataset_key: str, m) -> None:
         "codeelo": m.download_codeelo_data,
         "math500": m.download_math500_data,
         "govreport": m.download_govreport_data,
+        "qa": m.download_natural_questions_data,
     }.get(dataset_key)
     if fn is None:
         print(f"[prepare_data] No downloader for {dataset_key!r}")
@@ -470,6 +474,8 @@ def generate_benchmark_inputs(
         dataset_name = "math500"
     elif getattr(args, "govreport", False):
         dataset_name = "govreport"
+    elif getattr(args, "qa", False):
+        dataset_name = "qa"
     else:
         dataset_name = "gsm"
 

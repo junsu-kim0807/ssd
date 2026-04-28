@@ -886,6 +886,12 @@ class ModelRunner:
                 if getattr(self, "intermediate_kv_cache", None) is not None
                 else self.kv_cache
             )
+        elif cache_kind == "draft":
+            if not self.is_draft:
+                raise ValueError(
+                    "copy_kv_slots: cache_kind='draft' is only valid on the draft model runner"
+                )
+            kv_cache = self.kv_cache
         else:
             raise ValueError(f"copy_kv_slots: unsupported cache_kind={cache_kind!r}")
 

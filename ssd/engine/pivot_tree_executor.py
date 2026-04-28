@@ -4,7 +4,10 @@ import json
 import torch
 
 from ssd.engine.block_manager import BlockManager
-from ssd.engine.helpers.pivot_tree_helpers import build_phase0_packed_inputs
+from ssd.engine.helpers.pivot_tree_helpers import (
+    build_phase0_packed_inputs,
+    gather_logits_by_path,
+)
 from ssd.engine.helpers.speculate_types import (
     SpeculateResult,
     VerifyProfileTrace,
@@ -45,11 +48,12 @@ class PivotTreeScratchExecutor(VerifierBase):
             seq.recovery_token_id = token_id
         return VerifyResult([], [seq.recovery_token_id for seq in seqs], None)
 
-    def _verify_expanded(
+    def _verify_flat_safety_mode(
         self,
         expanded_seqs: list[Sequence],
         speculate_result: SpeculateResult,
     ) -> _BranchVerifyOutcome:
+        """Phase-0 safe fallback: flat expanded verify semantics."""
         b_exp = len(expanded_seqs)
         logits_p_flat = self.target_model_runner.call("run", expanded_seqs, False, False, True)
         for s in expanded_seqs:
@@ -211,13 +215,283 @@ class PivotTreeScratchExecutor(VerifierBase):
                         st.inter_shared_prefix_blocks,
                     )
 
+    def _commit_phase1_draft_graft_and_release_forks(
+        self,
+        parent_seqs: list[Sequence],
+        bundle: PivotTreeScratchBundle,
+        winners_per_parent: list[int],
+    ) -> None:
+        """Phase-1: graft draft/inter winner tails only; target KV via scratch slot copy."""
+        if bundle.branch_states is None or bundle.expanded_seqs is None:
+            return
+        d_bm: BlockManager = self.scheduler.draft_block_manager
+        i_bm: BlockManager | None = self.scheduler.intermediate_block_manager
+        t_bm: BlockManager = self.scheduler.block_manager
+
+        for seq, st in zip(bundle.expanded_seqs, bundle.branch_states):
+            winner_b_idx = winners_per_parent[st.parent_seq_idx]
+            if st.branch_idx != winner_b_idx:
+                continue
+            if st.is_parent_inplace:
+                continue
+            parent = parent_seqs[st.parent_seq_idx]
+            parent.draft_block_table = self._replace_parent_tail(
+                d_bm,
+                parent.draft_block_table,
+                st.draft_shared_prefix_blocks,
+                st.draft_private_tail_block_ids,
+            )
+            if i_bm is not None:
+                parent.inter_block_table = self._replace_parent_tail(
+                    i_bm,
+                    parent.inter_block_table,
+                    st.inter_shared_prefix_blocks,
+                    st.inter_private_tail_block_ids,
+                )
+
+        for seq, st in zip(bundle.expanded_seqs, bundle.branch_states):
+            if st.is_parent_inplace:
+                continue
+            winner_b_idx = winners_per_parent[st.parent_seq_idx]
+            is_winner = st.branch_idx == winner_b_idx
+            if is_winner:
+                t_bm.release_fork(seq.block_table, [], st.target_shared_prefix_blocks)
+                d_bm.release_fork(seq.draft_block_table, [], st.draft_shared_prefix_blocks)
+                if i_bm is not None:
+                    i_bm.release_fork(seq.inter_block_table, [], st.inter_shared_prefix_blocks)
+            else:
+                t_bm.release_fork(
+                    seq.block_table,
+                    st.target_private_tail_block_ids,
+                    st.target_shared_prefix_blocks,
+                )
+                d_bm.release_fork(
+                    seq.draft_block_table,
+                    st.draft_private_tail_block_ids,
+                    st.draft_shared_prefix_blocks,
+                )
+                if i_bm is not None:
+                    i_bm.release_fork(
+                        seq.inter_block_table,
+                        st.inter_private_tail_block_ids,
+                        st.inter_shared_prefix_blocks,
+                    )
+
+    @staticmethod
+    def _make_target_scratch_commit_bundle(
+        bundle: PivotTreeScratchBundle,
+        winner_rows: list[int],
+        new_suffixes: list[list[int]],
+    ) -> PivotTreeCommitBundle:
+        won_tgt: list[list[int]] = []
+        for pidx in range(bundle.parent_batch_size):
+            row = int(winner_rows[pidx])
+            L = len(new_suffixes[pidx])
+            won_tgt.append([int(x) for x in bundle.path_node_ids[row][:L]])
+        return PivotTreeCommitBundle(
+            winner_target_node_ids=won_tgt,
+            winner_draft_node_ids=[[] for _ in range(bundle.parent_batch_size)],
+            target_node_slot=bundle.target_node_to_slot,
+            draft_node_slot={},
+            raw_suffix_lens=[len(s) for s in new_suffixes],
+            scratch_owner=bundle.scratch_owner,
+        )
+
+    def _phase1a_debug_logits_compare_flat_vs_scratch(
+        self,
+        bundle: PivotTreeScratchBundle,
+        logits_p_scratch: torch.Tensor,
+    ) -> None:
+        """Optional ``debug_mode`` check: flat target verify vs packed scratch logits."""
+        cfg = getattr(self.scheduler, "config", None)
+        # Disabled by default: flat compare performs an additional target forward
+        # and may mutate KV/frontier assumptions in Phase-1A.
+        if not bool(getattr(cfg, "debug_phase1a_flat_compare", False)):
+            return
+        expanded = bundle.expanded_seqs
+        if expanded is None:
+            return
+        snap_nc = [int(s.num_cached_tokens) for s in expanded]
+        try:
+            b_exp = len(expanded)
+            logits_flat = self.target_model_runner.call("run", expanded, False, False, True)
+            for s in expanded:
+                s.num_cached_tokens += self.lookahead + 1
+            logits_flat = logits_flat.view(b_exp, self.lookahead + 1, -1)
+            diff = float(
+                (logits_flat.float() - logits_p_scratch.float()).abs().max().item()
+            )
+            print(
+                json.dumps(
+                    {
+                        "pivot_tree_phase1a_logits_compare": True,
+                        "max_abs_diff": diff,
+                        "batch_expanded": int(b_exp),
+                        "lookahead": int(self.lookahead),
+                    },
+                    ensure_ascii=False,
+                ),
+                flush=True,
+            )
+        finally:
+            for s, nc in zip(expanded, snap_nc):
+                s.num_cached_tokens = int(nc)
+
+    def _verify_target_scratch_phase1(
+        self,
+        seqs: list[Sequence],
+        speculate_result: SpeculateResult,
+        bundle: PivotTreeScratchBundle,
+    ) -> VerifyResult:
+        assert bundle.target_scratch_packed is not None
+        if not bool(getattr(self.target_model_runner, "enforce_eager", False)):
+            raise RuntimeError(
+                "Phase-1 pivot_tree_scratch target scratch verify requires "
+                "target ModelRunner.enforce_eager=True until CUDA-graph support lands."
+            )
+        for st in bundle.branch_states or []:
+            assert not st.target_private_tail_block_ids, (
+                "Phase-1 invariant: no target private tail on expanded rows "
+                "(speculator must use fork_target_kv=False / shared-prefix target tables)."
+            )
+        packed = bundle.target_scratch_packed
+        logits_tree_flat = self.target_model_runner.call(
+            "run_packed_tree_decode",
+            packed.input_ids,
+            packed.positions,
+            packed.slot_mapping,
+            packed.context_lens,
+            packed.block_tables,
+            packed.cu_seqlens_q,
+            packed.max_seqlen_q,
+            packed.tree_attn_mask,
+        )
+        logits_p = gather_logits_by_path(logits_tree_flat, bundle.path_node_ids)
+        assert logits_p.shape[:2] == speculate_result.speculations.shape, (
+            f"logits_p {logits_p.shape[:2]} vs speculations {speculate_result.speculations.shape[:2]}"
+        )
+        self._phase1a_debug_logits_compare_flat_vs_scratch(bundle, logits_p)
+        expanded_seqs = bundle.expanded_seqs
+        assert expanded_seqs is not None
+        temps_target = [s.temperature for s in expanded_seqs]
+        temps_draft = [
+            s.draft_temperature if s.draft_temperature is not None else s.temperature
+            for s in expanded_seqs
+        ]
+        temperatures_target = torch.tensor(temps_target, dtype=torch.float32, device=self.device)
+        temperatures_draft = torch.tensor(temps_draft, dtype=torch.float32, device=self.device)
+        suffixes, recovery = verify(
+            logits_p=logits_p,
+            logits_q=speculate_result.logits_q,
+            speculations=speculate_result.speculations,
+            temperatures_target=temperatures_target,
+            temperatures_draft=temperatures_draft,
+            cache_hits=None,
+            sampler_x=None,
+            async_fan_out=None,
+            jit_speculate=False,
+        )
+        accept_len = [max(0, len(s) - 1) for s in suffixes]
+        parent_bsz = bundle.parent_batch_size
+        winners = [-1] * parent_bsz
+        winner_rows = [-1] * parent_bsz
+        new_suffixes: list[list[int]] = [[] for _ in range(parent_bsz)]
+        recovery_tokens = [0] * parent_bsz
+        per_parent_rows: list[list[int]] = [[] for _ in range(parent_bsz)]
+        for row_idx, pidx in enumerate(bundle.path_parent_seq_idx):
+            per_parent_rows[pidx].append(row_idx)
+        force_b = getattr(getattr(self.scheduler, "config", None), "debug_force_pivot_winner_branch", None)
+        for pidx in range(parent_bsz):
+            rows = per_parent_rows[pidx]
+            best_row = rows[0]
+            best_accept = accept_len[best_row]
+            if force_b is not None:
+                forced = int(force_b)
+                for r in rows:
+                    if bundle.path_branch_idx[r] == forced:
+                        best_row = r
+                        best_accept = accept_len[r]
+                        break
+            else:
+                for r in rows[1:]:
+                    if accept_len[r] > best_accept:
+                        best_row = r
+                        best_accept = accept_len[r]
+            winners[pidx] = bundle.path_branch_idx[best_row]
+            winner_rows[pidx] = int(best_row)
+            new_suffixes[pidx] = suffixes[best_row]
+            recovery_tokens[pidx] = recovery[best_row]
+
+        self._commit_phase1_draft_graft_and_release_forks(seqs, bundle, winners)
+        commit_bundle = self._make_target_scratch_commit_bundle(bundle, winner_rows, new_suffixes)
+
+        if bool(getattr(getattr(self.scheduler, "config", None), "debug_mode", False)):
+            spec_rows = speculate_result.speculations.detach().cpu().tolist()
+            print(
+                json.dumps(
+                    {
+                        "pivot_round_debug": True,
+                        "stage": "collapse_phase1_scratch",
+                        "selected_request_ids": [int(x) for x in winners],
+                        "selected_expanded_row_ids": [int(x) for x in winner_rows],
+                        "spec_rows": [[int(t) for t in row] for row in spec_rows],
+                    },
+                    ensure_ascii=False,
+                ),
+                flush=True,
+            )
+
+        profile_trace = None
+        if self.enable_profile_trace:
+            per_parent_expanded = [c > 1 for c in bundle.host_plan.branch_counts]
+            per_parent_branch_count = list(bundle.host_plan.branch_counts)
+            profile_trace = VerifyProfileTrace(
+                verification_models=["target"] * parent_bsz,
+                token_ids_per_position=[[] for _ in range(parent_bsz)],
+                token_confidence_per_position=[[] for _ in range(parent_bsz)],
+                accept_len=[max(0, len(s) - 1) for s in new_suffixes],
+                recovery_tokens=list(recovery_tokens),
+                bonus_tokens=[None for _ in range(parent_bsz)],
+                pivot_expanded=per_parent_expanded,
+                pivot_branch_count=per_parent_branch_count,
+                pivot_selected_branch_idx=list(winners),
+            )
+        self.metrics.setdefault("accepted_suffix_lens_with_recovery", []).extend(
+            [len(s) for s in new_suffixes]
+        )
+        return VerifyResult(
+            new_suffixes=new_suffixes,
+            recovery_tokens=recovery_tokens,
+            eagle_acts=None,
+            is_hv_intermediate=False,
+            profile_trace=profile_trace,
+            postprocess_mode="speculate",
+            winning_branch_idx_per_parent=winners,
+            winning_branch_row_idx_per_parent=winner_rows,
+            pivot_before_expansion_batch_size=int(parent_bsz),
+            pivot_after_expansion_batch_size=int(bundle.expanded_batch_size),
+            scratch_commit_bundle=commit_bundle,
+        )
+
     def verify(self, seqs: list[Sequence], speculate_result: SpeculateResult, eagle: bool = False) -> VerifyResult:
         bundle = speculate_result.branch_bundle
         if not isinstance(bundle, PivotTreeScratchBundle) or bundle.expanded_seqs is None:
             raise ValueError("PivotTreeScratchExecutor requires PivotTreeScratchBundle with expanded_seqs")
+        assert bundle.branch_states is not None, "Phase-0 fallback requires branch_states"
+
+        has_target_scratch = bool(bundle.target_node_to_slot)
+        has_draft_scratch = bool(bundle.draft_node_to_slot)
+        if has_target_scratch:
+            assert not has_draft_scratch
+            assert bundle.target_scratch_packed is not None
+            return self._verify_target_scratch_phase1(seqs, speculate_result, bundle)
+        # Explicit Phase-0 safety-mode invariants.
+        assert not has_target_scratch
+        assert not has_draft_scratch
+        assert bundle.scratch_owner is None
 
         self._phase0_compare_logits_flat_vs_tree(bundle.expanded_seqs, speculate_result)
-        outcome = self._verify_expanded(bundle.expanded_seqs, speculate_result)
+        outcome = self._verify_flat_safety_mode(bundle.expanded_seqs, speculate_result)
         parent_bsz = bundle.parent_batch_size
         winners = [-1] * parent_bsz
         winner_rows = [-1] * parent_bsz
@@ -274,14 +548,6 @@ class PivotTreeScratchExecutor(VerifierBase):
         self.metrics.setdefault("accepted_suffix_lens_with_recovery", []).extend(
             [len(s) for s in new_suffixes]
         )
-        commit_bundle = PivotTreeCommitBundle(
-            winner_target_node_ids=[list(bundle.path_node_ids[r]) for r in winner_rows],
-            winner_draft_node_ids=[list(bundle.path_node_ids[r]) for r in winner_rows],
-            target_node_slot=dict(bundle.target_node_to_slot),
-            draft_node_slot=dict(bundle.draft_node_to_slot),
-            raw_suffix_lens=[len(s) for s in new_suffixes],
-            scratch_owner=bundle.scratch_owner,
-        )
         return VerifyResult(
             new_suffixes=new_suffixes,
             recovery_tokens=recovery_tokens,
@@ -293,5 +559,5 @@ class PivotTreeScratchExecutor(VerifierBase):
             winning_branch_row_idx_per_parent=winner_rows,
             pivot_before_expansion_batch_size=int(parent_bsz),
             pivot_after_expansion_batch_size=int(bundle.expanded_batch_size),
-            scratch_commit_bundle=commit_bundle,
+            scratch_commit_bundle=None,
         )

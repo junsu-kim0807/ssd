@@ -101,6 +101,7 @@ def main():
     parser.add_argument("--codeelo", action="store_true")
     parser.add_argument("--math500", action="store_true")
     parser.add_argument("--govreport", action="store_true")
+    parser.add_argument("--qa", action="store_true")
     parser.add_argument("--random", action="store_true")
     parser.add_argument("--all", action="store_true")
     parser.add_argument("--example", action="store_true")
@@ -172,6 +173,8 @@ def main():
             eval_cmd.append("--math500")
         if args.govreport:
             eval_cmd.append("--govreport")
+        if args.qa:
+            eval_cmd.append("--qa")
         if args.random:
             eval_cmd.append("--random")
         if args.all:

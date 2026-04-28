@@ -4,6 +4,7 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
+    from ssd.engine.helpers.pivot_tree_helpers import TargetScratchPackedInputs
     from ssd.engine.pivot_branch_planner import PivotHostPlan
     from ssd.engine.sequence import Sequence
 
@@ -101,6 +102,8 @@ class ScratchOwner:
     def merge(self, other: "ScratchOwner | None") -> "ScratchOwner":
         if other is None:
             return self
+        if other is self:
+            return self
         self.target_block_ids.extend(other.target_block_ids)
         self.draft_block_ids.extend(other.draft_block_ids)
         return self
@@ -139,6 +142,8 @@ class PivotTreeScratchBundle:
     expanded_seqs: list["Sequence"] | None = None
     branch_states: list[BranchForkState] | None = None
     scratch_owner: ScratchOwner | None = None
+    # Phase-1 target scratch packed verify (None in Phase-0 fallback).
+    target_scratch_packed: "TargetScratchPackedInputs | None" = None
 
 
 @dataclass

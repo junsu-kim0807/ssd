@@ -46,6 +46,7 @@ def main():
     parser.add_argument("--codeelo", action="store_true")
     parser.add_argument("--math500", action="store_true")
     parser.add_argument("--govreport", action="store_true")
+    parser.add_argument("--qa", action="store_true")
     parser.add_argument("--random", action="store_true")
     parser.add_argument("--all", action="store_true")
     parser.add_argument("--example", action="store_true")

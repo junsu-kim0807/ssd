@@ -173,6 +173,11 @@ def parse_arguments():
         action="store_true",
         help="Use ccdv/govreport-summarization prompts (JSONL from SSD_DATASET_DIR)",
     )
+    parser.add_argument(
+        "--qa",
+        action="store_true",
+        help="Use sentence-transformers/natural-questions prompts (JSONL from SSD_DATASET_DIR)",
+    )
     parser.add_argument("--random", action="store_true", help="Use random tokens instead of dataset prompts")
     parser.add_argument("--prompt_offset", type=int, default=0, help="Skip first N prompts per dataset (for variance testing)")
     parser.add_argument("--all", action="store_true", help="Use numseqs from each dataset (union dataset with numseqs*4 total)")
@@ -270,13 +275,14 @@ def parse_arguments():
             getattr(args, "codeelo", False),
             getattr(args, "math500", False),
             getattr(args, "govreport", False),
+            getattr(args, "qa", False),
         )
     )
     if _n_ds > 1:
         parser.error(
             "Choose at most one dataset flag among "
             "--humaneval --alpaca --c4 --ultrafeedback --aime2025 --livecodebench "
-            "--codeelo --math500 --govreport"
+            "--codeelo --math500 --govreport --qa"
         )
 
     _profile_engine = {"cost": "cost_breakdown", "metadata": "metadata", "cost_metadata": "cost_metadata"}
