@@ -97,6 +97,7 @@ def main():
     parser.add_argument("--c4", action="store_true")
     parser.add_argument("--ultrafeedback", action="store_true")
     parser.add_argument("--aime2025", action="store_true")
+    parser.add_argument("--aime", action="store_true")
     parser.add_argument("--livecodebench", action="store_true")
     parser.add_argument("--codeelo", action="store_true")
     parser.add_argument("--math500", action="store_true")
@@ -165,6 +166,8 @@ def main():
             eval_cmd.append("--ultrafeedback")
         if args.aime2025:
             eval_cmd.append("--aime2025")
+        if args.aime:
+            eval_cmd.append("--aime")
         if args.livecodebench:
             eval_cmd.append("--livecodebench")
         if args.codeelo:

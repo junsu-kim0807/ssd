@@ -287,6 +287,57 @@ def download_aime2025_data(num_samples=None):
     return output_file
 
 
+def download_aime_data(num_samples=None):
+    """Download AIME validation set (AI-MO/aimo-validation-aime, train split) to JSONL."""
+    output_dir = os.path.join(get_base_output_dir(), "aime")
+    os.makedirs(output_dir, exist_ok=True)
+
+    max_samples = 10000
+    if num_samples is None:
+        num_samples = max_samples
+    else:
+        num_samples = min(num_samples, max_samples)
+
+    output_file = os.path.join(output_dir, "aimo_validation_aime_train.jsonl")
+    if os.path.exists(output_file):
+        print(f"File {output_file} already exists. Skipping download.")
+        return output_file
+
+    print("Loading AIME validation dataset (AI-MO/aimo-validation-aime, train split)...")
+    try:
+        dataset = load_dataset("AI-MO/aimo-validation-aime", split="train")
+    except Exception as e:
+        print(f"Error loading AIME validation dataset: {e}")
+        raise
+
+    total_samples = len(dataset)
+    samples_to_process = min(num_samples, total_samples)
+    print(f"Processing {samples_to_process} samples from {total_samples} total samples...")
+
+    with open(output_file, "w", encoding="utf-8") as f:
+        for i in range(samples_to_process):
+            example = dataset[i]
+            # Keep schema-flexible extraction; bench loader prioritizes "problem" then "text".
+            problem = (
+                example.get("problem")
+                or example.get("question")
+                or example.get("prompt")
+                or example.get("text")
+                or ""
+            )
+            answer = example.get("answer", "")
+            sample = {
+                "problem": str(problem).strip(),
+                "answer": str(answer).strip(),
+            }
+            f.write(json.dumps(sample, ensure_ascii=False) + "\n")
+            if i % 200 == 0:
+                print(f"Processed {i}/{samples_to_process} samples...")
+
+    print(f"Saved {samples_to_process} AIME validation samples to {output_file}")
+    return output_file
+
+
 LIVECODEBENCH_LITE_CONFIG = "release_v5"
 LIVECODEBENCH_LITE_MAX = 10000
 
@@ -583,6 +634,7 @@ def download_all_datasets(num_samples=None):
         ("HumanEval", download_humaneval_data),
         ("Alpaca", download_alpaca_data),
         ("AIME2025", download_aime2025_data),
+        ("AIMEValidation", download_aime_data),
         ("LiveCodeBenchLite", download_livecodebench_code_generation_lite_data),
         ("MATH500", download_math500_data),
         ("CodeElo", download_codeelo_data),
@@ -615,6 +667,7 @@ DOWNLOADERS_BY_KEY = {
     "humaneval": download_humaneval_data,
     "alpaca": download_alpaca_data,
     "aime2025": download_aime2025_data,
+    "aime": download_aime_data,
     "livecodebench": download_livecodebench_code_generation_lite_data,
     "livecodebench_lite": download_livecodebench_code_generation_lite_data,
     "math500": download_math500_data,

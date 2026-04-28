@@ -151,6 +151,7 @@ def parse_arguments():
     parser.add_argument("--c4", action="store_true", help="Use C4 prompts")
     parser.add_argument("--ultrafeedback", action="store_true", help="Use UltraFeedback prompts")
     parser.add_argument("--aime2025", action="store_true", help="Use AIME 2025 (math-ai/aime25) prompts from SSD_DATASET_DIR")
+    parser.add_argument("--aime", action="store_true", help="Use AIME validation prompts (AI-MO/aimo-validation-aime train split) from SSD_DATASET_DIR")
     parser.add_argument(
         "--livecodebench",
         "--lcb_lite",
@@ -271,6 +272,7 @@ def parse_arguments():
             args.c4,
             args.ultrafeedback,
             args.aime2025,
+            getattr(args, "aime", False),
             args.livecodebench,
             getattr(args, "codeelo", False),
             getattr(args, "math500", False),
@@ -281,7 +283,7 @@ def parse_arguments():
     if _n_ds > 1:
         parser.error(
             "Choose at most one dataset flag among "
-            "--humaneval --alpaca --c4 --ultrafeedback --aime2025 --livecodebench "
+            "--humaneval --alpaca --c4 --ultrafeedback --aime2025 --aime --livecodebench "
             "--codeelo --math500 --govreport --qa"
         )
 
@@ -330,6 +332,7 @@ def create_run_name(args):
     c4_str = "_c4" if args.c4 else ""
     ultrafeedback_str = "_ultrafeedback" if args.ultrafeedback else ""
     aime_str = "_aime2025" if getattr(args, "aime2025", False) else ""
+    aime_val_str = "_aime" if getattr(args, "aime", False) else ""
     lcb_str = "_livecodebench" if getattr(args, "livecodebench", False) else ""
     codeelo_str = "_codeelo" if getattr(args, "codeelo", False) else ""
     math500_str = "_math500" if getattr(args, "math500", False) else ""
@@ -345,6 +348,7 @@ def create_run_name(args):
         or args.random
         or args.all
         or getattr(args, "aime2025", False)
+        or getattr(args, "aime", False)
         or getattr(args, "livecodebench", False)
         or getattr(args, "codeelo", False)
         or getattr(args, "math500", False)
@@ -377,7 +381,7 @@ def create_run_name(args):
     return args.name if args.name else (
         f"{model_type}_size{size_part}_{spec_mode_str}{async_mode_str}{jit_mode_str}_b{args.b}{hv_r_str}{k_str}{f_str}{draft_str}"
         f"{temp_str}{sampler_x_str}{prof_short}{example_str}{humaneval_str}{alpaca_str}{c4_str}{ultrafeedback_str}"
-        f"{aime_str}{lcb_str}{codeelo_str}{math500_str}{govreport_str}{random_str}{all_str}{gsm_str}"
+        f"{aime_str}{aime_val_str}{lcb_str}{codeelo_str}{math500_str}{govreport_str}{random_str}{all_str}{gsm_str}"
     )
 
 
@@ -425,6 +429,7 @@ def initialize_wandb(args, run_name):
             "c4_mode": args.c4,
             "ultrafeedback_mode": args.ultrafeedback,
             "aime2025_mode": getattr(args, "aime2025", False),
+            "aime_mode": getattr(args, "aime", False),
             "livecodebench_mode": getattr(args, "livecodebench", False),
             "codeelo_mode": getattr(args, "codeelo", False),
             "math500_mode": getattr(args, "math500", False),

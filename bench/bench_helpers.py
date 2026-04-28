@@ -103,6 +103,8 @@ def benchmark_dataset_label(args) -> str:
         return "ultrafeedback"
     if getattr(args, "aime2025", False):
         return "aime2025"
+    if getattr(args, "aime", False):
+        return "aime"
     if getattr(args, "livecodebench", False):
         return "livecodebench_lite"
     if getattr(args, "codeelo", False):
@@ -131,6 +133,7 @@ def ensure_benchmark_dataset(args) -> None:
             "math500",
             "govreport",
             "qa",
+            "aime",
             "livecodebench_lite",
         ):
             _ensure_single_dataset_file(name, m)
@@ -158,6 +161,7 @@ def _ensure_single_dataset_file(dataset_key: str, m) -> None:
         "c4": m.download_c4_data,
         "ultrafeedback": m.download_ultrafeedback_data,
         "aime2025": m.download_aime2025_data,
+        "aime": m.download_aime_data,
         "livecodebench_lite": m.download_livecodebench_code_generation_lite_data,
         "codeelo": m.download_codeelo_data,
         "math500": m.download_math500_data,
@@ -466,6 +470,8 @@ def generate_benchmark_inputs(
         dataset_name = "ultrafeedback"
     elif getattr(args, "aime2025", False):
         dataset_name = "aime2025"
+    elif getattr(args, "aime", False):
+        dataset_name = "aime"
     elif getattr(args, "livecodebench", False):
         dataset_name = "livecodebench_lite"
     elif getattr(args, "codeelo", False):

@@ -27,6 +27,7 @@ def main():
     parser.add_argument("--c4", action="store_true")
     parser.add_argument("--ultrafeedback", action="store_true")
     parser.add_argument("--aime2025", action="store_true")
+    parser.add_argument("--aime", action="store_true")
     parser.add_argument("--livecodebench", action="store_true")
     parser.add_argument("--codeelo", action="store_true")
     parser.add_argument("--math500", action="store_true")
