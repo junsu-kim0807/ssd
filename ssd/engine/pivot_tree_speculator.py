@@ -148,11 +148,11 @@ class PivotTreeScratchSpeculator(PivotRootSpeculatorSync):
         cursor = 0
         root_by_parent: list[list[int]] = []
         prob_by_parent: list[list[float]] = []
-        root_probs_host = (
-            [float(x) for x in plan.root_token_probs.detach().cpu().tolist()]
-            if plan.root_token_probs.numel() == int(plan.expanded_batch_size)
-            else [0.0] * int(plan.expanded_batch_size)
-        )
+        b_exp_plan = int(plan.expanded_batch_size)
+        if self.enable_profile_trace and plan.root_token_probs.numel() == b_exp_plan:
+            root_probs_host = [float(x) for x in plan.root_token_probs.detach().cpu().tolist()]
+        else:
+            root_probs_host = [0.0] * b_exp_plan
         for c in host.branch_counts:
             cnt = int(c)
             root_by_parent.append([int(x) for x in host.root_token_ids[cursor : cursor + cnt]])

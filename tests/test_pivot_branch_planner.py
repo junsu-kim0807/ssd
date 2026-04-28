@@ -99,6 +99,16 @@ def test_capacity_clamp_reduces_expanded_requests():
     assert plan.expanded_batch_size == 5
 
 
+def test_profile_metadata_off_skips_root_softmax_gathers():
+    logits = _logits_from_probs([[0.7, 0.2, 0.1], [0.6, 0.3, 0.1]])
+    cfg = PivotExpansionConfig(policy="dynamic", criteria="top1", threshold=0.99, topk=3)
+    plan = build_pivot_expansion_plan(logits, cfg, profile_metadata=False)
+    assert int(plan.expanded_batch_size) > 0
+    assert (plan.root_token_probs == 0).all()
+    plan_m = build_pivot_expansion_plan(logits, cfg, profile_metadata=True)
+    assert plan_m.root_token_probs.abs().sum().item() > 0.0
+
+
 def test_tie_case_deterministic_order():
     scores = torch.tensor([0.5, 0.5, 0.5], dtype=torch.float32)
     expand_mask = torch.tensor([True, True, True], dtype=torch.bool)

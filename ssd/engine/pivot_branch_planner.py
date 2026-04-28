@@ -176,6 +176,13 @@ def build_pivot_expansion_plan(
     materialize_host: bool = True,
     profile_metadata: bool = False,
 ) -> PivotExpansionPlan:
+    """Build expansion indices and optional host mirror.
+
+    When ``profile_metadata`` is False (normal decode / cost-only profiling), skip
+    top-``k`` softmax and per-branch root probability gather; keep a zero tensor for
+    ``root_token_probs`` shape compatibility. Expansion decisions use logit-margin
+    scores only (plus ``torch.topk`` on logits for candidate token ids).
+    """
     if first_step_logits.ndim != 2:
         raise ValueError(
             f"first_step_logits must have shape [B, V], got {tuple(first_step_logits.shape)}"
@@ -203,15 +210,13 @@ def build_pivot_expansion_plan(
     )
 
     topk_ids = top_ids_all[:, :topk]
-    # Profiling proxies without full-vocab softmax. Skip the cheap-but-non-zero
-    # GPU ops (sigmoid/tanh) and their D2H sync when profile metadata is off.
+    # Optional profile proxies (sigmoid/tanh): only when metadata rows need them.
     if profile_metadata:
         top1_probs = torch.sigmoid(logit_margin_scores)
         residual_scores = torch.tanh(logit_margin_scores / 2.0)
     else:
         top1_probs = logit_margin_scores  # placeholder; not materialized to host
         residual_scores = logit_margin_scores  # placeholder; not materialized to host
-    topk_probs = torch.softmax(top_vals_all[:, :topk], dim=-1)
     branch_counts_t = torch.where(
         expand_mask,
         torch.full((bsz,), topk, dtype=torch.int64, device=device),
@@ -231,7 +236,15 @@ def build_pivot_expansion_plan(
         - starts_per_branch
     )
     root_token_ids = topk_ids[parent_index_per_branch, branch_index_per_parent]
-    root_token_probs = topk_probs[parent_index_per_branch, branch_index_per_parent]
+    # Per-branch softmax probability within the top-k column slice: used for profiling /
+    # trace rows only. Winner selection uses verify accept_len, not these values.
+    if profile_metadata:
+        topk_probs = torch.softmax(top_vals_all[:, :topk], dim=-1)
+        root_token_probs = topk_probs[parent_index_per_branch, branch_index_per_parent]
+    else:
+        root_token_probs = torch.zeros(
+            expanded_batch_size, dtype=torch.float32, device=device
+        )
 
     host: PivotHostPlan | None = None
     if materialize_host:
