@@ -87,6 +87,7 @@ def parse_arguments():
             "pivot",
             "pivot_tree_scratch",
             "pivot_opt",
+            "pivot_opt_hierarchical",
             "hierarchical",
             "pivot_hierarchical",
             "pivot_legacy",
@@ -284,6 +285,8 @@ def parse_arguments():
         assert getattr(args, 'async', False), "Eagle currently only supports async speculative decoding"
     if args.spec_policy == "pivot_opt":
         args.spec_policy = "pivot_tree_scratch"
+    if args.spec_policy == "pivot_opt_hierarchical":
+        args.spec_policy = "pivot_hierarchical"
 
     _n_ds = sum(
         bool(x)
@@ -540,9 +543,11 @@ def create_llm_kwargs(args, draft_path):
             llm_kwargs["profiler_output_dir"] = str(_pod).strip()
             llm_kwargs["profiler_mode"] = getattr(args, "profiler_mode", None) or "cost_metadata"
 
-    inter = resolve_intermediate_model_path(args, HF_CACHE_DIR)
-    if inter:
-        llm_kwargs["intermediate"] = inter
+    # Intermediate model is only used by hierarchical verify policies.
+    if args.spec and args.spec_policy in {"hierarchical", "pivot_hierarchical"}:
+        inter = resolve_intermediate_model_path(args, HF_CACHE_DIR)
+        if inter:
+            llm_kwargs["intermediate"] = inter
 
     _gmu = getattr(args, "gpu_memory_utilization", None)
     if _gmu is not None:

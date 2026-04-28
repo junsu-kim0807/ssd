@@ -106,6 +106,7 @@ def build_spec_components(
             device=config.device,
             draft_model_runner=draft_runner,
             target_model_runner=model_runner,
+            intermediate_runner=intermediate_runner,
             scheduler=scheduler,
             expansion_cfg=PivotExpansionConfig(
                 policy=config.pivot_expansion_policy,
