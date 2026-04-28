@@ -88,10 +88,11 @@ PROFILE_MODE_CHOICES = ("cost", "metadata", "cost_metadata")
 # When --batch and --length are both passed: one job script runs these bench datasets in order.
 MULTI_DATASET_PROFILE_SLUGS: tuple[str, ...] = (
     "alpaca",
-    # "humaneval",
+    "qa",
+    "humaneval",
     "gsm8k",
-    "math500",
     "codeelo",
+    # "math500",
     # "livecodebench",
 )
 

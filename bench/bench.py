@@ -705,6 +705,18 @@ def main():
 
     string_prompts, prompt_token_ids, original_prompts = generate_benchmark_inputs(args, model_path)
     prompts = string_prompts if string_prompts is not None else prompt_token_ids
+    if prompts and len(prompts) < args.numseqs:
+        base_len = len(prompts)
+        # If the selected dataset has fewer rows than requested, repeat rows
+        # cyclically so runtime request count still matches --numseqs.
+        repeated = [prompts[i % base_len] for i in range(args.numseqs)]
+        prompts = repeated
+        print(
+            f"[bench] Loaded {base_len} prompts, repeated to match --numseqs={args.numseqs}.",
+            flush=True,
+        )
+        if original_prompts:
+            original_prompts = [original_prompts[i % len(original_prompts)] for i in range(args.numseqs)]
 
     if prompts:
         num_reqs = len(prompts)
