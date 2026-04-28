@@ -28,7 +28,7 @@ def test_build_rowwise_prefix_candidate_mask_length():
     m = build_rowwise_prefix_candidate_mask(pos0_list, k1, device=dev)
     want = sum((p0 + k1) * k1 for p0 in pos0_list)
     assert m.numel() == want
-    assert m.dtype == torch.uint8
+    assert m.dtype == torch.bool
 
 
 def test_can_use_target_scratch_phase1a_requires_alignment():

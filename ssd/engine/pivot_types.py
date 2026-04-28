@@ -4,7 +4,10 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
-    from ssd.engine.helpers.pivot_tree_helpers import TargetScratchPackedInputs
+    from ssd.engine.helpers.pivot_tree_helpers import (
+        DraftScratchPackedInputs,
+        TargetScratchPackedInputs,
+    )
     from ssd.engine.pivot_branch_planner import PivotHostPlan
     from ssd.engine.sequence import Sequence
 
@@ -144,6 +147,8 @@ class PivotTreeScratchBundle:
     scratch_owner: ScratchOwner | None = None
     # Phase-1 target scratch packed verify (None in Phase-0 fallback).
     target_scratch_packed: "TargetScratchPackedInputs | None" = None
+    # Phase-2 draft scratch packed metadata (None before draft scratch rollout).
+    draft_scratch_packed: "DraftScratchPackedInputs | None" = None
 
 
 @dataclass

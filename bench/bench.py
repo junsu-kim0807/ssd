@@ -284,6 +284,7 @@ def parse_arguments():
         assert args.temp == 0.0 and args.dtemp is None, "Eagle currently only supports greedy decoding (temp=0)"
         assert getattr(args, 'async', False), "Eagle currently only supports async speculative decoding"
     args.debug_phase0_flat_compare = args.spec_policy == "pivot_opt"
+    args.enable_pivot_draft_scratch_shadow = args.spec_policy == "pivot_opt"
     if args.spec_policy == "pivot_opt":
         args.spec_policy = "pivot_tree_scratch"
     if args.spec_policy == "pivot_opt_hierarchical":
@@ -529,6 +530,9 @@ def create_llm_kwargs(args, draft_path):
         pivot_expansion_threshold=args.pivot_expansion_threshold,
         pivot_topk=args.pivot_topk,
         debug_phase0_flat_compare=bool(getattr(args, "debug_phase0_flat_compare", False)),
+        enable_pivot_draft_scratch_shadow=bool(
+            getattr(args, "enable_pivot_draft_scratch_shadow", False)
+        ),
     )
 
     if getattr(args, "target_verify_interval", None) is not None:

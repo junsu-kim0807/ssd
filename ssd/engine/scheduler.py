@@ -544,22 +544,40 @@ class Scheduler:
                     draft_model_runner is not None
                     and i < len(commit_bundle.winner_draft_node_ids)
                 ):
-                    dr_nodes = commit_bundle.winner_draft_node_ids[i][: len(new_suffix)]
+                    dr_nodes_full = commit_bundle.winner_draft_node_ids[i]
+                    assert len(dr_nodes_full) >= len(new_suffix), (
+                        f"winner_draft_node_ids shorter than accepted suffix: "
+                        f"len(nodes)={len(dr_nodes_full)}, len(new_suffix)={len(new_suffix)}"
+                    )
+                    dr_nodes = dr_nodes_full[: len(new_suffix)]
                     src_block_ids = []
                     src_offsets = []
                     dst_block_ids = []
                     dst_offsets = []
                     for j, node_id in enumerate(dr_nodes):
-                        if node_id not in commit_bundle.draft_node_slot:
-                            continue
+                        assert node_id in commit_bundle.draft_node_slot, (
+                            f"draft node id {node_id} missing from draft_node_slot"
+                        )
                         sb, so = commit_bundle.draft_node_slot[node_id]
                         dst_pos = seq.num_tokens + j
+                        assert (dst_pos // self.block_size) < len(seq.draft_block_table), (
+                            f"draft dst block OOB: dst_pos={dst_pos}, "
+                            f"len(draft_block_table)={len(seq.draft_block_table)}, block_size={self.block_size}"
+                        )
                         dst_bid = int(seq.draft_block_table[dst_pos // self.block_size])
                         dst_off = int(dst_pos % self.block_size)
+                        assert int(sb) not in seq.draft_block_table, (
+                            f"scratch source block leaked into parent draft block_table: sb={int(sb)}"
+                        )
                         src_block_ids.append(int(sb))
                         src_offsets.append(int(so))
                         dst_block_ids.append(dst_bid)
                         dst_offsets.append(dst_off)
+                    if dr_nodes:
+                        assert len(src_block_ids) == len(new_suffix), (
+                            f"draft scratch commit alignment mismatch: copied={len(src_block_ids)}, "
+                            f"accepted={len(new_suffix)}"
+                        )
                     if src_block_ids:
                         draft_model_runner.copy_kv_slots(
                             src_block_ids,
@@ -568,6 +586,13 @@ class Scheduler:
                             dst_offsets,
                             "draft",
                         )
+                elif getattr(commit_bundle, "draft_node_slot", None):
+                    assert draft_model_runner is not None, (
+                        "draft scratch commit requires draft_model_runner"
+                    )
+                    assert i < len(commit_bundle.winner_draft_node_ids), (
+                        "draft scratch commit missing winner_draft_node_ids row"
+                    )
             # Phase-0 mode intentionally does not perform slot-copy.
             if commit_bundle is not None and not has_scratch_slots:
                 assert (

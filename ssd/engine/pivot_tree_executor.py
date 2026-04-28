@@ -320,6 +320,9 @@ class PivotTreeScratchExecutor(VerifierBase):
         winner_rows: list[int],
         new_suffixes: list[list[int]],
     ) -> PivotTreeCommitBundle:
+        assert not bundle.draft_node_to_slot, (
+            "Phase-2 draft scratch is disabled until draft scratch forward writes KV"
+        )
         won_tgt: list[list[int]] = []
         for pidx in range(bundle.parent_batch_size):
             row = int(winner_rows[pidx])
