@@ -372,6 +372,45 @@ class PivotRootSpeculatorSync(SpeculatorSync):
             return
         kv_cache[:, :, dst_block_id, :valid_tokens].copy_(kv_cache[:, :, src_block_id, :valid_tokens])
 
+    @staticmethod
+    def _copy_partial_cow_block_batched(
+        kv_cache: torch.Tensor,
+        copy_src_block_ids: list[int],
+        copy_dst_block_ids: list[int],
+        copy_valid_tokens: list[int],
+    ) -> None:
+        """Bucket per-block partial copies by ``valid_tokens`` and emit one
+        fancy-indexed scatter per bucket. Most steps produce only 1-2 distinct
+        ``valid_tokens`` values (block_size for full prefix blocks plus one
+        residual partial block), so this collapses N kernel launches into 1-2.
+        """
+        n = len(copy_src_block_ids)
+        if n == 0:
+            return
+        # Group indices by valid_tokens.
+        buckets: dict[int, tuple[list[int], list[int]]] = {}
+        for src, dst, v in zip(copy_src_block_ids, copy_dst_block_ids, copy_valid_tokens):
+            v = int(v)
+            if v <= 0:
+                continue
+            entry = buckets.get(v)
+            if entry is None:
+                buckets[v] = ([int(src)], [int(dst)])
+            else:
+                entry[0].append(int(src))
+                entry[1].append(int(dst))
+        if not buckets:
+            return
+        device = kv_cache.device
+        for v, (srcs, dsts) in buckets.items():
+            if len(srcs) == 1:
+                kv_cache[:, :, dsts[0], :v].copy_(kv_cache[:, :, srcs[0], :v])
+                continue
+            srcs_t = torch.as_tensor(srcs, dtype=torch.long, device=device)
+            dsts_t = torch.as_tensor(dsts, dtype=torch.long, device=device)
+            # Single fancy-indexed scatter: copy block-axis gathered slices.
+            kv_cache[:, :, dsts_t, :v] = kv_cache[:, :, srcs_t, :v]
+
     def _copy_partial_cow_block(
         self,
         *,
@@ -380,12 +419,12 @@ class PivotRootSpeculatorSync(SpeculatorSync):
         copy_valid_tokens: list[int],
         kv_cache: torch.Tensor,
     ) -> None:
-        for src_block, dst_block, valid_tokens in zip(
+        self._copy_partial_cow_block_batched(
+            kv_cache,
             copy_src_block_ids,
             copy_dst_block_ids,
             copy_valid_tokens,
-        ):
-            self._copy_kv_block(kv_cache, src_block, dst_block, valid_tokens)
+        )
 
     def speculate(
         self,

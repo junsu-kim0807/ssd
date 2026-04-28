@@ -149,18 +149,19 @@ class LLMEngine:
         )
         assert config.max_model_len == self.scheduler.max_model_len
 
-        # Pivot microcost timing sync is meaningful only for profiled pivot runs.
-        # Force deterministic behavior for every run so stale shell env does not leak.
-        _profile_enabled = bool(
+        # CUDA sync around pivot COW/expansion timers: only when cost aggregates are written
+        # (same gate as pivot microcost accumulation) and output dir is set. With profiling off
+        # or metadata-only / kernel trace, force "0" so a stale SSD_PROFILE_PIVOT_SYNC=1 shell
+        # env cannot slow non-cost runs.
+        pm = getattr(config, "profiler_mode", None) or ""
+        _pivot_cost_cuda_sync = bool(
             getattr(config, "profiler_output_dir", None)
             and str(getattr(config, "profiler_output_dir")).strip()
+            and wants_cost_aggregates(pm)
         )
         os.environ["SSD_PROFILE_PIVOT_SYNC"] = (
             "1"
-            if (
-                _profile_enabled
-                and config.spec_policy in {"pivot", "pivot_tree_scratch"}
-            )
+            if _pivot_cost_cuda_sync and config.spec_policy in {"pivot", "pivot_tree_scratch"}
             else "0"
         )
 

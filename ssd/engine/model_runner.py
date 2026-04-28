@@ -850,11 +850,30 @@ class ModelRunner:
         else:
             raise ValueError(f"copy_kv_blocks: unsupported cache_kind={cache_kind!r}")
 
+        # Bucket by ``valid_tokens`` and emit one fancy-indexed scatter per
+        # bucket. In practice all full prefix blocks share v=block_size and at
+        # most one residual partial block has a smaller v, so N kernel launches
+        # collapse into 1-2.
+        buckets: dict[int, tuple[list[int], list[int]]] = {}
         for src, dst, n_valid in zip(src_block_ids, dst_block_ids, valid_tokens_per_block):
             n = int(n_valid)
             if n <= 0:
                 continue
-            kv_cache[:, :, int(dst), :n].copy_(kv_cache[:, :, int(src), :n])
+            entry = buckets.get(n)
+            if entry is None:
+                buckets[n] = ([int(src)], [int(dst)])
+            else:
+                entry[0].append(int(src))
+                entry[1].append(int(dst))
+        if buckets:
+            device = kv_cache.device
+            for n, (srcs, dsts) in buckets.items():
+                if len(srcs) == 1:
+                    kv_cache[:, :, dsts[0], :n].copy_(kv_cache[:, :, srcs[0], :n])
+                    continue
+                srcs_t = torch.as_tensor(srcs, dtype=torch.long, device=device)
+                dsts_t = torch.as_tensor(dsts, dtype=torch.long, device=device)
+                kv_cache[:, :, dsts_t, :n] = kv_cache[:, :, srcs_t, :n]
 
         # ``copy_kv_blocks`` is a pure local memory op (no implicit NCCL sync).
         # When invoked through ``call()`` on TP runs, make completion explicit so

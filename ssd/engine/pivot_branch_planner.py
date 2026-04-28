@@ -203,9 +203,14 @@ def build_pivot_expansion_plan(
     )
 
     topk_ids = top_ids_all[:, :topk]
-    # Profiling proxies without full-vocab softmax.
-    top1_probs = torch.sigmoid(logit_margin_scores)
-    residual_scores = torch.tanh(logit_margin_scores / 2.0)
+    # Profiling proxies without full-vocab softmax. Skip the cheap-but-non-zero
+    # GPU ops (sigmoid/tanh) and their D2H sync when profile metadata is off.
+    if profile_metadata:
+        top1_probs = torch.sigmoid(logit_margin_scores)
+        residual_scores = torch.tanh(logit_margin_scores / 2.0)
+    else:
+        top1_probs = logit_margin_scores  # placeholder; not materialized to host
+        residual_scores = logit_margin_scores  # placeholder; not materialized to host
     topk_probs = torch.softmax(top_vals_all[:, :topk], dim=-1)
     branch_counts_t = torch.where(
         expand_mask,
