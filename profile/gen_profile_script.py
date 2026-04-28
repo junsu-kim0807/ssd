@@ -32,9 +32,8 @@ Sweep flags (optional, Cartesian product with other dimensions):
   --length  → speculative k 3, 5, 7, 9 (methods with ``uses_spec_k``; AR keeps path segment ``kna``)
   --temp    → temperatures 0, 0.3, 0.7, 1.0
 
-Default ``--methods`` includes ``hierarchical`` (sync spec + ``--spec_policy hierarchical``)
-and planner pivot ``pivot`` (sync spec + ``--spec_policy pivot``). Legacy pivot remains
-available as ``pivot_legacy``.
+Default ``--methods`` is ``ar,sync,pivot`` (autoregressive, sync spec, planner pivot). Other ids
+(``async``, ``hierarchical``, ``pivot_legacy``, …) remain available via ``--methods``.
 
 Adding a method
     1. Define ``extra_bench_args(k, async_fan_out) -> list[str]`` (tokens only; no ``--gpus``).
@@ -773,9 +772,9 @@ def main() -> None:
     p.add_argument(
         "--methods",
         type=str,
-        default="ar,sync,async,hierarchical,pivot",
+        default="ar,sync,pivot",
         help="Comma-separated method ids: ar | sync | async | hierarchical | pivot | pivot_legacy "
-        "(pivot is sync planner policy; pivot_legacy keeps async + spec_hive path).",
+        "(default ar,sync,pivot; pivot is sync planner policy; pivot_legacy keeps async + spec_hive path).",
     )
     p.add_argument(
         "--dataset",
