@@ -13,11 +13,19 @@ intermediate verifies plus one target verify. If ``--hv-rounds`` is omitted, gen
 
 ``--batch`` and ``--length`` are independent sweep dimensions (batch sizes vs speculative ``k``).
 
+With ``--batch`` or ``--length``, method ``pivot`` also sweeps ``--pivot_topk`` and
+``--pivot_expansion_pct`` over ``{2,3,5} × {0.1,0.2,0.5}`` (``pivot_legacy`` uses CLI defaults only).
+
 When **either** ``--batch`` or ``--length`` is set, generated jobs cover the profile dataset set
 (alpaca, humaneval, gsm8k, math500, codeelo, livecodebench): profiler paths ``.../b<b>/k.../t0/r<R>/<dataset>/`` for hierarchical.
 By default, **one Slurm script per dataset** (job name ``<dataset>_<family>_<method>_b<b>_<kpath>_<temp_tag>``).
 With ``--all``, one Slurm script runs every dataset in a ``for`` loop. ``--dataset`` is ignored in that mode.
 Job scripts and logs live under the same ``.../b<b>/k.../<pair>/t<tag>/`` layout; hierarchical adds ``r<R>/`` after ``t<tag>``.
+
+When using ``--batch`` (or ``--length``) for the multi-dataset profile sweep, a companion **bench-only** bash
+script is written: ``profile/run_batch.sh`` if ``--batch`` is set, and ``profile/run_length.sh`` if ``--length``
+is set (``sleep 5`` between ``python -O bench/bench.py`` blocks). If both flags are set, both files are written
+with the same command list.
 
 Sweep flags (optional, Cartesian product with other dimensions):
   --batch   → batch sizes 1, 4, 16, 64, 256
@@ -36,6 +44,7 @@ Adding a method
 from __future__ import annotations
 
 import argparse
+from itertools import product
 import os
 import re
 import shlex
@@ -181,6 +190,29 @@ def pct_path_component(pct: float) -> str:
 
 def uses_pivot_profiler_layout(method_id: str) -> bool:
     return method_id in {"pivot", "pivot_legacy"}
+
+
+# With ``--batch`` / ``--length`` and method ``pivot`` only (not ``pivot_legacy``).
+PIVOT_BATCH_LENGTH_TOPK_SWEEP = (2, 3, 5)
+PIVOT_BATCH_LENGTH_EXPANSION_PCT_SWEEP = (0.1, 0.2, 0.5)
+
+
+def uses_pivot_batch_length_topk_pct_sweep(method_id: str) -> bool:
+    return method_id == "pivot"
+
+
+def iter_pivot_topk_pct_for_profile_sweep(
+    *,
+    multi_dataset_sweep: bool,
+    method_id: str,
+    cli_topk: int,
+    cli_pct: float,
+) -> tuple[tuple[int, float], ...]:
+    if multi_dataset_sweep and uses_pivot_batch_length_topk_pct_sweep(method_id):
+        return tuple(
+            (int(tk), float(pc)) for tk in PIVOT_BATCH_LENGTH_TOPK_SWEEP for pc in PIVOT_BATCH_LENGTH_EXPANSION_PCT_SWEEP
+        )
+    return ((int(cli_topk), float(cli_pct)),)
 
 
 def shell_quote_single(s: str) -> str:
@@ -820,6 +852,20 @@ def main() -> None:
     p.add_argument("--output-len", type=int, default=FIXED_OUTPUT_LEN)
 
     p.add_argument("--extra-bench-arg", action="append", default=[], help="Extra bench.py token (repeatable)")
+    p.add_argument(
+        "--run-batch-sh",
+        type=str,
+        default=str(_REPO_ROOT / "profile" / "run_batch.sh"),
+        help="With --batch (multi-dataset sweep): write this bash script with bench.py commands only "
+        "(sleep 5 between each). Ignored if --batch is not set.",
+    )
+    p.add_argument(
+        "--run-length-sh",
+        type=str,
+        default=str(_REPO_ROOT / "profile" / "run_length.sh"),
+        help="With --length (multi-dataset sweep): write this bash script with bench.py commands only "
+        "(sleep 5 between each). Ignored if --length is not set.",
+    )
     p.add_argument("--dry-run", action="store_true")
     args = p.parse_args()
 
@@ -873,6 +919,15 @@ def main() -> None:
     err_log_root = Path(args.err_log_root).resolve()
 
     n_written = 0
+    run_batch_chunks: list[list[str]] = []
+    run_length_chunks: list[list[str]] = []
+
+    def _record_run_script_argv(argv_cmd: list[str]) -> None:
+        if args.batch:
+            run_batch_chunks.append(argv_cmd)
+        if args.length:
+            run_length_chunks.append(argv_cmd)
+
     for fam, mid, k_val, b_val, temp_val, spec in iter_job_configs(
         model_families=model_families,
         methods=methods,
@@ -884,7 +939,16 @@ def main() -> None:
         hv_round_cells: tuple[int | None, ...] = (
             tuple(int(r) for r in hv_rounds_parsed) if spec.id == "hierarchical" else (None,)
         )
-        for hv_round in hv_round_cells:
+        pivot_topk_pct_cells = iter_pivot_topk_pct_for_profile_sweep(
+            multi_dataset_sweep=multi_dataset_sweep,
+            method_id=spec.id,
+            cli_topk=int(args.pivot_topk),
+            cli_pct=float(args.pivot_expansion_pct),
+        )
+        for hv_round, (pivot_topk_val, pivot_pct_val) in product(
+            hv_round_cells,
+            pivot_topk_pct_cells,
+        ):
             flag_name, target_hub, draft_hub = MODEL_PRESETS[fam]
             pair_slug = target_plus_draft_slug(target_hub, None if not spec.uses_spec_k else draft_hub)
             k_path = "kna" if not spec.uses_spec_k else f"k{int(k_val)}"
@@ -894,8 +958,8 @@ def main() -> None:
 
             pivot_prof_kwargs = dict(
                 pivot_round=str(args.pivot_profiler_round),
-                pivot_topk=int(args.pivot_topk),
-                pivot_expansion_pct=float(args.pivot_expansion_pct),
+                pivot_topk=int(pivot_topk_val),
+                pivot_expansion_pct=float(pivot_pct_val),
             )
 
             prof_base_rel = profiler_rel_dir(
@@ -913,8 +977,8 @@ def main() -> None:
 
             gpu_n = gpus_global if gpus_global is not None else DEFAULT_GPU_BY_FAMILY_METHOD[(fam, spec.id)]
 
-            pivot_bench_topk = int(args.pivot_topk) if uses_pivot_profiler_layout(spec.id) else None
-            pivot_bench_pct = float(args.pivot_expansion_pct) if uses_pivot_profiler_layout(spec.id) else None
+            pivot_bench_topk = int(pivot_topk_val) if uses_pivot_profiler_layout(spec.id) else None
+            pivot_bench_pct = float(pivot_pct_val) if uses_pivot_profiler_layout(spec.id) else None
 
             bench_argv = build_bench_argv(
                 model_flag=flag_name,
@@ -948,8 +1012,8 @@ def main() -> None:
                     / pair_slug
                     / temp_tag
                     / f"r_{sanitize_path_component(str(args.pivot_profiler_round))}"
-                    / f"topk{int(args.pivot_topk)}"
-                    / pct_path_component(float(args.pivot_expansion_pct))
+                    / f"topk{int(pivot_topk_val)}"
+                    / pct_path_component(float(pivot_pct_val))
                 )
             else:
                 rel_bits = Path(args.profile_mode) / fam / spec.id / f"b{b_val}" / k_path / pair_slug / temp_tag
@@ -1000,6 +1064,39 @@ def main() -> None:
                     pivot_topk=pivot_bench_topk,
                     pivot_expansion_pct=pivot_bench_pct,
                 )
+                for ds in MULTI_DATASET_PROFILE_SLUGS:
+                    ds_rb = dataset_bench_flags(ds)
+                    prof_rel_rb = "./" + profiler_rel_dir(
+                        profile_mode=args.profile_mode,
+                        method_id=spec.id,
+                        batch_size=b_val,
+                        k_path_token=k_path,
+                        pair_slug=pair_slug,
+                        temp=temp_val,
+                        dataset_slug=ds,
+                        hv_round=prof_hv_kw,
+                        **pivot_prof_kwargs,
+                    ).replace(os.sep, "/")
+                    _record_run_script_argv(
+                        build_bench_argv(
+                            model_flag=flag_name,
+                            dataset_flags=ds_rb,
+                            method=spec,
+                            k=k_for_bench,
+                            async_fan_out=int(args.async_fan_out),
+                            batch_size=b_val,
+                            temp=float(temp_val),
+                            numseqs=int(args.numseqs),
+                            output_len=int(args.output_len),
+                            gpus=gpu_n,
+                            profile_mode=args.profile_mode,
+                            profiler_output_dir=prof_rel_rb,
+                            extra_bench_args=tuple(args.extra_bench_arg),
+                            hv_target_verify_interval=hv_round,
+                            pivot_topk=pivot_bench_topk,
+                            pivot_expansion_pct=pivot_bench_pct,
+                        )
+                    )
                 text = make_slurm_script(
                     job_name=job_name,
                     account=args.account,
@@ -1059,6 +1156,7 @@ def main() -> None:
                         pivot_topk=pivot_bench_topk,
                         pivot_expansion_pct=pivot_bench_pct,
                     )
+                    _record_run_script_argv(bench_argv_ds)
                     text = make_slurm_script(
                         job_name=job_name,
                         account=args.account,
@@ -1108,6 +1206,35 @@ def main() -> None:
                     script_path.write_text(text, encoding="utf-8")
                     os.chmod(script_path, 0o755)
                 n_written += 1
+
+    def _write_run_only_script(path_str: str, chunks: list[list[str]], label: str) -> None:
+        if not multi_dataset_sweep or not chunks:
+            return
+        out_path = Path(path_str).expanduser()
+        lines = [
+            "#!/usr/bin/env bash",
+            "",
+            "# Bench-only commands (sleep 5 between). Generated by profile/gen_profile_script.py.",
+            "",
+        ]
+        for i, argv_rb in enumerate(chunks):
+            if i:
+                lines.extend(["", "sleep 5", ""])
+            lines.append(format_multiline_cmd(argv_rb))
+        lines.append("")
+        body = "\n".join(lines)
+        if args.dry_run:
+            print(f"would write {label} script ({len(chunks)} commands): {out_path}", file=sys.stderr)
+        else:
+            out_path.parent.mkdir(parents=True, exist_ok=True)
+            out_path.write_text(body, encoding="utf-8")
+            os.chmod(out_path, 0o755)
+            print(f"Wrote {label} script ({len(chunks)} bench command(s)): {out_path}", file=sys.stderr)
+
+    if args.batch:
+        _write_run_only_script(args.run_batch_sh, run_batch_chunks, "run-batch")
+    if args.length:
+        _write_run_only_script(args.run_length_sh, run_length_chunks, "run-length")
 
     print(f"Generated {n_written} job script(s) under {job_root}")
 
