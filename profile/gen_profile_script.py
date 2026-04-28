@@ -89,9 +89,10 @@ PROFILE_MODE_CHOICES = ("cost", "metadata", "cost_metadata")
 MULTI_DATASET_PROFILE_SLUGS: tuple[str, ...] = (
     "alpaca",
     "qa",
-    "humaneval",
-    "gsm8k",
+    # "humaneval",
+    # "gsm8k",
     "codeelo",
+    "aime",
     # "math500",
     # "livecodebench",
 )
