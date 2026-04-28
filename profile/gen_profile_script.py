@@ -313,10 +313,12 @@ def dataset_bench_flags(dataset: str) -> list[str]:
         "gsm8k": [],  # alias for GSM-style default (no extra dataset flag)
         "ultrafeedback": ["--ultrafeedback"],
         "aime2025": ["--aime2025"],
+        "aime": ["--aime"],
         "livecodebench": ["--livecodebench"],
         "codeelo": ["--codeelo"],
         "math500": ["--math500"],
         "govreport": ["--govreport"],
+        "qa": ["--qa"],
         "random": ["--random"],
         "all": ["--all"],
     }
@@ -506,10 +508,12 @@ def build_multi_dataset_profile_loop_sh(
         '  echo "==== bench profile dataset=${dataset} ===="',
         "  case \"${dataset}\" in",
         "    alpaca) EXTRA_DS=(--alpaca);;",
+        "    qa) EXTRA_DS=(--qa);;",
         "    humaneval) EXTRA_DS=(--humaneval);;",
         "    gsm8k) EXTRA_DS=();;",
         "    math500) EXTRA_DS=(--math500);;",
         "    codeelo) EXTRA_DS=(--codeelo);;",
+        "    aime) EXTRA_DS=(--aime);;",
         "    livecodebench) EXTRA_DS=(--livecodebench);;",
         '    *) echo "unknown dataset: ${dataset}" >&2; exit 1;;',
         "  esac",
@@ -690,7 +694,7 @@ def main() -> None:
         "--dataset",
         type=str,
         default="alpaca",
-        help="humaneval|alpaca|c4|gsm|ultrafeedback|aime2025|livecodebench|codeelo|math500|govreport|random|all",
+        help="humaneval|alpaca|c4|gsm|ultrafeedback|aime2025|aime|livecodebench|codeelo|math500|govreport|qa|random|all",
     )
 
     p.add_argument(
