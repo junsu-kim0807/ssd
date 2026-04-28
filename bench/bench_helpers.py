@@ -369,6 +369,19 @@ def load_dataset_token_ids(
                     )
                 else:
                     tokens = tokenizer.encode(text, add_special_tokens=False)
+                # Some tokenizer/chat-template versions return BatchEncoding or tensor-like
+                # objects instead of plain token id lists. Normalize to List[int].
+                if hasattr(tokens, "get"):  # e.g. BatchEncoding
+                    input_ids = tokens.get("input_ids")
+                    if input_ids is not None:
+                        tokens = input_ids
+                if hasattr(tokens, "tolist"):  # torch / numpy tensors
+                    tokens = tokens.tolist()
+                if isinstance(tokens, list) and tokens and isinstance(tokens[0], list):
+                    # Handle batched shape [[...]] by taking first row.
+                    tokens = tokens[0]
+                if not isinstance(tokens, list):
+                    tokens = list(tokens)
 
                 target_len = max(len(tokens), input_len)
 
