@@ -5,7 +5,7 @@ from abc import ABC, abstractmethod
 from typing import TYPE_CHECKING, Literal
 
 if TYPE_CHECKING:
-    from ssd.engine.pivot_types import PivotBranchBundle
+    from ssd.engine.pivot_types import PivotBranchBundle, PivotTreeCommitBundle, PivotTreeScratchBundle
 
 
 @dataclass
@@ -13,7 +13,7 @@ class SpeculateResult:
     speculations: torch.Tensor
     logits_q: torch.Tensor
     cache_hits: torch.Tensor | None = None
-    branch_bundle: "PivotBranchBundle | None" = None
+    branch_bundle: "PivotBranchBundle | PivotTreeScratchBundle | None" = None
 
 
 @dataclass
@@ -63,6 +63,7 @@ class VerifyResult:
     # Pivot batch expansion summary (works even when profile trace is disabled, e.g. cost mode).
     pivot_before_expansion_batch_size: int | None = None
     pivot_after_expansion_batch_size: int | None = None
+    scratch_commit_bundle: "PivotTreeCommitBundle | None" = None
 
 
 class SpeculatorBase(ABC):

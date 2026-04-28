@@ -92,6 +92,24 @@ class Attention(nn.Module):
                                        max_seqlen_k=context.max_seqlen_k, cu_seqlens_k=context.cu_seqlens_k,
                                        softmax_scale=self.scale, causal=True)
         else:
+            if context.is_pivot_tree_pack:
+                if self.only_prefill_wrapper is not None:
+                    o = self.only_prefill_wrapper.run(q, (self.k_cache, self.v_cache))
+                else:
+                    # Fallback path for environments where wrapper planning is unavailable.
+                    o = flash_attn_with_kvcache(
+                        q,
+                        k_cache,
+                        v_cache,
+                        cache_seqlens=context.context_lens,
+                        page_table=context.block_tables,
+                        softmax_scale=self.scale,
+                        causal=True,
+                        cu_seqlens_q=context.cu_seqlens_q,
+                        max_seqlen_q=context.max_seqlen_q,
+                    )
+                o = o.view(-1, self.num_heads * self.head_dim)
+                return o
             # verify/glue decode: multi-query with cu_seqlens_q (K+1 or variable per seq)
             verify_or_glue = (
                 self.speculate and context.cu_seqlens_q is not None

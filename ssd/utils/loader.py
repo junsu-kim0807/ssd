@@ -22,6 +22,16 @@ def _remap_hf_weight_name_to_ssd(weight_name: str) -> str:
     return weight_name
 
 
+def _apply_quant_remap(name: str, quant_remap) -> str:
+    """Apply the model's ``quant_remap`` substring rules (Phase 1 split-QKV)."""
+    if not quant_remap:
+        return name
+    for find, replace in quant_remap:
+        if find in name:
+            return name.replace(find, replace, 1)
+    return name
+
+
 def load_embedding_from_target(model: nn.Module, target_path: str, target_hidden_size: int = None, draft_hidden_size: int = None) -> bool:
     """Try to load embedding weights from target model path (safetensors or bin)"""
     # Only load target embeddings if hidden sizes match (or if sizes not provided, assume compatible)
@@ -199,10 +209,12 @@ def load_eagle_model(model: nn.Module, path: str, packed_modules_mapping: dict, 
 def load_safetensors_model(model: nn.Module, path: str, packed_modules_mapping: dict):
     """Load model weights from safetensors files"""
     safetensor_files = glob(os.path.join(path, "*.safetensors"))
+    quant_remap = getattr(model, "quant_remap", None)
     for file in tqdm(safetensor_files, desc="Loading model files"):
         with safe_open(file, "pt", "cpu") as f:
             for weight_name in f.keys():
                 logical_name = _remap_hf_weight_name_to_ssd(weight_name)
+                logical_name = _apply_quant_remap(logical_name, quant_remap)
                 for k in packed_modules_mapping:
                     if k in logical_name:
                         v, shard_id = packed_modules_mapping[k]

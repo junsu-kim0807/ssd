@@ -5,17 +5,22 @@ from huggingface_hub import snapshot_download
 
 MODELS = {
     "llama": [
-        "meta-llama/Llama-3.1-8B-Instruct",
-        "meta-llama/Llama-3.1-70B-Instruct",
-        "meta-llama/Llama-3.2-1B-Instruct",
-        "meta-llama/Llama-3.2-3B-Instruct",
-        "meta-llama/Llama-3.3-70B-Instruct",
+        # "meta-llama/Llama-3.1-8B-Instruct",
+        # "meta-llama/Llama-3.1-70B-Instruct",
+        # "meta-llama/Llama-3.2-1B-Instruct",
+        # "meta-llama/Llama-3.2-3B-Instruct",
+        # "meta-llama/Llama-3.3-70B-Instruct",
+        # "nvidia/Llama-3.1-Nemotron-Nano-8B-v1",
+        "nvidia/Llama-3.1-70B-Instruct-FP8",
+        "RedHatAI/Meta-Llama-3.1-70B-Instruct-FP8",
     ],
     "qwen": [
-        "Qwen/Qwen3-0.6B",
-        "Qwen/Qwen3-1.7B",
-        "Qwen/Qwen3-8B",
-        "Qwen/Qwen3-32B",
+        # "Qwen/Qwen3-0.6B",
+        # "Qwen/Qwen3-1.7B",
+        # "Qwen/Qwen3-8B",
+        # "Qwen/Qwen3-32B",
+        # "Qwen/Qwen3-14B",
+        "Qwen/Qwen3-32B-FP8",
     ],
     "gemma": [
         "google/gemma-4-31B-it",

@@ -156,7 +156,12 @@ class LLMEngine:
             and str(getattr(config, "profiler_output_dir")).strip()
         )
         os.environ["SSD_PROFILE_PIVOT_SYNC"] = (
-            "1" if (_profile_enabled and config.spec_policy == "pivot") else "0"
+            "1"
+            if (
+                _profile_enabled
+                and config.spec_policy in {"pivot", "pivot_tree_scratch"}
+            )
+            else "0"
         )
 
         self.profiler = make_profiler(config)

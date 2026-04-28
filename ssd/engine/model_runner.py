@@ -48,7 +48,15 @@ from ssd.engine.helpers.cudagraph_helpers import (
     capture_glue_decode_cudagraph,
     get_custom_mask,
 )
-from ssd.engine.spec_policy_traits import uses_hierarchical_verify, uses_target_varlen_verify
+from ssd.engine.spec_policy_traits import (
+    uses_hierarchical_verify,
+    uses_pivot_tree_scratch,
+    uses_target_varlen_verify,
+)
+from ssd.quantization import (
+    gate_intermediate_quant_spec,
+    log_intermediate_quant_spec,
+)
 
 # ---------------------------------------------------------------------------
 # [REMOVE_ME HV_EAGER_FALLBACK_LOG] Hierarchical CUDAGraph→eager bypass: log on
@@ -141,7 +149,8 @@ class ModelRunner:
         self.device = torch.device(f'cuda:{self.rank}') 
         
         # cudagraph logic for FlashInfer kernels, need diff wrapper for each batch size we make a graph for 
-        if is_draft and config.draft_async:
+        enable_tree_wrappers = uses_pivot_tree_scratch(getattr(config, "spec_policy", ""))
+        if (is_draft and config.draft_async) or (enable_tree_wrappers and not is_intermediate):
             self._init_flashinfer_wrappers()
         
         if self.verbose: print(f'INSIDE MODEL RUNNER INIT, DRAFT={is_draft}', flush=True)
@@ -223,7 +232,10 @@ class ModelRunner:
             # pages_for_max_len = (self.config.max_model_len + self.block_size - 1) // self.block_size
             last_page_len_max_len = self.config.max_model_len % self.block_size
             last_page_len_max_len = self.block_size if last_page_len_max_len == 0 else last_page_len_max_len
-            MQ_LEN = self.config.async_fan_out * (self.config.speculate_k + 1)
+            if self.config.draft_async:
+                MQ_LEN = self.config.async_fan_out * (self.config.speculate_k + 1)
+            else:
+                MQ_LEN = self.config.speculate_k + 1
             
             cu_seqlens_q = torch.empty(max_bs + 1, dtype=torch.int32, device=self.device)
             kv_indptr = torch.empty(max_bs + 1, dtype=torch.int32, device=self.device)
@@ -273,6 +285,11 @@ class ModelRunner:
         model_type_name = getattr(runner_cfg, "model_type", getattr(hf_config, "model_type", None))
 
         assert model_type_name is not None, "ERROR in ModelRunner: hf_config.model_type is not set"
+
+        if self.intermediate_mode:
+            quant_spec = getattr(config, "intermediate_quant_spec", None)
+            log_intermediate_quant_spec(config.model, quant_spec)
+            gate_intermediate_quant_spec(quant_spec)
         if config.use_eagle and is_draft:
             print(f'[EAGLE3] Loading Eagle3DraftForCausalLM as model_class', flush=True)
             model_class = Eagle3DraftForCausalLM
@@ -560,6 +577,10 @@ class ModelRunner:
         im_dec = _decoder_cfg(im_cfg.hf_config)
         model_type_name = getattr(im_dec, "model_type", getattr(im_cfg.hf_config, "model_type", None))
         assert model_type_name is not None, "intermediate_hf_config.model_type is required"
+
+        quant_spec = getattr(target_config, "intermediate_quant_spec", None)
+        log_intermediate_quant_spec(im_cfg.model, quant_spec)
+        gate_intermediate_quant_spec(quant_spec)
         if target_config.use_eagle:
             raise NotImplementedError("hierarchical + EAGLE + multi-GPU intermediate is not supported")
         if model_type_name == "llama":
@@ -842,6 +863,77 @@ class ModelRunner:
             # Ensure local KV copy kernels complete before entering TP barrier.
             torch.cuda.current_stream().synchronize()
             dist.barrier(group=self.tp_pg, device_ids=[self.rank])
+
+    def copy_kv_slots(
+        self,
+        src_block_ids: list[int],
+        src_offsets: list[int],
+        dst_block_ids: list[int],
+        dst_offsets: list[int],
+        cache_kind: str = "target",
+    ) -> None:
+        assert (
+            len(src_block_ids)
+            == len(src_offsets)
+            == len(dst_block_ids)
+            == len(dst_offsets)
+        ), "copy_kv_slots: src/dst lengths must match"
+        if cache_kind == "target":
+            kv_cache = self.kv_cache
+        elif cache_kind == "intermediate":
+            kv_cache = (
+                self.intermediate_kv_cache
+                if getattr(self, "intermediate_kv_cache", None) is not None
+                else self.kv_cache
+            )
+        else:
+            raise ValueError(f"copy_kv_slots: unsupported cache_kind={cache_kind!r}")
+
+        for sb, so, db, do in zip(src_block_ids, src_offsets, dst_block_ids, dst_offsets):
+            kv_cache[:, :, int(db), int(do) : int(do) + 1, :, :].copy_(
+                kv_cache[:, :, int(sb), int(so) : int(so) + 1, :, :]
+            )
+        if self.world_size > 1 and self.tp_pg is not None:
+            torch.cuda.current_stream().synchronize()
+            dist.barrier(group=self.tp_pg, device_ids=[self.rank])
+
+    def run_packed_tree_decode(
+        self,
+        input_ids: torch.Tensor,
+        positions: torch.Tensor,
+        slot_mapping: torch.Tensor,
+        context_lens: torch.Tensor,
+        block_tables: torch.Tensor,
+        cu_seqlens_q: torch.Tensor,
+        max_seqlen_q: int,
+        tree_attn_mask: torch.Tensor | None,
+        *,
+        return_logits: bool = True,
+        model_override=None,
+    ) -> torch.Tensor:
+        set_context(
+            is_prefill=False,
+            cu_seqlens_q=cu_seqlens_q,
+            cu_seqlens_k=None,
+            max_seqlen_q=max_seqlen_q,
+            max_seqlen_k=0,
+            slot_mapping=slot_mapping,
+            context_lens=context_lens,
+            block_tables=block_tables,
+            is_pivot_tree_pack=True,
+            custom_mask=tree_attn_mask,
+        )
+        try:
+            logits = self.run_model(
+                input_ids,
+                positions,
+                is_prefill=False,
+                last_only=False,
+                model=model_override,
+            )
+        finally:
+            reset_context()
+        return logits if return_logits else logits
 
     def warmup_model(self):
         torch.cuda.empty_cache()
@@ -1362,6 +1454,39 @@ class ModelRunner:
         assert not (is_prefill and not last_only), "ERROR in run_model: is_prefill and not last_only"
         
         if is_prefill or self.enforce_eager:
+            ctx = get_context()
+            if (
+                not is_prefill
+                and bool(getattr(ctx, "is_pivot_tree_pack", False))
+                and getattr(self, "only_prefill_wrapper", None) is not None
+                and ctx.block_tables is not None
+                and ctx.context_lens is not None
+                and ctx.cu_seqlens_q is not None
+            ):
+                counts = (ctx.context_lens + self.block_size - 1) // self.block_size
+                kv_indptr = torch.cat(
+                    [torch.tensor([0], device=ctx.block_tables.device), counts.cumsum(dim=0)]
+                ).to(torch.int32)
+                mask = (
+                    torch.arange(ctx.block_tables.size(1), device=ctx.block_tables.device)[None, :]
+                    < counts[:, None]
+                )
+                kv_indices = ctx.block_tables[mask]
+                kv_last_page_len = (ctx.context_lens % self.block_size)
+                kv_last_page_len[kv_last_page_len == 0] = self.block_size
+                self.only_prefill_wrapper.plan(
+                    ctx.cu_seqlens_q.to(torch.int32),
+                    kv_indptr,
+                    kv_indices.to(torch.int32),
+                    kv_last_page_len.to(torch.int32),
+                    self.decoder_hf_config.num_attention_heads,
+                    self.decoder_hf_config.num_key_value_heads,
+                    self.decoder_hf_config.head_dim,
+                    self.block_size,
+                    custom_mask=ctx.custom_mask,
+                    q_data_type=self.decoder_hf_config.torch_dtype,
+                    kv_data_type=self.decoder_hf_config.torch_dtype,
+                )
             if not is_prefill and self.enforce_eager:
                 if not last_only:
                     stage = "verification"

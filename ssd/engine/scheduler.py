@@ -456,6 +456,112 @@ class Scheduler:
                     self.intermediate_block_manager.deallocate(seq)
                 self.running.remove(seq)
 
+    def postprocess_pivot_tree_scratch(
+        self,
+        seqs: list[Sequence],
+        new_suffixes: list[list[int]],
+        next_recovery_tokens: list[int],
+        commit_bundle=None,
+        *,
+        eagle_acts: torch.Tensor | None = None,
+        target_model_runner=None,
+        draft_model_runner=None,
+    ) -> None:
+        """Tree-scratch postprocess.
+
+        Phase 1 supports target scratch + draft flat-graft. Phase 2 supports
+        both target and draft scratch slot copies. If commit metadata is absent,
+        we fall back to standard speculative postprocess semantics.
+        """
+        for i, (seq, new_suffix, next_recovery_token) in enumerate(
+            zip(seqs, new_suffixes, next_recovery_tokens)
+        ):
+            new_suffix, finished = self._handle_eos_and_max_new_tokens(seq, new_suffix)
+            if commit_bundle is not None:
+                raw_len = int(commit_bundle.raw_suffix_lens[i]) if i < len(commit_bundle.raw_suffix_lens) else len(new_suffix)
+                assert raw_len >= len(new_suffix)
+                if (
+                    target_model_runner is not None
+                    and i < len(commit_bundle.winner_target_node_ids)
+                ):
+                    tgt_nodes = commit_bundle.winner_target_node_ids[i][: len(new_suffix)]
+                    src_block_ids: list[int] = []
+                    src_offsets: list[int] = []
+                    dst_block_ids: list[int] = []
+                    dst_offsets: list[int] = []
+                    for j, node_id in enumerate(tgt_nodes):
+                        if node_id not in commit_bundle.target_node_slot:
+                            continue
+                        sb, so = commit_bundle.target_node_slot[node_id]
+                        dst_pos = seq.num_tokens + j
+                        dst_bid = int(seq.block_table[dst_pos // self.block_size])
+                        dst_off = int(dst_pos % self.block_size)
+                        src_block_ids.append(int(sb))
+                        src_offsets.append(int(so))
+                        dst_block_ids.append(dst_bid)
+                        dst_offsets.append(dst_off)
+                    if src_block_ids:
+                        target_model_runner.call(
+                            "copy_kv_slots",
+                            src_block_ids,
+                            src_offsets,
+                            dst_block_ids,
+                            dst_offsets,
+                            "target",
+                        )
+                if (
+                    draft_model_runner is not None
+                    and i < len(commit_bundle.winner_draft_node_ids)
+                ):
+                    dr_nodes = commit_bundle.winner_draft_node_ids[i][: len(new_suffix)]
+                    src_block_ids = []
+                    src_offsets = []
+                    dst_block_ids = []
+                    dst_offsets = []
+                    for j, node_id in enumerate(dr_nodes):
+                        if node_id not in commit_bundle.draft_node_slot:
+                            continue
+                        sb, so = commit_bundle.draft_node_slot[node_id]
+                        dst_pos = seq.num_tokens + j
+                        dst_bid = int(seq.draft_block_table[dst_pos // self.block_size])
+                        dst_off = int(dst_pos % self.block_size)
+                        src_block_ids.append(int(sb))
+                        src_offsets.append(int(so))
+                        dst_block_ids.append(dst_bid)
+                        dst_offsets.append(dst_off)
+                    if src_block_ids:
+                        draft_model_runner.copy_kv_slots(
+                            src_block_ids,
+                            src_offsets,
+                            dst_block_ids,
+                            dst_offsets,
+                            "target",
+                        )
+            self._update_kv_caches(seq, new_suffix)
+            self._update_sequence_metadata(seq, new_suffix, next_recovery_token)
+            assert seq.num_cached_tokens <= seq.num_tokens
+            assert seq.num_draft_cached_tokens <= seq.num_tokens
+            need_blocks = (seq.num_tokens + self.block_size - 1) // self.block_size
+            assert len(seq.block_table) >= need_blocks
+            assert len(seq.draft_block_table) >= need_blocks
+
+            if eagle_acts is not None:
+                accepted_len = len(new_suffix)
+                idx = min(accepted_len - 1, eagle_acts.shape[1] - 1)
+                seq.last_target_hidden_state = eagle_acts[i, idx]
+            if finished:
+                seq.status = SequenceStatus.FINISHED
+                self.block_manager.deallocate(seq)
+                self.draft_block_manager.deallocate(seq)
+                if self.intermediate_block_manager is not None:
+                    self.intermediate_block_manager.deallocate(seq)
+                self.running.remove(seq)
+
+        if commit_bundle is not None and getattr(commit_bundle, "scratch_owner", None) is not None:
+            commit_bundle.scratch_owner.release_unreleased(
+                self.block_manager, self.draft_block_manager
+            )
+
     def _hv_apply_local_intermediate_round(
         self,
         seqs: list[Sequence],

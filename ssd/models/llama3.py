@@ -8,6 +8,12 @@ from ssd.layers.layernorm import RMSDNorm
 from ssd.layers.linear import QKVParallelLinear, MergedColumnParallelLinear, RowParallelLinear
 from ssd.layers.rotary_embedding import get_rope
 from ssd.layers.embed_head import VocabParallelEmbedding, ParallelLMHead
+from ssd.quantization import QuantSpec
+from ssd.quantization.factory import (
+    make_qkv_linear,
+    make_merged_column_linear,
+    make_row_linear,
+)
 
 
 class LlamaAttention(nn.Module):  # Renamed from Qwen3Attention
@@ -29,6 +35,7 @@ class LlamaAttention(nn.Module):  # Renamed from Qwen3Attention
         draft_async: bool = False,
         tp_group: dist.ProcessGroup | None = None,
         tp_size: int = 1,
+        quant_spec: QuantSpec | None = None,
     ) -> None:
         super().__init__()
         self.draft = draft
@@ -37,29 +44,31 @@ class LlamaAttention(nn.Module):  # Renamed from Qwen3Attention
         self.tp_size = tp_size
 
         self.total_num_heads = num_heads
-        self.num_heads = self.total_num_heads // tp_size 
+        self.num_heads = self.total_num_heads // tp_size
         self.total_num_kv_heads = num_kv_heads
         self.num_kv_heads = self.total_num_kv_heads // tp_size
         self.head_dim = head_dim or hidden_size // self.total_num_heads
         self.q_size = self.num_heads * self.head_dim
         self.kv_size = self.num_kv_heads * self.head_dim
         self.scaling = self.head_dim**-0.5
-        
-        self.qkv_proj = QKVParallelLinear(
+
+        self.qkv_proj = make_qkv_linear(
             hidden_size,
             self.head_dim,
             self.total_num_heads,
             self.total_num_kv_heads,
             bias=False,  # Llama doesn't use QKV bias
-            tp_group=self.tp_group, 
+            tp_group=self.tp_group,
             tp_size=self.tp_size,
+            quant_spec=quant_spec,
         )
-        self.o_proj = RowParallelLinear(
+        self.o_proj = make_row_linear(
             self.total_num_heads * self.head_dim,
             hidden_size,
             bias=False,
             tp_group=self.tp_group,
             tp_size=self.tp_size,
+            quant_spec=quant_spec,
         )
         
         # Llama 3 doesn't use rope scaling but 3.1 does (and Qwen3 does) -- this only makes a difference on long context prompts, which we don't test 
@@ -108,21 +117,24 @@ class LlamaMLP(nn.Module):
         hidden_act: str,
         tp_group: dist.ProcessGroup | None = None,
         tp_size: int = 1,
+        quant_spec: QuantSpec | None = None,
     ) -> None:
         super().__init__()
-        self.gate_up_proj = MergedColumnParallelLinear(
+        self.gate_up_proj = make_merged_column_linear(
             hidden_size,
             [intermediate_size] * 2,
             bias=False,
             tp_group=tp_group,
             tp_size=tp_size,
+            quant_spec=quant_spec,
         )
-        self.down_proj = RowParallelLinear(
+        self.down_proj = make_row_linear(
             intermediate_size,
             hidden_size,
             bias=False,
             tp_group=tp_group,
             tp_size=tp_size,
+            quant_spec=quant_spec,
         )
         assert hidden_act == "silu"
         self.act_fn = SiluAndMul()
@@ -146,8 +158,9 @@ class LlamaDecoderLayer(nn.Module):
         draft_async: bool,
         tp_group: dist.ProcessGroup | None = None,
         tp_size: int = 1,
+        quant_spec: QuantSpec | None = None,
     ) -> None:
-        super().__init__() 
+        super().__init__()
         self.draft = draft
         self.speculate = speculate
         self.spec_k = spec_k
@@ -169,6 +182,7 @@ class LlamaDecoderLayer(nn.Module):
             draft_async=self.draft_async,
             tp_group=tp_group,
             tp_size=tp_size,
+            quant_spec=quant_spec,
         )
 
         self.mlp = LlamaMLP(
@@ -177,6 +191,7 @@ class LlamaDecoderLayer(nn.Module):
             hidden_act=config.hidden_act,
             tp_group=tp_group,
             tp_size=tp_size,
+            quant_spec=quant_spec,
         )
 
         self.input_layernorm = RMSDNorm(config.hidden_size, eps=config.rms_norm_eps)
@@ -213,6 +228,7 @@ class LlamaModel(nn.Module):
         eagle_layers: list[int] | None = None,
         tp_group: dist.ProcessGroup | None = None,
         tp_size: int = 1,
+        quant_spec: QuantSpec | None = None,
     ) -> None:
         super().__init__()
         self.draft = draft
@@ -240,6 +256,7 @@ class LlamaModel(nn.Module):
                 draft_async=self.draft_async,
                 tp_group=tp_group,
                 tp_size=tp_size,
+                quant_spec=quant_spec,
             )
             for _ in range(config.num_hidden_layers)
         ])
@@ -284,7 +301,8 @@ class LlamaForCausalLM(nn.Module):
 
     def __init__(
         self,
-        config: LlamaConfig,        draft: bool = False,
+        config: LlamaConfig,
+        draft: bool = False,
         speculate: bool = False,
         use_eagle: bool = False,
         eagle_layers: list[int] | None = None,
@@ -293,6 +311,7 @@ class LlamaForCausalLM(nn.Module):
         draft_async: bool = False,
         tp_group: dist.ProcessGroup | None = None,
         tp_size: int = 1,
+        quant_spec: QuantSpec | None = None,
     ) -> None:
         super().__init__()
 
@@ -304,13 +323,40 @@ class LlamaForCausalLM(nn.Module):
         self.eagle_layers = eagle_layers
         self.tp_group = tp_group
         self.tp_size = tp_size
-        
+        self.quant_spec = quant_spec
+
         assert not (use_eagle and draft), "ERROR in LlamaForCausalLM: use_eagle should be on EagleDraftForCausalLM and not LlamaForCausalLM"
         assert not (tp_group is None and self.tp_size > 1), "ERROR in LlamaForCausalLM: tp_group is None and tp_size > 1"
+        assert not (use_eagle and quant_spec is not None), "EAGLE + quantized intermediate is not supported"
 
         print(f'Starting LlamaForCausalLM init, draft={draft}, speculate={speculate}, spec_k={spec_k}')
         print(f'[LlamaForCausalLM] use_eagle={use_eagle}, eagle_layers={eagle_layers}', flush=True)
-        self.model = LlamaModel(config, draft, speculate, spec_k, async_fan_out, draft_async, use_eagle=use_eagle, eagle_layers=eagle_layers, tp_group=tp_group, tp_size=self.tp_size)
+        self.model = LlamaModel(
+            config,
+            draft,
+            speculate,
+            spec_k,
+            async_fan_out,
+            draft_async,
+            use_eagle=use_eagle,
+            eagle_layers=eagle_layers,
+            tp_group=tp_group,
+            tp_size=self.tp_size,
+            quant_spec=quant_spec,
+        )
+
+        if quant_spec is not None and quant_spec.is_quantized:
+            # Split-QKV / split-gate_up: HF keys (``q_proj.*``, ``gate_proj.*``)
+            # are routed into the wrapper submodules so the loader does not
+            # apply the dense ``packed_modules_mapping``.
+            self.packed_modules_mapping = {}
+            self.quant_remap = (
+                ("self_attn.q_proj", "self_attn.qkv_proj.q_proj"),
+                ("self_attn.k_proj", "self_attn.qkv_proj.k_proj"),
+                ("self_attn.v_proj", "self_attn.qkv_proj.v_proj"),
+                ("mlp.gate_proj", "mlp.gate_up_proj.gate_proj"),
+                ("mlp.up_proj", "mlp.gate_up_proj.up_proj"),
+            )
         self.lm_head = ParallelLMHead(
             config.vocab_size,
             config.hidden_size,

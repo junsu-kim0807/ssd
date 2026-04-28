@@ -15,6 +15,8 @@ class Context:
     block_tables: torch.Tensor | None = None
     #: True for hierarchical target ``run_verify_varlen`` (per-seq query lengths differ; B=1 is ambiguous for LMHead heuristics).
     is_varlen_verify: bool = False
+    is_pivot_tree_pack: bool = False
+    custom_mask: torch.Tensor | None = None
 
 _CONTEXT = Context()
 
@@ -32,6 +34,8 @@ def set_context(
     block_tables=None,
     is_jit=False,
     is_varlen_verify: bool = False,
+    is_pivot_tree_pack: bool = False,
+    custom_mask: torch.Tensor | None = None,
 ):
     global _CONTEXT
     _CONTEXT = Context(
@@ -45,6 +49,8 @@ def set_context(
         context_lens,
         block_tables,
         is_varlen_verify,
+        is_pivot_tree_pack,
+        custom_mask,
     )
 
 def reset_context():

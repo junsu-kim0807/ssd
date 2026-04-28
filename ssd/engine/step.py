@@ -9,6 +9,7 @@ from ssd.engine.model_runner import ModelRunner
 from ssd.engine.sequence import Sequence
 from ssd.engine.scheduler import Scheduler
 from ssd.engine.helpers.speculate_types import SpeculatorBase, VerifierBase, VerifyResult
+from ssd.engine.spec_policy_traits import uses_pivot_tree_scratch
 from ssd.engine.verifier_hierarchical import VerifierHierarchical
 from ssd.utils.misc import decode_tokens
 from ssd.utils.profiler import SSDProfiler
@@ -239,167 +240,204 @@ class SpecDecodeStep(InferenceStep):
             recovery_tokens=[],
             eagle_acts=eagle_sentinel,
         )
-        #### STEP 1: SPECULATE ####
-        if self._profiler_active():
-            pr.bump_draft_requests(len(seqs))
-            pr.start_stage("draft")
-        speculate_result = self.speculator.speculate(seqs, in_verify_result)
-        if self._profiler_active():
-            pr.finish_stage("draft")
+        scratch_owner = None
+        speculate_result = None
+        out_verify_result = None
+        pivot_tree_policy = uses_pivot_tree_scratch(getattr(self.scheduler.config, "spec_policy", ""))
+        def _merge_scratch_owner(cur, other):
+            if other is None:
+                return cur
+            if cur is None:
+                return other
+            if hasattr(cur, "merge"):
+                return cur.merge(other)
+            return cur
+        try:
+            #### STEP 1: SPECULATE ####
+            if self._profiler_active():
+                pr.bump_draft_requests(len(seqs))
+                pr.start_stage("draft")
+            speculate_result = self.speculator.speculate(seqs, in_verify_result)
+            if self._profiler_active():
+                pr.finish_stage("draft")
+            scratch_owner = _merge_scratch_owner(
+                scratch_owner,
+                getattr(getattr(speculate_result, "branch_bundle", None), "scratch_owner", None),
+            )
 
-        if _prof:
-            torch.cuda.synchronize()
-            _t1 = perf_counter()
+            if _prof:
+                torch.cuda.synchronize()
+                _t1 = perf_counter()
 
-        if __debug__:
-            speculations = speculate_result.speculations
-            print(f"[SpecDecodeStep] speculations: {speculations}", flush=True)
-            speculations_list = speculations.tolist()
+            if __debug__:
+                speculations = speculate_result.speculations
+                print(f"[SpecDecodeStep] speculations: {speculations}", flush=True)
+                speculations_list = speculations.tolist()
 
-            for i, speculation in enumerate(speculations_list):
-                decoded_tokens = decode_tokens(speculation, self.tokenizer)
-                print(f"[SpecDecodeStep] speculation {i}: {decoded_tokens}", flush=True)
+                for i, speculation in enumerate(speculations_list):
+                    decoded_tokens = decode_tokens(speculation, self.tokenizer)
+                    print(f"[SpecDecodeStep] speculation {i}: {decoded_tokens}", flush=True)
 
-        #### STEP 2: VERIFY ####
-        if self._profiler_active():
+            #### STEP 2: VERIFY ####
+            if self._profiler_active():
+                if hierarchical:
+                    _t_hv_verify = perf_counter()
+                else:
+                    pr.start_stage("verify")
+            out_verify_result = self.verifier.verify(seqs, speculate_result, eagle=self.eagle)
+            scratch_owner = _merge_scratch_owner(
+                scratch_owner,
+                getattr(getattr(out_verify_result, "scratch_commit_bundle", None), "scratch_owner", None),
+            )
+            if self._profiler_active():
+                if hierarchical:
+                    pr.accum_hierarchical_verify_time(
+                        perf_counter() - _t_hv_verify, out_verify_result.is_hv_intermediate
+                    )
+                else:
+                    pr.finish_stage("verify")
+                pr.record_decode_verify_batch(seqs, out_verify_result)
+
+            if _prof:
+                torch.cuda.synchronize()
+                _t2 = perf_counter()
+
+            if __debug__:
+                recovery_tokens = out_verify_result.recovery_tokens
+                new_suffixes = out_verify_result.new_suffixes
+                for i, new_suffix in enumerate(new_suffixes):
+                    decoded_tokens = decode_tokens(new_suffix + [recovery_tokens[i]], self.tokenizer)
+                    print(f"[SpecDecodeStep] verification {i}: {decoded_tokens}", flush=True)
+
+            if hierarchical and getattr(self.scheduler.config, "debug_mode", False):
+                if isinstance(self.verifier, VerifierHierarchical) and not out_verify_result.is_hv_intermediate:
+                    dbg_target_cands = self.verifier._build_target_candidates(seqs, speculate_result)
+
+            # Restore original seq state before postprocess (undo speculate + verify modifications)
             if hierarchical:
-                _t_hv_verify = perf_counter()
+                for seq, (orig_len, orig_nt, orig_lt, orig_ndc, orig_nct) in zip(seqs, saved):
+                    del seq.token_ids[orig_len:]
+                    seq.num_tokens = orig_nt
+                    seq.last_token = orig_lt
+                    seq.num_draft_cached_tokens = orig_ndc
+                    seq.num_cached_tokens = orig_nct
+                    # Keep ``num_inter_cached_tokens`` from verify (e.g. += K+1 on intermediate).
             else:
-                pr.start_stage("verify")
-        out_verify_result = self.verifier.verify(seqs, speculate_result, eagle=self.eagle)
-        if self._profiler_active():
-            if hierarchical:
-                pr.accum_hierarchical_verify_time(
-                    perf_counter() - _t_hv_verify, out_verify_result.is_hv_intermediate
-                )
-            else:
-                pr.finish_stage("verify")
-            pr.record_decode_verify_batch(seqs, out_verify_result)
+                for seq, (orig_len, orig_nt, orig_lt, orig_ndc, orig_nct) in zip(seqs, saved):
+                    del seq.token_ids[orig_len:]
+                    seq.num_tokens = orig_nt
+                    seq.last_token = orig_lt
+                    seq.num_draft_cached_tokens = orig_ndc
+                    seq.num_cached_tokens = orig_nct
 
-        if _prof:
-            torch.cuda.synchronize()
-            _t2 = perf_counter()
-
-        if __debug__:
-            recovery_tokens = out_verify_result.recovery_tokens
-            new_suffixes = out_verify_result.new_suffixes
-            for i, new_suffix in enumerate(new_suffixes):
-                decoded_tokens = decode_tokens(new_suffix + [recovery_tokens[i]], self.tokenizer)
-                print(f"[SpecDecodeStep] verification {i}: {decoded_tokens}", flush=True)
-
-        if hierarchical and getattr(self.scheduler.config, "debug_mode", False):
-            if isinstance(self.verifier, VerifierHierarchical) and not out_verify_result.is_hv_intermediate:
-                dbg_target_cands = self.verifier._build_target_candidates(seqs, speculate_result)
-
-        # Restore original seq state before postprocess (undo speculate + verify modifications)
-        if hierarchical:
-            for seq, (orig_len, orig_nt, orig_lt, orig_ndc, orig_nct) in zip(seqs, saved):
-                del seq.token_ids[orig_len:]
-                seq.num_tokens = orig_nt
-                seq.last_token = orig_lt
-                seq.num_draft_cached_tokens = orig_ndc
-                seq.num_cached_tokens = orig_nct
-                # Keep ``num_inter_cached_tokens`` from verify (e.g. += K+1 on intermediate).
-        else:
-            for seq, (orig_len, orig_nt, orig_lt, orig_ndc, orig_nct) in zip(seqs, saved):
-                del seq.token_ids[orig_len:]
-                seq.num_tokens = orig_nt
-                seq.last_token = orig_lt
-                seq.num_draft_cached_tokens = orig_ndc
-                seq.num_cached_tokens = orig_nct
-
-        #### STEP 3: POSTPROCESS ####
-        dbg_vanilla_raw_suffixes: list[list[int]] | None = None
-        dbg_vanilla_trunc_preview: list[tuple[list[int], bool]] | None = None
-        if (
-            (not hierarchical)
-            and dbg_spec_pre_comp is not None
-            and getattr(self.scheduler.config, "debug_mode", False)
-        ):
-            dbg_vanilla_raw_suffixes = [list(s) for s in out_verify_result.new_suffixes]
-            dbg_vanilla_trunc_preview = []
-            for seq, raw in zip(seqs, dbg_vanilla_raw_suffixes):
-                trunc, finished = self.scheduler._handle_eos_and_max_new_tokens(seq, list(raw))
-                dbg_vanilla_trunc_preview.append((trunc, finished))
-
-        if self._profiler_active():
-            pr.start_stage("postprocess")
-        if hierarchical:
-            mode = getattr(out_verify_result, "postprocess_mode", None)
-            is_inter = out_verify_result.is_hv_intermediate if mode is None else (mode == "hv_intermediate")
-            if is_inter:
-                self.scheduler.postprocess_hv_intermediate_round(
-                    seqs,
-                    out_verify_result.new_suffixes,
-                    out_verify_result.recovery_tokens,
-                )
-            else:
-                self.scheduler.postprocess_hv_target_round(
-                    seqs,
-                    out_verify_result.new_suffixes,
-                    out_verify_result.recovery_tokens,
-                    eagle_acts=out_verify_result.eagle_acts if self.eagle else None,
-                )
-        else:
-            self.scheduler.postprocess_speculate(
-                seqs,
-                out_verify_result.new_suffixes,
-                out_verify_result.recovery_tokens,
-                eagle_acts=out_verify_result.eagle_acts if self.eagle else None,
-            )
-        if self._profiler_active():
-            pr.finish_stage("postprocess")
-
-        if (
-            hierarchical
-            and dbg_hv_pre_comp is not None
-            and dbg_hv_round0 is not None
-            and getattr(self.scheduler.config, "debug_mode", False)
-        ):
-            self._hv_correctness_debug_log(
-                seqs,
-                speculate_result,
-                out_verify_result,
-                dbg_hv_pre_comp,
-                dbg_hv_round0,
-                dbg_target_cands,
-            )
-        elif (
-            (not hierarchical)
-            and dbg_spec_pre_comp is not None
-            and getattr(self.scheduler.config, "debug_mode", False)
-        ):
-            self._spec_correctness_debug_log(
-                seqs,
-                speculate_result,
-                out_verify_result,
-                dbg_spec_pre_comp,
-            )
+            #### STEP 3: POSTPROCESS ####
+            dbg_vanilla_raw_suffixes: list[list[int]] | None = None
+            dbg_vanilla_trunc_preview: list[tuple[list[int], bool]] | None = None
             if (
-                dbg_vanilla_raw_suffixes is not None
-                and dbg_vanilla_trunc_preview is not None
+                (not hierarchical)
+                and dbg_spec_pre_comp is not None
+                and getattr(self.scheduler.config, "debug_mode", False)
             ):
-                for i, seq in enumerate(seqs):
-                    raw = dbg_vanilla_raw_suffixes[i]
-                    trunc, finished_preview = dbg_vanilla_trunc_preview[i]
-                    post_delta = seq.num_completion_tokens - dbg_spec_pre_comp[i]
-                    row = {
-                        "hv_target_commit_debug": True,
-                        "seq_id": seq.seq_id,
-                        "pre_num_tokens": int(saved[i][1]),
-                        "pre_completion_tokens": dbg_spec_pre_comp[i],
-                        "raw_suffix_len": len(raw),
-                        "raw_suffix_head": raw[:3],
-                        "truncated_suffix_len_preview": len(trunc),
-                        "truncated_suffix_head_preview": trunc[:3],
-                        "post_completion_delta": post_delta,
-                        "post_num_tokens": seq.num_tokens,
-                        "next_recovery_token": int(out_verify_result.recovery_tokens[i]),
-                        "finished_preview": bool(finished_preview),
-                        "is_finished": bool(seq.is_finished),
-                        "lost_by_truncation_or_commit": len(raw) - post_delta,
-                    }
-                    print(json.dumps(row, ensure_ascii=False), flush=True)
+                dbg_vanilla_raw_suffixes = [list(s) for s in out_verify_result.new_suffixes]
+                dbg_vanilla_trunc_preview = []
+                for seq, raw in zip(seqs, dbg_vanilla_raw_suffixes):
+                    trunc, finished = self.scheduler._handle_eos_and_max_new_tokens(seq, list(raw))
+                    dbg_vanilla_trunc_preview.append((trunc, finished))
+
+            if self._profiler_active():
+                pr.start_stage("postprocess")
+            if hierarchical:
+                mode = getattr(out_verify_result, "postprocess_mode", None)
+                is_inter = out_verify_result.is_hv_intermediate if mode is None else (mode == "hv_intermediate")
+                if is_inter:
+                    self.scheduler.postprocess_hv_intermediate_round(
+                        seqs,
+                        out_verify_result.new_suffixes,
+                        out_verify_result.recovery_tokens,
+                    )
+                else:
+                    self.scheduler.postprocess_hv_target_round(
+                        seqs,
+                        out_verify_result.new_suffixes,
+                        out_verify_result.recovery_tokens,
+                        eagle_acts=out_verify_result.eagle_acts if self.eagle else None,
+                    )
+            else:
+                if pivot_tree_policy:
+                    self.scheduler.postprocess_pivot_tree_scratch(
+                        seqs,
+                        out_verify_result.new_suffixes,
+                        out_verify_result.recovery_tokens,
+                        commit_bundle=out_verify_result.scratch_commit_bundle,
+                        eagle_acts=out_verify_result.eagle_acts if self.eagle else None,
+                        target_model_runner=getattr(self.verifier, "target_model_runner", None),
+                        draft_model_runner=getattr(self.verifier, "draft_model_runner", None),
+                    )
+                else:
+                    self.scheduler.postprocess_speculate(
+                        seqs,
+                        out_verify_result.new_suffixes,
+                        out_verify_result.recovery_tokens,
+                        eagle_acts=out_verify_result.eagle_acts if self.eagle else None,
+                    )
+            if self._profiler_active():
+                pr.finish_stage("postprocess")
+
+            if (
+                hierarchical
+                and dbg_hv_pre_comp is not None
+                and dbg_hv_round0 is not None
+                and getattr(self.scheduler.config, "debug_mode", False)
+            ):
+                self._hv_correctness_debug_log(
+                    seqs,
+                    speculate_result,
+                    out_verify_result,
+                    dbg_hv_pre_comp,
+                    dbg_hv_round0,
+                    dbg_target_cands,
+                )
+            elif (
+                (not hierarchical)
+                and dbg_spec_pre_comp is not None
+                and getattr(self.scheduler.config, "debug_mode", False)
+            ):
+                self._spec_correctness_debug_log(
+                    seqs,
+                    speculate_result,
+                    out_verify_result,
+                    dbg_spec_pre_comp,
+                )
+                if (
+                    dbg_vanilla_raw_suffixes is not None
+                    and dbg_vanilla_trunc_preview is not None
+                ):
+                    for i, seq in enumerate(seqs):
+                        raw = dbg_vanilla_raw_suffixes[i]
+                        trunc, finished_preview = dbg_vanilla_trunc_preview[i]
+                        post_delta = seq.num_completion_tokens - dbg_spec_pre_comp[i]
+                        row = {
+                            "hv_target_commit_debug": True,
+                            "seq_id": seq.seq_id,
+                            "pre_num_tokens": int(saved[i][1]),
+                            "pre_completion_tokens": dbg_spec_pre_comp[i],
+                            "raw_suffix_len": len(raw),
+                            "raw_suffix_head": raw[:3],
+                            "truncated_suffix_len_preview": len(trunc),
+                            "truncated_suffix_head_preview": trunc[:3],
+                            "post_completion_delta": post_delta,
+                            "post_num_tokens": seq.num_tokens,
+                            "next_recovery_token": int(out_verify_result.recovery_tokens[i]),
+                            "finished_preview": bool(finished_preview),
+                            "is_finished": bool(seq.is_finished),
+                            "lost_by_truncation_or_commit": len(raw) - post_delta,
+                        }
+                        print(json.dumps(row, ensure_ascii=False), flush=True)
+        finally:
+            if scratch_owner is not None:
+                scratch_owner.release_unreleased(
+                    self.scheduler.block_manager, self.scheduler.draft_block_manager
+                )
 
         if _prof:
             torch.cuda.synchronize()

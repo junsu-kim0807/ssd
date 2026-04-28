@@ -8,6 +8,8 @@ from ssd.engine.helpers.speculate_types import SpeculatorBase, VerifierBase
 from ssd.engine.pivot_branch_planner import PivotExpansionConfig
 from ssd.engine.pivot_executor_flat import PivotExecutorFlat
 from ssd.engine.pivot_speculator_sync import PivotRootSpeculatorSync
+from ssd.engine.pivot_tree_executor import PivotTreeScratchExecutor
+from ssd.engine.pivot_tree_speculator import PivotTreeScratchSpeculator
 from ssd.engine.spec_policy_traits import is_pivot_legacy, uses_hierarchical_verify
 from ssd.engine.speculator_sync import SpeculatorSync
 from ssd.engine.verifier import Verifier
@@ -86,6 +88,40 @@ def build_spec_components(
             lookahead=config.speculate_k,
             device=config.device,
             target_model_runner=model_runner,
+            scheduler=scheduler,
+            metrics=metrics,
+            enable_profile_trace=enable_profile_trace,
+        )
+        return SpecDecodeComponents(speculator=speculator, verifier=verifier)
+
+    if config.spec_policy == "pivot_tree_scratch":
+        max_expand_rows = config.max_num_seqs * max(1, int(config.pivot_topk))
+        if config.pivot_expansion_policy == "dynamic" and float(config.pivot_expansion_pct) > 0.0:
+            max_expand_reqs = int(math.floor(config.max_num_seqs * float(config.pivot_expansion_pct)))
+            max_expand_rows = config.max_num_seqs + max(0, max_expand_reqs) * max(
+                0, int(config.pivot_topk) - 1
+            )
+        speculator = PivotTreeScratchSpeculator(
+            lookahead=config.speculate_k,
+            device=config.device,
+            draft_model_runner=draft_runner,
+            target_model_runner=model_runner,
+            scheduler=scheduler,
+            expansion_cfg=PivotExpansionConfig(
+                policy=config.pivot_expansion_policy,
+                criteria=config.pivot_expansion_criteria,
+                expansion_pct=config.pivot_expansion_pct,
+                threshold=config.pivot_expansion_threshold,
+                topk=config.pivot_topk,
+            ),
+            max_expand_rows=max_expand_rows,
+            enable_profile_trace=enable_profile_trace,
+        )
+        verifier = PivotTreeScratchExecutor(
+            lookahead=config.speculate_k,
+            device=config.device,
+            target_model_runner=model_runner,
+            draft_model_runner=draft_runner,
             scheduler=scheduler,
             metrics=metrics,
             enable_profile_trace=enable_profile_trace,

@@ -9,6 +9,7 @@ from ssd.engine.spec_policy_traits import (
     uses_hierarchical_verify,
     uses_pivot_root_expansion,
 )
+from ssd.quantization import QuantSpec, detect_quant_spec
 
 
 def _decoder_cfg(cfg):
@@ -66,6 +67,8 @@ class Config:
     # hierarchical verification (sync spec, single verify per step)
     intermediate: str = ""  # HF model dir; empty => use same path as draft
     intermediate_hf_config: AutoConfig | None = None
+    # Phase 0 quantization detection (intermediate-only). None => bf16/fp16 dense.
+    intermediate_quant_spec: QuantSpec | None = None
     target_verify_interval: int = 1  # r: r intermediate verifies + target in one fused decode step (HierarchicalFusedStep).
     # When True, intermediate postprocess never jumps hv_round_idx to r on EOS (avoids mixed-round batches in fused HV).
     hv_ignore_intermediate_eos: bool = False
@@ -125,13 +128,15 @@ class Config:
             if self.spec_policy not in {
                 "default",
                 "pivot",
+                "pivot_tree_scratch",
                 "hierarchical",
                 "pivot_hierarchical",
                 "pivot_legacy",
             }:
                 raise ValueError(
                     f"Unsupported spec_policy={self.spec_policy}. "
-                    "Use 'default', 'pivot', 'hierarchical', 'pivot_hierarchical', or 'pivot_legacy'.")
+                    "Use 'default', 'pivot', 'pivot_tree_scratch', "
+                    "'hierarchical', 'pivot_hierarchical', or 'pivot_legacy'.")
             if is_pivot_legacy(self.spec_policy):
                 if self.interval < 0:
                     raise ValueError("interval must be >= 0 for pivot_legacy")
@@ -178,6 +183,7 @@ class Config:
                     raise ValueError(f"target_verify_interval must be >= 1 for {self.spec_policy}")
                 im = self.intermediate or self.draft
                 self.intermediate_hf_config = AutoConfig.from_pretrained(im, trust_remote_code=True)
+                self.intermediate_quant_spec = detect_quant_spec(self.intermediate_hf_config, im)
                 self.max_model_len = min(
                     self.max_model_len,
                     _cfg_attr(

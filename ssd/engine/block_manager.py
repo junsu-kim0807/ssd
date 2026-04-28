@@ -153,6 +153,23 @@ class BlockManager:
         blocks = self._allocate_n_blocks(num_needed_blocks)
         return [b.block_id for b in blocks]
 
+    def allocate_scratch_blocks(self, n: int) -> list[int]:
+        """Allocate temporary blocks not attached to any sequence table."""
+        if n <= 0:
+            return []
+        blocks = self._allocate_n_blocks(int(n))
+        return [b.block_id for b in blocks]
+
+    def release_scratch_blocks(self, block_ids: list[int]) -> None:
+        """Release temporary blocks allocated by ``allocate_scratch_blocks``."""
+        if not block_ids:
+            return
+        for bid in block_ids:
+            block = self.blocks[int(bid)]
+            block.ref_count -= 1
+            if block.ref_count == 0:
+                self._deallocate_block(int(bid))
+
     def make_fork_block_table(
         self,
         src_block_table: list[int],
