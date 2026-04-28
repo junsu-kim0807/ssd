@@ -143,6 +143,12 @@ def parse_arguments():
     parser.add_argument("--temp", type=float, default=0.0, help="Temperature for generation")
     parser.add_argument("--dtemp", type=float, default=None, help="Draft async temperature (overrides --temp)")
     parser.add_argument("--x", type=float, default=None, help="Sampler x for generation (Saguaro sampling coefficient)")
+    parser.add_argument(
+        "--ignore_eos",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="Whether to ignore EOS during generation. Default: True, except --aime defaults to False.",
+    )
 
     # Example mode
     parser.add_argument("--example", action="store_true", help="Use real prompts like in example.py and print generations (supports up to batch size 8)")
@@ -182,7 +188,12 @@ def parse_arguments():
     parser.add_argument("--random", action="store_true", help="Use random tokens instead of dataset prompts")
     parser.add_argument("--prompt_offset", type=int, default=0, help="Skip first N prompts per dataset (for variance testing)")
     parser.add_argument("--all", action="store_true", help="Use numseqs from each dataset (union dataset with numseqs*4 total)")
-    parser.add_argument("--chat_template", action="store_true", help="Wrap dataset prompts in chat template before tokenizing")
+    parser.add_argument(
+        "--chat_template",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="Wrap dataset prompts in chat template before tokenizing. Default: False, except --aime defaults to True.",
+    )
     parser.add_argument(
         "--prepare_data",
         action="store_true",
@@ -286,6 +297,13 @@ def parse_arguments():
             "--humaneval --alpaca --c4 --ultrafeedback --aime2025 --aime --livecodebench "
             "--codeelo --math500 --govreport --qa"
         )
+    if args.ignore_eos is None:
+        # AIME-style math prompts are prone to repetition when forcing generation to output_len.
+        # Keep legacy default for other datasets, but stop on EOS for --aime.
+        args.ignore_eos = not bool(getattr(args, "aime", False))
+    if args.chat_template is None:
+        # For AIME, use instruct-style prompt formatting by default.
+        args.chat_template = bool(getattr(args, "aime", False))
 
     _profile_engine = {"cost": "cost_breakdown", "metadata": "metadata", "cost_metadata": "cost_metadata"}
     _pod_raw = getattr(args, "profiler_output_dir", None) or ""
@@ -430,11 +448,13 @@ def initialize_wandb(args, run_name):
             "ultrafeedback_mode": args.ultrafeedback,
             "aime2025_mode": getattr(args, "aime2025", False),
             "aime_mode": getattr(args, "aime", False),
+            "ignore_eos": bool(getattr(args, "ignore_eos", True)),
             "livecodebench_mode": getattr(args, "livecodebench", False),
             "codeelo_mode": getattr(args, "codeelo", False),
             "math500_mode": getattr(args, "math500", False),
             "govreport_mode": getattr(args, "govreport", False),
             "benchmark_dataset": benchmark_dataset_label(args),
+            "chat_template": bool(getattr(args, "chat_template", False)),
             "random_mode": args.random,
             "all_mode": args.all,
             "sampler_x": args.x,
@@ -730,7 +750,7 @@ def main():
     sampling_params = [SamplingParams(
         temperature=args.temp,
         draft_temperature=args.dtemp,
-        ignore_eos=True,
+        ignore_eos=bool(args.ignore_eos),
         max_new_tokens=args.output_len,
     ) for _ in range(num_reqs)]
 
@@ -775,7 +795,7 @@ def main():
         cur_sampling_params = [SamplingParams(
             temperature=temp,
             draft_temperature=args.dtemp,
-            ignore_eos=True,
+            ignore_eos=bool(args.ignore_eos),
             max_new_tokens=args.output_len,
         ) for _ in range(num_reqs)]
 
