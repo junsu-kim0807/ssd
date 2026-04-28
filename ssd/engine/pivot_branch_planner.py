@@ -212,18 +212,18 @@ def build_pivot_expansion_plan(
         torch.full((bsz,), topk, dtype=torch.int64, device=device),
         torch.ones((bsz,), dtype=torch.int64, device=device),
     )
-    # One explicit sync to obtain expanded_batch_size; pass it to repeat_interleave
-    # so PyTorch does not insert hidden syncs to compute output sizes.
-    expanded_batch_size = int(branch_counts_t.sum().item())
     parent_ids = torch.arange(bsz, dtype=torch.int64, device=device)
-    parent_index_per_branch = torch.repeat_interleave(
-        parent_ids, branch_counts_t, output_size=expanded_batch_size
-    )
+    # NOTE: avoid ``output_size=...`` fast-path here. Some environments hit
+    # Repeat.cu device-asserts when provided output_size mismatches internal
+    # cumsum bookkeeping. Let ATen derive the output shape from repeats.
+    parent_index_per_branch = torch.repeat_interleave(parent_ids, branch_counts_t)
+    expanded_batch_size = int(parent_index_per_branch.numel())
     cum = torch.cumsum(branch_counts_t, dim=0)
     starts = cum - branch_counts_t
+    starts_per_branch = torch.repeat_interleave(starts, branch_counts_t)
     branch_index_per_parent = (
         torch.arange(expanded_batch_size, dtype=torch.int64, device=device)
-        - torch.repeat_interleave(starts, branch_counts_t, output_size=expanded_batch_size)
+        - starts_per_branch
     )
     root_token_ids = topk_ids[parent_index_per_branch, branch_index_per_parent]
     root_token_probs = topk_probs[parent_index_per_branch, branch_index_per_parent]
