@@ -573,7 +573,7 @@ class PivotRootSpeculatorSync(SpeculatorSync):
             target_cached0 = parent.num_cached_tokens
             draft_cached0 = parent.num_draft_cached_tokens
             inter_cached0 = parent.num_inter_cached_tokens
-            branch_seq = parent.clone_spec()
+            branch_seq = parent.clone_spec_for_branch()
             required_tokens = parent.num_tokens + self.lookahead
             if fork_target_kv:
                 t_plan = t_bm.make_cow_fork_block_table(
@@ -587,9 +587,10 @@ class PivotRootSpeculatorSync(SpeculatorSync):
                     target_cached0 // parent.block_size,
                     len(parent.block_table),
                 )
+                # ``fork_shared_prefix`` already returns a fresh list (block_manager.py:140).
                 fork_bt = t_bm.fork_shared_prefix(parent.block_table, n_share)
                 t_plan = CowForkPlan(
-                    fork_block_table=list(fork_bt),
+                    fork_block_table=fork_bt,
                     private_tail_block_ids=[],
                     shared_prefix_blocks=int(n_share),
                     copy_src_block_ids=[],
@@ -609,10 +610,12 @@ class PivotRootSpeculatorSync(SpeculatorSync):
                     required_total_tokens=required_tokens,
                 )
 
-            branch_seq.block_table = list(t_plan.fork_block_table)
-            branch_seq.draft_block_table = list(d_plan.fork_block_table)
+            # ``CowForkPlan`` lists are freshly built and owned by the caller
+            # (see ``BlockManager.make_cow_fork_block_table``); no need to copy.
+            branch_seq.block_table = t_plan.fork_block_table
+            branch_seq.draft_block_table = d_plan.fork_block_table
             if i_plan is not None:
-                branch_seq.inter_block_table = list(i_plan.fork_block_table)
+                branch_seq.inter_block_table = i_plan.fork_block_table
 
             if t_plan.copy_src_block_ids:
                 target_copy_src_all.extend(t_plan.copy_src_block_ids)
@@ -630,6 +633,15 @@ class PivotRootSpeculatorSync(SpeculatorSync):
                 inter_copy_valid_all.extend(i_plan.copy_valid_tokens)
                 num_inter_cow_copy_blocks += len(i_plan.copy_src_block_ids)
             branch_seq.append_token(int(root_token))
+            # Correctness checks for the tail-only ``_TokensView`` clone path.
+            # Pass 2 (parent branch-0 in-place append) has not run yet, so the
+            # parent's ``token_ids`` should still end at ``recovery``; the
+            # branch's view should expose exactly the parent prefix + root.
+            assert len(branch_seq.token_ids) == parent.num_tokens + 1
+            assert branch_seq.token_ids[parent.num_tokens] == int(root_token)
+            assert branch_seq.num_tokens == parent.num_tokens + 1
+            assert branch_seq.last_token == int(root_token)
+            assert parent.token_ids[-1] == recovery_tokens[int(parent_idx)]
             expanded_seqs[row_idx] = branch_seq
             st = BranchForkState(
                 parent_seq_idx=int(parent_idx),
@@ -641,10 +653,10 @@ class PivotRootSpeculatorSync(SpeculatorSync):
                 inter_shared_prefix_blocks=(
                     i_plan.shared_prefix_blocks if i_plan is not None else 0
                 ),
-                draft_private_tail_block_ids=list(d_plan.private_tail_block_ids),
-                target_private_tail_block_ids=list(t_plan.private_tail_block_ids),
+                draft_private_tail_block_ids=d_plan.private_tail_block_ids,
+                target_private_tail_block_ids=t_plan.private_tail_block_ids,
                 inter_private_tail_block_ids=(
-                    list(i_plan.private_tail_block_ids) if i_plan is not None else []
+                    i_plan.private_tail_block_ids if i_plan is not None else []
                 ),
                 is_parent_inplace=False,
             )
