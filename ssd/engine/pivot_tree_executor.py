@@ -6,7 +6,6 @@ import torch
 from ssd.engine.block_manager import BlockManager
 from ssd.engine.helpers.pivot_tree_helpers import (
     build_phase0_packed_inputs,
-    gather_logits_by_path,
 )
 from ssd.engine.helpers.speculate_types import (
     SpeculateResult,
@@ -438,7 +437,48 @@ class PivotTreeScratchExecutor(VerifierBase):
             packed.max_seqlen_q,
             packed.tree_attn_mask,
         )
-        logits_p = gather_logits_by_path(logits_tree_flat, bundle.path_node_ids)
+        if bool(getattr(getattr(self.scheduler, "config", None), "debug_mode", False)):
+            torch.cuda.synchronize()
+        flat_node_ids = [int(n) for row in bundle.path_node_ids for n in row]
+        expected_q = int(packed.input_ids.numel())
+        if bool(getattr(getattr(self.scheduler, "config", None), "debug_mode", False)):
+            print(
+                json.dumps(
+                    {
+                        "phase1a_logits_shape_debug": True,
+                        "logits_tree_shape": list(logits_tree_flat.shape),
+                        "expected_q": expected_q,
+                        "num_flat_node_ids": len(flat_node_ids),
+                        "min_node_id": (min(flat_node_ids) if flat_node_ids else None),
+                        "max_node_id": (max(flat_node_ids) if flat_node_ids else None),
+                        "path_rows": len(bundle.path_node_ids),
+                        "path_row_len": (len(bundle.path_node_ids[0]) if bundle.path_node_ids else 0),
+                        "packed_input_ids_numel": int(packed.input_ids.numel()),
+                    },
+                    ensure_ascii=False,
+                ),
+                flush=True,
+            )
+        assert logits_tree_flat.ndim == 2, (
+            f"expected flat logits [N,V], got shape={list(logits_tree_flat.shape)}"
+        )
+        assert int(logits_tree_flat.shape[0]) == expected_q, (
+            f"logits rows mismatch: logits={int(logits_tree_flat.shape[0])}, expected_q={expected_q}"
+        )
+        assert len(flat_node_ids) == expected_q
+        if flat_node_ids:
+            assert min(flat_node_ids) >= 0
+            assert max(flat_node_ids) < int(logits_tree_flat.shape[0]), (
+                f"path_node_ids OOB: max_node_id={max(flat_node_ids)}, "
+                f"logits_rows={int(logits_tree_flat.shape[0])}"
+            )
+        n_rows = len(bundle.path_node_ids)
+        row_len = len(bundle.path_node_ids[0]) if n_rows else 0
+        assert n_rows * row_len == expected_q, (
+            f"Phase1A row geometry mismatch: n_rows={n_rows}, row_len={row_len}, "
+            f"expected_q={expected_q}"
+        )
+        logits_p = logits_tree_flat.view(n_rows, row_len, -1)
         assert logits_p.shape[:2] == speculate_result.speculations.shape, (
             f"logits_p {logits_p.shape[:2]} vs speculations {speculate_result.speculations.shape[:2]}"
         )
