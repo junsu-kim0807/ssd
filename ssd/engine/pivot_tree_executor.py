@@ -86,7 +86,8 @@ class PivotTreeScratchExecutor(VerifierBase):
         speculate_result: SpeculateResult,
     ) -> None:
         """Phase-0 checks: compare flat verify logits against packed tree logits."""
-        if not bool(getattr(getattr(self.scheduler, "config", None), "debug_mode", False)):
+        cfg = getattr(self.scheduler, "config", None)
+        if not bool(getattr(cfg, "debug_phase0_flat_compare", False)):
             return
         spec_rows = speculate_result.speculations.detach().cpu().tolist()
         packed = build_phase0_packed_inputs(

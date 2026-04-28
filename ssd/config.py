@@ -92,6 +92,9 @@ class Config:
     max_steps: int | None = None
     # Pivot debug: force winning branch index (expanded ``branch_idx``) when set.
     debug_force_pivot_winner_branch: int | None = None
+    # Phase-0 debug compare runs an extra packed-tree target forward.
+    # Keep this opt-in and disabled by default.
+    debug_phase0_flat_compare: bool = False
     # Phase-1A debug compare runs an extra target forward and can perturb KV state.
     # Keep this opt-in and disabled by default.
     debug_phase1a_flat_compare: bool = False

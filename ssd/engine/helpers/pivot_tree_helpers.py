@@ -139,17 +139,33 @@ def build_phase0_packed_inputs(
     block_tables_host: list[list[int]] = []
     positions_host: list[int] = []
     slot_mapping_host: list[int] = []
+    pos0_per_row: list[int] = []
     for i, toks in enumerate(path_token_ids):
         seq = seqs[i if i < len(seqs) else 0]
         c = int(seq.num_tokens)
+        pos0 = c - row_len
+        pos0_per_row.append(pos0)
+        assert pos0 >= 0, (
+            f"phase0 pack invariant failed: negative pos0={pos0} "
+            f"(num_tokens={c}, row_len={row_len})"
+        )
+        assert int(seq.num_cached_tokens) == pos0, (
+            f"phase0 pack invariant failed: "
+            f"num_cached_tokens={seq.num_cached_tokens}, pos0={pos0}, "
+            f"num_tokens={seq.num_tokens}, row_len={row_len}"
+        )
         context_lens[i] = c
         bt = seq.draft_block_table if use_draft_table else seq.block_table
         block_tables_host.append([int(x) for x in bt])
         for j in range(len(toks)):
-            p = c + j
+            p = pos0 + j
             positions_host.append(p)
             bidx = p // block_size
             off = p % block_size
+            assert bidx < len(bt), (
+                f"phase0 pack block-table OOB: bidx={bidx}, len(bt)={len(bt)}, "
+                f"p={p}, block_size={block_size}, pos0={pos0}, row_len={row_len}"
+            )
             slot_mapping_host.append(int(bt[bidx]) * block_size + off)
     max_blocks = max(len(t) for t in block_tables_host)
     block_tables = torch.full((bsz, max_blocks), -1, dtype=torch.int32, device=device)
@@ -159,10 +175,7 @@ def build_phase0_packed_inputs(
     positions = torch.tensor(positions_host, dtype=torch.int64, device=device)
     slot_mapping = torch.tensor(slot_mapping_host, dtype=torch.int64, device=device)
     cu = torch.arange(0, bsz + 1, dtype=torch.int32, device=device) * row_len
-    mask = build_tree_mask(
-        [list(range(i * row_len, (i + 1) * row_len)) for i in range(bsz)],
-        device=device,
-    )
+    mask = build_rowwise_prefix_candidate_mask(pos0_per_row, row_len, device=device)
     return PackedTreeDecodeInputs(
         input_ids=input_ids,
         positions=positions,
