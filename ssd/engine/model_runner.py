@@ -917,6 +917,49 @@ class ModelRunner:
         return_logits: bool = True,
         model_override=None,
     ) -> torch.Tensor:
+        # TP workers can receive tensors materialized on rank0's device.
+        # Normalize all packed-tree inputs to this runner's local CUDA device.
+        input_ids = input_ids.to(
+            device=self.device, dtype=torch.int64, non_blocking=True
+        ).contiguous()
+        positions = positions.to(
+            device=self.device, dtype=torch.int64, non_blocking=True
+        ).contiguous()
+        slot_mapping = slot_mapping.to(
+            device=self.device, dtype=torch.int64, non_blocking=True
+        ).contiguous()
+        context_lens = context_lens.to(
+            device=self.device, dtype=torch.int32, non_blocking=True
+        ).contiguous()
+        block_tables = block_tables.to(
+            device=self.device, dtype=torch.int32, non_blocking=True
+        ).contiguous()
+        cu_seqlens_q = cu_seqlens_q.to(
+            device=self.device, dtype=torch.int32, non_blocking=True
+        ).contiguous()
+        if tree_attn_mask is not None:
+            tree_attn_mask = tree_attn_mask.to(
+                device=self.device,
+                dtype=torch.bool,
+                non_blocking=True,
+            ).contiguous()
+
+        if bool(getattr(self.config, "debug_mode", False)):
+            tensors = {
+                "input_ids": input_ids,
+                "positions": positions,
+                "slot_mapping": slot_mapping,
+                "context_lens": context_lens,
+                "block_tables": block_tables,
+                "cu_seqlens_q": cu_seqlens_q,
+                "tree_attn_mask": tree_attn_mask,
+            }
+            for name, t in tensors.items():
+                if t is not None:
+                    assert t.device == self.device, (
+                        f"run_packed_tree_decode {name} on {t.device}, expected {self.device}"
+                    )
+
         set_context(
             is_prefill=False,
             cu_seqlens_q=cu_seqlens_q,
@@ -1514,6 +1557,9 @@ class ModelRunner:
                         f"custom_mask length mismatch: got {int(ctx.custom_mask.numel())}, "
                         f"expected {expected_mask_len}"
                     )
+                custom_mask = (
+                    ctx.custom_mask.contiguous() if ctx.custom_mask is not None else None
+                )
                 self.only_prefill_wrapper.plan(
                     ctx.cu_seqlens_q.to(torch.int32),
                     kv_indptr,
@@ -1523,7 +1569,7 @@ class ModelRunner:
                     num_kv_heads_local,
                     self.decoder_hf_config.head_dim,
                     self.block_size,
-                    custom_mask=ctx.custom_mask,
+                    custom_mask=custom_mask,
                     q_data_type=self.decoder_hf_config.torch_dtype,
                     kv_data_type=self.decoder_hf_config.torch_dtype,
                 )
