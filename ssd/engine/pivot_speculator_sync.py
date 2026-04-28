@@ -3,7 +3,6 @@ from __future__ import annotations
 import json
 import numpy as np
 import os
-from pathlib import Path
 from time import perf_counter
 import torch
 
@@ -65,14 +64,9 @@ class PivotRootSpeculatorSync(SpeculatorSync):
             torch.cuda.synchronize()
 
     def _write_pivot_cost_row(self, row: dict) -> None:
-        if not self._pivot_cost_enabled():
-            return
-        cfg = self.scheduler.config
-        out_dir = Path(str(cfg.profiler_output_dir))
-        out_dir.mkdir(parents=True, exist_ok=True)
-        path = out_dir / f"pivot_draft_microcost.worker_{self._pivot_cost_writer_pid}.jsonl"
-        with path.open("a", encoding="utf-8") as f:
-            f.write(json.dumps(row, ensure_ascii=False) + "\n")
+        # Disabled: do not write legacy pivot microcost JSONL rows.
+        _ = row
+        return
 
     def _debug_pivot_expansion(
         self,
