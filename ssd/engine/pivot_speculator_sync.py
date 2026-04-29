@@ -373,6 +373,34 @@ class PivotRootSpeculatorSync(SpeculatorSync):
         kv_cache[:, :, dst_block_id, :valid_tokens].copy_(kv_cache[:, :, src_block_id, :valid_tokens])
 
     @staticmethod
+    def _copy_cow_block_full_batched(
+        kv_cache: torch.Tensor,
+        copy_src_block_ids: list[int],
+        copy_dst_block_ids: list[int],
+    ) -> None:
+        """Full-block batched COW copy.
+
+        Copies the entire block (all ``block_size`` token slots) from src to dst
+        in a single fancy-indexed scatter. Bytes copied per block are larger than
+        the partial-only path (block_size vs partial_tokens), but the kernel
+        launch and indexing cost is paid exactly once regardless of how many
+        distinct partial-token lengths the batch has.
+
+        Correctness: dst blocks are freshly allocated for the branch and the
+        ``[partial_tokens, block_size)`` tail region is overwritten by the
+        branch's draft rollout before it can be read. Overcopying parent's stale
+        KV into that region is therefore semantically inert.
+        """
+        if not copy_src_block_ids:
+            return
+        device = kv_cache.device
+        srcs_t = torch.as_tensor(copy_src_block_ids, dtype=torch.long, device=device)
+        dsts_t = torch.as_tensor(copy_dst_block_ids, dtype=torch.long, device=device)
+        # kv_cache shape: [2, layers, blocks, block_size, kv_heads, head_dim]
+        # (or any layout with blocks at dim=2). Drop the partial slice → full copy.
+        kv_cache[:, :, dsts_t] = kv_cache[:, :, srcs_t]
+
+    @staticmethod
     def _copy_partial_cow_block_batched(
         kv_cache: torch.Tensor,
         copy_src_block_ids: list[int],
@@ -419,6 +447,18 @@ class PivotRootSpeculatorSync(SpeculatorSync):
         copy_valid_tokens: list[int],
         kv_cache: torch.Tensor,
     ) -> None:
+        # ``SSD_PIVOT_DRAFT_COW_COPY_MODE``: "bucketed_partial" (default) or
+        # "full_block". Full-block trades extra bytes for a single kernel launch
+        # regardless of how many partial lengths the batch has — see
+        # ``_copy_cow_block_full_batched`` for the safety argument.
+        mode = os.environ.get("SSD_PIVOT_DRAFT_COW_COPY_MODE", "bucketed_partial")
+        if mode == "full_block":
+            self._copy_cow_block_full_batched(
+                kv_cache,
+                copy_src_block_ids,
+                copy_dst_block_ids,
+            )
+            return
         self._copy_partial_cow_block_batched(
             kv_cache,
             copy_src_block_ids,
@@ -708,8 +748,11 @@ class PivotRootSpeculatorSync(SpeculatorSync):
             branch_states[row_idx] = st
         t_branch_construct1 = perf_counter()
 
+        # Per-cache COW copy timing. Splitting the previous combined window into
+        # target/draft/inter is required to read the effect of any single-cache
+        # change (e.g. draft full-block mode) without target/inter noise.
         self._cuda_sync_for_pivot_cost()
-        t_cow_copy0 = perf_counter()
+        t_target_copy0 = perf_counter()
         if target_copy_src_all:
             # Must go through ``call`` so every target TP rank copies its shard.
             self.target_model_runner.call(
@@ -719,6 +762,10 @@ class PivotRootSpeculatorSync(SpeculatorSync):
                 target_copy_valid_all,
                 "target",
             )
+        self._cuda_sync_for_pivot_cost()
+        t_target_copy1 = perf_counter()
+
+        t_draft_copy0 = perf_counter()
         if draft_copy_src_all:
             self._copy_partial_cow_block(
                 copy_src_block_ids=draft_copy_src_all,
@@ -726,6 +773,10 @@ class PivotRootSpeculatorSync(SpeculatorSync):
                 copy_valid_tokens=draft_copy_valid_all,
                 kv_cache=self.draft_model_runner.kv_cache,
             )
+        self._cuda_sync_for_pivot_cost()
+        t_draft_copy1 = perf_counter()
+
+        t_inter_copy0 = perf_counter()
         if inter_copy_src_all and self.intermediate_runner is not None:
             self.intermediate_runner.call(
                 "copy_kv_blocks",
@@ -735,7 +786,7 @@ class PivotRootSpeculatorSync(SpeculatorSync):
                 "intermediate",
             )
         self._cuda_sync_for_pivot_cost()
-        t_cow_copy1 = perf_counter()
+        t_inter_copy1 = perf_counter()
 
         # Pass 2: branch 0 = parent in-place. Mutating ``parent.token_ids`` here is
         # safe — Pass 1 finished before this, and the outer step rolls the tape
@@ -824,7 +875,13 @@ class PivotRootSpeculatorSync(SpeculatorSync):
         )
         t_final_pack1 = perf_counter()
         branch_construct_s = t_branch_construct1 - t_branch_construct0
-        cow_copy_s = t_cow_copy1 - t_cow_copy0
+        target_cow_copy_s = t_target_copy1 - t_target_copy0
+        draft_cow_copy_s = t_draft_copy1 - t_draft_copy0
+        inter_cow_copy_s = t_inter_copy1 - t_inter_copy0
+        cow_copy_s = target_cow_copy_s + draft_cow_copy_s + inter_cow_copy_s
+        draft_cow_copy_mode = os.environ.get(
+            "SSD_PIVOT_DRAFT_COW_COPY_MODE", "bucketed_partial"
+        )
         branch0_setup_s = t_branch0_setup1 - t_branch0_setup0
         initial_pack_s = t_initial_pack1 - t_initial_pack0
         tail_draft_s = t_tail_draft1 - t_tail_draft0
@@ -846,6 +903,10 @@ class PivotRootSpeculatorSync(SpeculatorSync):
                 "pivot_branch0_override_s": float(t_cap2 - t_cap1),
                 "pivot_branch_construct_s": float(branch_construct_s),
                 "pivot_cow_copy_s": float(cow_copy_s),
+                "pivot_target_cow_copy_s": float(target_cow_copy_s),
+                "pivot_draft_cow_copy_s": float(draft_cow_copy_s),
+                "pivot_inter_cow_copy_s": float(inter_cow_copy_s),
+                "pivot_draft_cow_copy_mode": draft_cow_copy_mode,
                 "pivot_branch0_setup_s": float(branch0_setup_s),
                 "pivot_initial_pack_s": float(initial_pack_s),
                 "pivot_tail_draft_forward_s": float(tail_draft_s),
