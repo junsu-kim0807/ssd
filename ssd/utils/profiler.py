@@ -217,6 +217,8 @@ def summarize_pivot_microcost_rows(rows: list[dict[str, Any]]) -> dict[str, Any]
         "pivot_draft_cow_copy_time_s": pivot_draft_cow_copy_s,
         "pivot_inter_cow_copy_time_s": pivot_inter_cow_copy_s,
         "pivot_draft_cow_copy_mode": last_nonempty("pivot_draft_cow_copy_mode"),
+        "pivot_target_cow_copy_mode": last_nonempty("pivot_target_cow_copy_mode"),
+        "pivot_inter_cow_copy_mode": last_nonempty("pivot_inter_cow_copy_mode"),
         "avg_target_cow_copy_time_per_block": (
             pivot_target_cow_copy_s / num_target_cow_blocks
             if num_target_cow_blocks > 0
@@ -662,6 +664,14 @@ class SSDProfiler:
                         "pivot_draft_cow_copy_mode": (
                             "value of SSD_PIVOT_DRAFT_COW_COPY_MODE during the run "
                             "(bucketed_partial default; full_block trades extra bytes for one kernel launch)"
+                        ),
+                        "pivot_target_cow_copy_mode": (
+                            "value of SSD_PIVOT_TARGET_COW_COPY_MODE during the run "
+                            "(bucketed_partial default; full_block for ModelRunner.copy_kv_blocks target)"
+                        ),
+                        "pivot_inter_cow_copy_mode": (
+                            "value of SSD_PIVOT_INTER_COW_COPY_MODE during the run "
+                            "(bucketed_partial default; full_block for ModelRunner.copy_kv_blocks intermediate)"
                         ),
                         "avg_target_cow_copy_time_per_block": (
                             "pivot_target_cow_copy_time_s / pivot_num_target_cow_copy_blocks"

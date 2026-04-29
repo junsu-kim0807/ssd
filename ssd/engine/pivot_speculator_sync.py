@@ -882,6 +882,12 @@ class PivotRootSpeculatorSync(SpeculatorSync):
         draft_cow_copy_mode = os.environ.get(
             "SSD_PIVOT_DRAFT_COW_COPY_MODE", "bucketed_partial"
         )
+        target_cow_copy_mode = os.environ.get(
+            "SSD_PIVOT_TARGET_COW_COPY_MODE", "bucketed_partial"
+        )
+        inter_cow_copy_mode = os.environ.get(
+            "SSD_PIVOT_INTER_COW_COPY_MODE", "bucketed_partial"
+        )
         branch0_setup_s = t_branch0_setup1 - t_branch0_setup0
         initial_pack_s = t_initial_pack1 - t_initial_pack0
         tail_draft_s = t_tail_draft1 - t_tail_draft0
@@ -907,6 +913,8 @@ class PivotRootSpeculatorSync(SpeculatorSync):
                 "pivot_draft_cow_copy_s": float(draft_cow_copy_s),
                 "pivot_inter_cow_copy_s": float(inter_cow_copy_s),
                 "pivot_draft_cow_copy_mode": draft_cow_copy_mode,
+                "pivot_target_cow_copy_mode": target_cow_copy_mode,
+                "pivot_inter_cow_copy_mode": inter_cow_copy_mode,
                 "pivot_branch0_setup_s": float(branch0_setup_s),
                 "pivot_initial_pack_s": float(initial_pack_s),
                 "pivot_tail_draft_forward_s": float(tail_draft_s),
