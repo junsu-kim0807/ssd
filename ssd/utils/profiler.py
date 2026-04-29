@@ -174,9 +174,23 @@ def summarize_pivot_microcost_rows(rows: list[dict[str, Any]]) -> dict[str, Any]
     def isum(key: str) -> int:
         return int(sum(int(r.get(key, 0) or 0) for r in rows))
 
+    def last_nonempty(key: str) -> str | None:
+        v: str | None = None
+        for r in rows:
+            x = r.get(key)
+            if x:
+                v = str(x)
+        return v
+
     n = len(rows)
     pivot_branch_construct_s = fsum("pivot_branch_construct_s")
     pivot_cow_copy_s = fsum("pivot_cow_copy_s")
+    pivot_target_cow_copy_s = fsum("pivot_target_cow_copy_s")
+    pivot_draft_cow_copy_s = fsum("pivot_draft_cow_copy_s")
+    pivot_inter_cow_copy_s = fsum("pivot_inter_cow_copy_s")
+    num_target_cow_blocks = isum("num_target_cow_copy_blocks")
+    num_draft_cow_blocks = isum("num_draft_cow_copy_blocks")
+    num_inter_cow_blocks = isum("num_inter_cow_copy_blocks")
     pivot_branch0_setup_s = fsum("pivot_branch0_setup_s")
     pivot_expand_pack_s = fsum("pivot_expand_pack_s")
     pivot_cow_plus_expansion_s = (
@@ -199,6 +213,25 @@ def summarize_pivot_microcost_rows(rows: list[dict[str, Any]]) -> dict[str, Any]
         "pivot_branch0_override_time_s": fsum("pivot_branch0_override_s"),
         "pivot_branch_construct_time_s": pivot_branch_construct_s,
         "pivot_cow_copy_time_s": pivot_cow_copy_s,
+        "pivot_target_cow_copy_time_s": pivot_target_cow_copy_s,
+        "pivot_draft_cow_copy_time_s": pivot_draft_cow_copy_s,
+        "pivot_inter_cow_copy_time_s": pivot_inter_cow_copy_s,
+        "pivot_draft_cow_copy_mode": last_nonempty("pivot_draft_cow_copy_mode"),
+        "avg_target_cow_copy_time_per_block": (
+            pivot_target_cow_copy_s / num_target_cow_blocks
+            if num_target_cow_blocks > 0
+            else None
+        ),
+        "avg_draft_cow_copy_time_per_block": (
+            pivot_draft_cow_copy_s / num_draft_cow_blocks
+            if num_draft_cow_blocks > 0
+            else None
+        ),
+        "avg_inter_cow_copy_time_per_block": (
+            pivot_inter_cow_copy_s / num_inter_cow_blocks
+            if num_inter_cow_blocks > 0
+            else None
+        ),
         "pivot_branch0_setup_time_s": pivot_branch0_setup_s,
         "pivot_expand_pack_time_s": pivot_expand_pack_s,
         "pivot_cow_plus_expansion_time_s": pivot_cow_plus_expansion_s,
@@ -206,9 +239,9 @@ def summarize_pivot_microcost_rows(rows: list[dict[str, Any]]) -> dict[str, Any]
         "pivot_tail_draft_forward_time_s": fsum("pivot_tail_draft_forward_s"),
         "pivot_extra_draft_forward_time_s": fsum("pivot_extra_draft_forward_s"),
         "pivot_num_nonzero_branches": isum("num_nonzero_branches"),
-        "pivot_num_target_cow_copy_blocks": isum("num_target_cow_copy_blocks"),
-        "pivot_num_draft_cow_copy_blocks": isum("num_draft_cow_copy_blocks"),
-        "pivot_num_inter_cow_copy_blocks": isum("num_inter_cow_copy_blocks"),
+        "pivot_num_target_cow_copy_blocks": num_target_cow_blocks,
+        "pivot_num_draft_cow_copy_blocks": num_draft_cow_blocks,
+        "pivot_num_inter_cow_copy_blocks": num_inter_cow_blocks,
         "avg_pivot_cow_plus_expansion_time_per_step": (
             pivot_cow_plus_expansion_s / n if n > 0 else None
         ),
@@ -613,7 +646,31 @@ class SSDProfiler:
                         "pivot_cow_copy_time_s": (
                             "partial COW KV copy wall time summed over pivot root-expansion steps "
                             "(in-memory during the run, or legacy pivot_draft_microcost JSONL); "
-                            "alias: pivot_cow_time_s. Set SSD_PROFILE_PIVOT_SYNC=1 for synchronized GPU timing"
+                            "alias: pivot_cow_time_s. Set SSD_PROFILE_PIVOT_SYNC=1 for synchronized GPU timing. "
+                            "Equals pivot_target_cow_copy_time_s + pivot_draft_cow_copy_time_s + pivot_inter_cow_copy_time_s"
+                        ),
+                        "pivot_target_cow_copy_time_s": (
+                            "target KV copy wall time only (target_model_runner.copy_kv_blocks)"
+                        ),
+                        "pivot_draft_cow_copy_time_s": (
+                            "draft KV copy wall time only (mode controlled by SSD_PIVOT_DRAFT_COW_COPY_MODE: "
+                            "bucketed_partial | full_block)"
+                        ),
+                        "pivot_inter_cow_copy_time_s": (
+                            "intermediate KV copy wall time only; 0 when no intermediate runner"
+                        ),
+                        "pivot_draft_cow_copy_mode": (
+                            "value of SSD_PIVOT_DRAFT_COW_COPY_MODE during the run "
+                            "(bucketed_partial default; full_block trades extra bytes for one kernel launch)"
+                        ),
+                        "avg_target_cow_copy_time_per_block": (
+                            "pivot_target_cow_copy_time_s / pivot_num_target_cow_copy_blocks"
+                        ),
+                        "avg_draft_cow_copy_time_per_block": (
+                            "pivot_draft_cow_copy_time_s / pivot_num_draft_cow_copy_blocks"
+                        ),
+                        "avg_inter_cow_copy_time_per_block": (
+                            "pivot_inter_cow_copy_time_s / pivot_num_inter_cow_copy_blocks"
                         ),
                         "pivot_expansion_time_s": (
                             "wall time for branch fork + COW + branch-0 in-place + host/GPU pack "
