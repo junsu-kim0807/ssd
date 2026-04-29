@@ -29,7 +29,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from time import perf_counter
 from typing import Any, Literal, Protocol
-from ssd.engine.spec_policy_traits import uses_hierarchical_verify
+from ssd.engine.spec_policy_traits import uses_hierarchical_verify, uses_pivot_root_expansion
 
 ProfilerMode = Literal["cost_breakdown", "metadata", "cost_metadata", "kernel_breakdown"]
 
@@ -619,10 +619,6 @@ class SSDProfiler:
             nm_tgt = int(self._num_target_verification_requests)
             nm_ver = int(self._num_verification_requests)
 
-            payload["avg_draft_time_per_batch"] = _per_batch_norm_wall(
-                float(self._run_draft_s), nd, avg_decode_bsz_f
-            )
-
             if uses_hierarchical_verify(self._spec_policy):
                 payload["avg_intermediate_verification_time_per_batch"] = _per_batch_norm_wall(
                     float(self._run_hv_inter_verify_s), nm_inter, avg_decode_bsz_f
@@ -699,6 +695,36 @@ class SSDProfiler:
                         ),
                     }
                 )
+
+            gross_draft_s = float(self._run_draft_s)
+            draft_for_norm = gross_draft_s
+            pivot_net_draft = False
+            if uses_pivot_root_expansion(self._spec_policy) and pivot_microcost:
+                oh = float(pivot_microcost.get("pivot_full_expansion_overhead_time_s") or 0.0)
+                if oh > 0.0:
+                    draft_for_norm = max(0.0, gross_draft_s - oh)
+                    pivot_net_draft = True
+            if pivot_net_draft:
+                payload["draft_time_s"] = draft_for_norm
+                payload["draft_time_s_including_pivot_expansion_overhead"] = gross_draft_s
+                payload["notes"]["draft_time_s"] = (
+                    "For spec_policy in {pivot, pivot_tree_scratch, pivot_hierarchical}: draft-stage wall "
+                    "minus pivot_full_expansion_overhead_time_s (remainder: first-step draft forward inside "
+                    "speculate, tail/extra draft forwards, and any draft time outside microcost spans). "
+                    "Gross draft-stage wall is draft_time_s_including_pivot_expansion_overhead."
+                )
+                payload["notes"]["draft_time_s_including_pivot_expansion_overhead"] = (
+                    "Unadjusted rank0 draft-stage wall (sync) or draft worker wall (async); includes time counted "
+                    "again in pivot_full_expansion_overhead_time_s."
+                )
+                payload["notes"]["avg_draft_time_per_batch"] = (
+                    "Uses net draft_time_s (after subtracting pivot_full_expansion_overhead_time_s when present) "
+                    "with the same num_draft / avg_decode_scheduled_batch_size denominator."
+                )
+
+            payload["avg_draft_time_per_batch"] = _per_batch_norm_wall(
+                draft_for_norm, nd, avg_decode_bsz_f
+            )
 
             self._sink.write_cost_breakdown(payload)
 

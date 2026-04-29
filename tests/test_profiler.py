@@ -414,6 +414,51 @@ def test_cost_breakdown_pivot_microcost_inline_no_jsonl(tmp_path):
     assert abs(data["pivot_expansion_time_s"] - 22.0) < 1e-9
 
 
+def test_cost_breakdown_pivot_draft_time_nets_full_expansion_overhead(tmp_path):
+    """pivot: draft_time_s and avg_draft_time_per_batch exclude pivot_full_expansion_overhead_time_s."""
+    p = SSDProfiler(
+        _prof_cfg(
+            profiler_mode="cost_breakdown",
+            profiler_output_dir=str(tmp_path),
+            spec_policy="pivot",
+        )
+    )
+
+    class S:
+        seq_id = 0
+
+    p.start_run(SimpleNamespace(), None)
+    p.start_step([S(), S()], is_prefill=False)
+    p.bump_draft_requests(2)
+    p.finish_step(1)
+    p._run_draft_s = 100.0
+    p.accumulate_pivot_microcost_row(
+        {
+            "pivot_plan_build_s": 1.0,
+            "pivot_capacity_clamp_s": 2.0,
+            "pivot_branch0_override_s": 3.0,
+            "pivot_branch_construct_s": 4.0,
+            "pivot_cow_copy_s": 5.0,
+            "pivot_branch0_setup_s": 6.0,
+            "pivot_expand_pack_s": 7.0,
+            "pivot_tail_draft_forward_s": 8.0,
+            "pivot_extra_draft_forward_s": 9.0,
+            "num_nonzero_branches": 10,
+            "num_target_cow_copy_blocks": 11,
+            "num_draft_cow_copy_blocks": 12,
+            "num_inter_cow_copy_blocks": 13,
+        }
+    )
+    p.finish_run()
+
+    data = json.loads((tmp_path / "cost_breakdown.json").read_text())
+    assert abs(data["pivot_full_expansion_overhead_time_s"] - 28.0) < 1e-9
+    assert abs(data["draft_time_s"] - 72.0) < 1e-9
+    assert abs(data["draft_time_s_including_pivot_expansion_overhead"] - 100.0) < 1e-9
+    assert data["avg_draft_time_per_batch"] is not None
+    assert abs(data["avg_draft_time_per_batch"] - 72.0) < 1e-9
+
+
 def test_profile_greedy_token_confidence_not_all_ones():
     from ssd.utils.profiler_metadata import profile_greedy_token_confidence
 
