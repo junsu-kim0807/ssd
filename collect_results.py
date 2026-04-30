@@ -48,6 +48,7 @@ from __future__ import annotations
 import argparse
 import json
 import math
+import re
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 
@@ -61,6 +62,11 @@ def _to_number_if_clean(value: str) -> Any:
     """Convert numeric-looking strings to int or float. Otherwise return original string."""
     if value == "":
         return value
+
+    # Support compact decimal tags used in paths: 0p3 -> 0.3, 1p0 -> 1.0
+    compact_decimal = re.fullmatch(r"-?\d+p\d+", value)
+    if compact_decimal:
+        value = value.replace("p", ".", 1)
 
     try:
         as_float = float(value)
@@ -81,6 +87,13 @@ def _parse_prefixed_int(tag: str, prefix: str, field_name: str) -> int:
         raise ValueError(f"Missing numeric value in {field_name} tag: {tag!r}")
 
     return int(raw)
+
+
+def _parse_k_tag(tag: str) -> int | None:
+    """Parse speculative-length path tag: k<int> or kna."""
+    if tag == "kna":
+        return None
+    return _parse_prefixed_int(tag, "k", "speculative_length")
 
 
 def _parse_prefixed_number(tag: str, prefix: str, field_name: str) -> Any:
@@ -163,18 +176,50 @@ def parse_context(run_dir: Path, keyed_root: Path) -> Dict[str, Any]:
     except ValueError:
         parts = run_dir.parts
 
-    if len(parts) < 6:
-        raise ValueError(
-            f"Cannot parse run context from {run_dir}. Expected at least 6 path components "
-            f"under keyed root: method/b*/k*/target+draft/t*/dataset"
-        )
+    pivot_expansion_policy: str | None = None
+    pivot_round: Any | None = None
+    pivot_topk: int | None = None
+    pivot_expansion_pct: Any | None = None
 
-    method = parts[0]
-    batch_size = _parse_prefixed_int(parts[1], "b", "batch size")
-    speculative_length = _parse_prefixed_int(parts[2], "k", "speculative_length")
-    model_pair = parts[3]
-    temperature = _parse_prefixed_number(parts[4], "t", "temperature")
-    dataset = parts[5]
+    if len(parts) >= 10 and parts[0] == "pivot" and parts[1] in {"dynamic", "static"}:
+        # New pivot layout:
+        # pivot/<policy>/b*/k*/pair/t*/r_*/topk*/pct*/dataset
+        method = "pivot"
+        pivot_expansion_policy = parts[1]
+        batch_size = _parse_prefixed_int(parts[2], "b", "batch size")
+        speculative_length = _parse_k_tag(parts[3])
+        model_pair = parts[4]
+        temperature = _parse_prefixed_number(parts[5], "t", "temperature")
+        pivot_round = _parse_prefixed_number(parts[6], "r_", "pivot round")
+        pivot_topk = _parse_prefixed_int(parts[7], "topk", "pivot_topk")
+        pivot_expansion_pct = _parse_prefixed_number(parts[8], "pct", "pivot_expansion_pct")
+        dataset = parts[9]
+    elif len(parts) >= 9 and parts[0] == "pivot":
+        # Legacy pivot layout:
+        # pivot/b*/k*/pair/t*/r_*/topk*/pct*/dataset
+        method = "pivot"
+        batch_size = _parse_prefixed_int(parts[1], "b", "batch size")
+        speculative_length = _parse_k_tag(parts[2])
+        model_pair = parts[3]
+        temperature = _parse_prefixed_number(parts[4], "t", "temperature")
+        pivot_round = _parse_prefixed_number(parts[5], "r_", "pivot round")
+        pivot_topk = _parse_prefixed_int(parts[6], "topk", "pivot_topk")
+        pivot_expansion_pct = _parse_prefixed_number(parts[7], "pct", "pivot_expansion_pct")
+        dataset = parts[8]
+    else:
+        if len(parts) < 6:
+            raise ValueError(
+                f"Cannot parse run context from {run_dir}. Expected at least 6 path components "
+                f"under keyed root: method/b*/k*/target+draft/t*/dataset"
+            )
+        # Legacy/default layout:
+        # method/b*/k*/pair/t*/dataset
+        method = parts[0]
+        batch_size = _parse_prefixed_int(parts[1], "b", "batch size")
+        speculative_length = _parse_k_tag(parts[2])
+        model_pair = parts[3]
+        temperature = _parse_prefixed_number(parts[4], "t", "temperature")
+        dataset = parts[5]
 
     model_components = model_pair.split("+")
     target_model = model_components[0] if model_components else None
@@ -193,6 +238,14 @@ def parse_context(run_dir: Path, keyed_root: Path) -> Dict[str, Any]:
 
     if len(model_components) > 2:
         ctx["intermediate_models"] = model_components[1:-1]
+    if pivot_expansion_policy is not None:
+        ctx["pivot_expansion_policy"] = pivot_expansion_policy
+    if pivot_round is not None:
+        ctx["pivot_round"] = pivot_round
+    if pivot_topk is not None:
+        ctx["pivot_topk"] = pivot_topk
+    if pivot_expansion_pct is not None:
+        ctx["pivot_expansion_pct"] = pivot_expansion_pct
 
     return ctx
 

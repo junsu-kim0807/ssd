@@ -100,6 +100,12 @@ class Config:
     debug_phase1a_flat_compare: bool = False
     # Phase-2 draft scratch production gate (off by default).
     enable_pivot_draft_scratch_phase2: bool = False
+    # Flat pivot target-scratch verify (PivotTree-isolated). When True with
+    # spec_policy="pivot" and not use_eagle, target verify writes into scratch
+    # KV slots instead of COW-forking the parent target block table; the winner
+    # branch's accepted suffix is then slot-copied into the parent. Draft COW is
+    # unchanged. Requires enforce_eager=True for the first implementation.
+    pivot_target_scratch: bool = False
 
     # Profiling (disabled when profiler_output_dir is empty / None)
     profiler_mode: Literal[
@@ -168,6 +174,22 @@ class Config:
                 raise ValueError("pivot_max_root_branches must be >= 1 when set")
             if self.pivot_topk == 1 and self.spec_policy in {"pivot", "pivot_hierarchical"}:
                 print("[Config] pivot_topk=1: root expansion is effectively disabled.", flush=True)
+            # ``pivot_target_scratch`` is only meaningful for spec_policy="pivot"
+            # (flat pivot). Other policies have their own scratch paths or no
+            # target COW to skip.
+            if self.pivot_target_scratch:
+                if self.spec_policy != "pivot":
+                    raise ValueError(
+                        "pivot_target_scratch=True requires spec_policy='pivot' "
+                        f"(got {self.spec_policy!r})"
+                    )
+                if self.use_eagle:
+                    raise ValueError("pivot_target_scratch is not compatible with use_eagle=True")
+                if not self.enforce_eager:
+                    raise NotImplementedError(
+                        "pivot_target_scratch currently requires enforce_eager=True "
+                        "(CUDA graph capture for the scratch verify path is a follow-up)"
+                    )
 
             if uses_pivot_root_expansion(self.spec_policy):
                 assert not self.draft_async, f"{self.spec_policy} requires draft_async=False (sync spec)"

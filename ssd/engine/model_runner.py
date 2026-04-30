@@ -863,7 +863,7 @@ class ModelRunner:
             mode_env = "SSD_PIVOT_TARGET_COW_COPY_MODE"
         else:  # intermediate
             mode_env = "SSD_PIVOT_INTER_COW_COPY_MODE"
-        mode = os.environ.get(mode_env, "bucketed_partial")
+        mode = os.environ.get(mode_env, "full_block")
 
         if mode == "full_block":
             # Filter out v<=0 entries (parity with bucketed path).

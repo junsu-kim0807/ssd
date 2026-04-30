@@ -41,6 +41,12 @@ class PivotBranchBundle:
     host_plan: "PivotHostPlan"
     expanded_seqs: list["Sequence"] | None = None
     branch_states: list[BranchForkState] | None = None
+    # Flat-pivot target-scratch flag. When True, the speculator skipped target
+    # COW fork construction and the executor must take the
+    # ``_verify_expanded_target_scratch`` path. The verify path owns the
+    # corresponding ``FlatPivotTargetScratchOwner``; this bundle does not carry
+    # it (per Δ2: speculator must not know about target scratch allocation).
+    target_scratch_enabled: bool = False
 
     @property
     def parent_index_per_branch(self) -> list[int]:

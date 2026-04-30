@@ -6,6 +6,7 @@ from typing import TYPE_CHECKING, Literal
 
 if TYPE_CHECKING:
     from ssd.engine.pivot_types import PivotBranchBundle, PivotTreeCommitBundle, PivotTreeScratchBundle
+    from ssd.engine.pivot_flat_scratch_types import FlatPivotTargetScratchCommitBundle
 
 
 @dataclass
@@ -64,6 +65,10 @@ class VerifyResult:
     pivot_before_expansion_batch_size: int | None = None
     pivot_after_expansion_batch_size: int | None = None
     scratch_commit_bundle: "PivotTreeCommitBundle | None" = None
+    # Flat-pivot target-scratch commit bundle. Kept disjoint from
+    # ``scratch_commit_bundle`` (PivotTree) so the two postprocess paths cannot
+    # collide. Only set by ``PivotExecutorFlat._verify_expanded_target_scratch``.
+    flat_target_scratch_commit_bundle: "FlatPivotTargetScratchCommitBundle | None" = None
 
 
 class SpeculatorBase(ABC):

@@ -28,12 +28,14 @@ def get_server_cmd(args):
     from bench_helpers import get_model_paths
     _, target, draft = get_model_paths(args)
 
+    # Must be >= eval client --b if multiple sequences can be in flight (see vllm_eval_client).
+    max_seqs = max(1, int(getattr(args, "b", 1)))
     cmd = [
         sys.executable, "-m", "vllm.entrypoints.openai.api_server",
         "--model", target,
         "--tensor-parallel-size", str(args.tp),
         "--gpu-memory-utilization", str(args.mem_frac),
-        "--max-num-seqs", "1",
+        "--max-num-seqs", str(max_seqs),
         "--disable-log-requests",
         "--port", str(args.port),
     ]

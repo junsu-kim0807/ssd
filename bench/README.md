@@ -14,25 +14,31 @@ each forward pass takes much longer than an HTTP round-trip), we find the differ
 
 ## Setup
 
-Use separate envs for all three stacks (`ssd`, `sglang`, `vllm`) because required FlashInfer versions by each conflict. 
+Use separate envs for all three stacks (`ssd`, `sglang`, `vllm`) because required FlashInfer versions by each conflict. All examples below use **uv** for venvs and installs.
 
 ```bash
-# SSD (from repo root)
-# uses pyproject.toml + uv.lock
+# SSD (from repo root) — pyproject.toml + uv.lock
 uv sync
+# activate: source .venv/bin/activate   # uv creates .venv by default
 
-# SGLang 0.5.9
-conda create -n sglang python=3.11
-conda activate sglang
-pip install "sglang[all]==0.5.9"
+# SGLang 0.5.9 (separate venv directory next to the repo or inside it)
+cd /path/to/ssd
+uv venv .venv-sglang --python 3.11
+source .venv-sglang/bin/activate
+uv pip install "sglang[all]==0.5.9" transformers aiohttp
+# optional: uv pip install wandb
 
 # vLLM 0.16.0
-conda create -n vllm016 python=3.11
-conda activate vllm016
-pip install "vllm==0.16.0"
+uv venv .venv-vllm --python 3.11
+source .venv-vllm/bin/activate
+uv pip install "vllm==0.16.0" transformers aiohttp
+# optional: uv pip install wandb
 ```
 
-SGLang/vLLM envs also need: `transformers`, `aiohttp`, `wandb` (optional).
+To run a bench without `activate`, call the venv’s interpreter directly, e.g.  
+`.venv-sglang/bin/python bench/run_sglang_bench.py ...`
+
+SGLang/vLLM envs also need: `transformers`, `aiohttp`, `wandb` (optional; shown inline above).
 
 ## Model paths
 
@@ -62,7 +68,7 @@ python -O bench.py --llama --size 70 --async --spec --k 7 --f 3 --b 1 \
 
 ### SGLang
 ```bash
-conda activate sglang
+source .venv-sglang/bin/activate   # or your path to the SGLang uv venv
 # Speculative decoding (default):
 python bench/run_sglang_bench.py --llama
 # Autoregressive baseline:
@@ -73,7 +79,7 @@ python bench/run_sglang_bench.py --llama --wandb --group mygroup --name myrun
 
 ### vLLM
 ```bash
-conda activate vllm016
+source .venv-vllm/bin/activate   # or your path to the vLLM uv venv
 # Speculative decoding (default):
 python bench/run_vllm_bench.py --llama
 # Autoregressive baseline:

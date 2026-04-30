@@ -347,7 +347,23 @@ class SpecDecodeStep(InferenceStep):
                         eagle_acts=out_verify_result.eagle_acts if self.eagle else None,
                     )
             else:
-                if pivot_tree_policy:
+                # Flat-pivot target-scratch path is gated by the verify-time
+                # bundle, NOT by spec_policy alone (so spec_policy="pivot" can
+                # still take the COW path when ``pivot_target_scratch`` is off
+                # or when capacity clamp falls back per-step).
+                flat_commit = getattr(
+                    out_verify_result, "flat_target_scratch_commit_bundle", None
+                )
+                if flat_commit is not None:
+                    self.scheduler.postprocess_pivot_target_scratch(
+                        seqs,
+                        out_verify_result.new_suffixes,
+                        out_verify_result.recovery_tokens,
+                        flat_commit,
+                        target_model_runner=getattr(self.verifier, "target_model_runner", None),
+                        eagle_acts=out_verify_result.eagle_acts if self.eagle else None,
+                    )
+                elif pivot_tree_policy:
                     self.scheduler.postprocess_pivot_tree_scratch(
                         seqs,
                         out_verify_result.new_suffixes,
@@ -422,6 +438,14 @@ class SpecDecodeStep(InferenceStep):
                 scratch_owner.release_unreleased(
                     self.scheduler.block_manager, self.scheduler.draft_block_manager
                 )
+            # Flat-pivot target-scratch defensive release. ``release_unreleased``
+            # is idempotent so this is a no-op when the postprocess path already
+            # released; it only matters when an exception bypassed postprocess.
+            flat_commit = getattr(
+                out_verify_result, "flat_target_scratch_commit_bundle", None
+            )
+            if flat_commit is not None:
+                flat_commit.scratch_owner.release_unreleased(self.scheduler.block_manager)
 
         if _prof:
             torch.cuda.synchronize()

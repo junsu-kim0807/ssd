@@ -27,12 +27,14 @@ def get_server_cmd(args):
     from bench_helpers import get_model_paths
     _, target, draft = get_model_paths(args)
 
+    # Must be >= eval client --b so concurrent /generate calls are not over-serialized.
+    max_run = max(1, int(getattr(args, "b", 1)))
     cmd = [
         sys.executable, "-m", "sglang.launch_server",
         "--model-path", target,
         "--tp", str(args.tp),
         "--mem-fraction-static", str(args.mem_frac),
-        "--max-running-requests", "1",
+        "--max-running-requests", str(max_run),
         "--disable-radix-cache",
         "--log-level", "warning",
         "--port", str(args.port),

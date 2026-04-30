@@ -13,6 +13,13 @@ from ssd.engine.helpers.speculate_types import (
     VerifyResult,
     VerifierBase,
 )
+from ssd.engine.pivot_flat_scratch_types import (
+    FlatPivotTargetScratchCommitBundle,
+    FlatPivotTargetScratchPackedInputs,
+)
+from ssd.engine.pivot_target_scratch_helpers import (
+    build_flat_pivot_target_scratch_packed_inputs,
+)
 from ssd.engine.pivot_types import BranchForkState, PivotBranchBundle
 from ssd.engine.scheduler import Scheduler
 from ssd.engine.model_runner import ModelRunner
@@ -97,6 +104,12 @@ class PivotExecutorFlat(VerifierBase):
         t_bm: BlockManager = self.scheduler.block_manager
         d_bm: BlockManager = self.scheduler.draft_block_manager
         i_bm: BlockManager | None = self.scheduler.intermediate_block_manager
+        # Target-scratch mode: speculator did NOT fork target KV, so target
+        # bookkeeping fields (target_shared_prefix_blocks, target_private_tail_block_ids)
+        # are zero/empty. Calling _replace_parent_tail with shared_prefix=0 and
+        # tail=[] would release ALL of parent.block_table and replace with [],
+        # corrupting the target KV. Skip every target-side action under this mode.
+        target_scratch = bool(getattr(bundle, "target_scratch_enabled", False))
 
         # Pass 1: graft winner private tails onto the parent block tables.
         # We iterate this pass first so loser releases (which only touch their
@@ -109,12 +122,13 @@ class PivotExecutorFlat(VerifierBase):
                 # Branch 0 won — parent block tables already hold the correct KV.
                 continue
             parent = parent_seqs[st.parent_seq_idx]
-            parent.block_table = self._replace_parent_tail(
-                t_bm,
-                parent.block_table,
-                st.target_shared_prefix_blocks,
-                st.target_private_tail_block_ids,
-            )
+            if not target_scratch:
+                parent.block_table = self._replace_parent_tail(
+                    t_bm,
+                    parent.block_table,
+                    st.target_shared_prefix_blocks,
+                    st.target_private_tail_block_ids,
+                )
             parent.draft_block_table = self._replace_parent_tail(
                 d_bm,
                 parent.draft_block_table,
@@ -158,11 +172,12 @@ class PivotExecutorFlat(VerifierBase):
             if st.is_parent_inplace:
                 continue
             pidx = st.parent_seq_idx
-            parent_alt_count_t[pidx] += 1
+            if not target_scratch:
+                parent_alt_count_t[pidx] += 1
+                parent_t_shared[pidx] = st.target_shared_prefix_blocks
             parent_alt_count_d[pidx] += 1
             # ``shared_prefix_blocks`` is a function of parent state alone, so
             # all alt branches of a parent agree; storing per-parent is fine.
-            parent_t_shared[pidx] = st.target_shared_prefix_blocks
             parent_d_shared[pidx] = st.draft_shared_prefix_blocks
             if has_inter:
                 parent_alt_count_i[pidx] += 1
@@ -170,7 +185,8 @@ class PivotExecutorFlat(VerifierBase):
 
             if st.branch_idx != winners_per_parent[pidx]:
                 # Loser: private tails dealloc'd in bulk below.
-                loser_t_tails.extend(st.target_private_tail_block_ids)
+                if not target_scratch:
+                    loser_t_tails.extend(st.target_private_tail_block_ids)
                 loser_d_tails.extend(st.draft_private_tail_block_ids)
                 if has_inter:
                     loser_i_tails.extend(st.inter_private_tail_block_ids)
@@ -179,6 +195,7 @@ class PivotExecutorFlat(VerifierBase):
         # Batched shared-prefix ref_count decrement per parent.
         # parent.block_table[:shared] holds the shared prefix block ids
         # (Pass 1's graft only replaces the tail).
+        # Target side is skipped under target-scratch mode (no fork existed).
         for pidx, count in parent_alt_count_t.items():
             t_bm.release_shared_prefix_n(
                 parent_seqs[pidx].block_table, parent_t_shared[pidx], count
@@ -248,12 +265,98 @@ class PivotExecutorFlat(VerifierBase):
         accept_len = [max(0, len(s) - 1) for s in suffixes]
         return _BranchVerifyOutcome(suffixes=suffixes, recovery=recovery, accept_len=accept_len)
 
+    def _verify_expanded_target_scratch(
+        self,
+        parent_seqs: list[Sequence],
+        bundle: PivotBranchBundle,
+        speculate_result: SpeculateResult,
+    ) -> tuple[_BranchVerifyOutcome, FlatPivotTargetScratchPackedInputs]:
+        """Target-scratch verify: write candidate KV into scratch blocks.
+
+        Parent target KV is NOT forked (COW skipped by speculator); parent
+        ``num_cached_tokens`` is not advanced here (postprocess handles
+        commit). On any failure, releases scratch blocks before re-raising.
+        """
+        b_exp = len(bundle.parent_index_per_branch)
+        L = self.lookahead + 1
+        block_size = self.scheduler.block_manager.block_size
+        packed: FlatPivotTargetScratchPackedInputs | None = None
+        try:
+            packed = build_flat_pivot_target_scratch_packed_inputs(
+                parent_seqs=parent_seqs,
+                parent_index_per_branch=bundle.parent_index_per_branch,
+                speculations=speculate_result.speculations,
+                block_size=block_size,
+                target_block_manager=self.scheduler.block_manager,
+                target_model_runner=self.target_model_runner,
+                device=self.device,
+            )
+            logits_p_flat = self.target_model_runner.call(
+                "run_packed_tree_decode",
+                packed.input_ids,
+                packed.positions,
+                packed.slot_mapping,
+                packed.context_lens,
+                packed.block_tables,
+                packed.cu_seqlens_q,
+                packed.max_seqlen_q,
+                packed.attn_mask,
+            )
+            logits_p = logits_p_flat.view(b_exp, L, -1)
+            temps_target = [
+                parent_seqs[bundle.parent_index_per_branch[r]].temperature
+                for r in range(b_exp)
+            ]
+            temps_draft = [
+                (
+                    parent_seqs[bundle.parent_index_per_branch[r]].draft_temperature
+                    if parent_seqs[bundle.parent_index_per_branch[r]].draft_temperature is not None
+                    else parent_seqs[bundle.parent_index_per_branch[r]].temperature
+                )
+                for r in range(b_exp)
+            ]
+            temperatures_target = torch.tensor(
+                temps_target, dtype=torch.float32, device=self.device
+            )
+            temperatures_draft = torch.tensor(
+                temps_draft, dtype=torch.float32, device=self.device
+            )
+            suffixes, recovery = verify(
+                logits_p=logits_p,
+                logits_q=speculate_result.logits_q,
+                speculations=speculate_result.speculations,
+                temperatures_target=temperatures_target,
+                temperatures_draft=temperatures_draft,
+                cache_hits=None,
+                sampler_x=None,
+                async_fan_out=None,
+                jit_speculate=False,
+            )
+            accept_len = [max(0, len(s) - 1) for s in suffixes]
+            outcome = _BranchVerifyOutcome(
+                suffixes=suffixes, recovery=recovery, accept_len=accept_len
+            )
+            return outcome, packed
+        except Exception:
+            if packed is not None:
+                packed.scratch_owner.release_unreleased(self.scheduler.block_manager)
+            raise
+
     def verify(self, seqs: list[Sequence], speculate_result: SpeculateResult, eagle: bool = False) -> VerifyResult:
         bundle = speculate_result.branch_bundle
-        if bundle is None or bundle.expanded_seqs is None:
-            raise ValueError("PivotExecutorFlat requires speculate_result.branch_bundle with expanded_seqs")
+        if bundle is None:
+            raise ValueError("PivotExecutorFlat requires speculate_result.branch_bundle")
 
-        outcome = self._verify_expanded(bundle.expanded_seqs, speculate_result)
+        target_scratch_enabled = bool(getattr(bundle, "target_scratch_enabled", False))
+        if target_scratch_enabled:
+            outcome, packed = self._verify_expanded_target_scratch(seqs, bundle, speculate_result)
+        else:
+            if bundle.expanded_seqs is None:
+                raise ValueError(
+                    "PivotExecutorFlat (COW) requires speculate_result.branch_bundle.expanded_seqs"
+                )
+            outcome = self._verify_expanded(bundle.expanded_seqs, speculate_result)
+            packed = None
         parent_bsz = bundle.parent_batch_size
 
         winners = [-1] * parent_bsz
@@ -340,12 +443,60 @@ class PivotExecutorFlat(VerifierBase):
                 pivot_selected_root_token_id=per_parent_selected_root,
             )
         self.metrics.setdefault("accepted_suffix_lens_with_recovery", []).extend([len(s) for s in new_suffixes])
-        # Commit winner branch KV onto parent block tables BEFORE releasing
-        # losers; without this, the parent's draft/target KV would not match
-        # the suffix that ``postprocess_speculate`` is about to commit, and the
-        # next decode step would see ``num_*_cached_tokens`` ahead of the real
-        # KV frontier.
-        self._commit_winner_and_release_forks(seqs, bundle, winners)
+
+        flat_commit: FlatPivotTargetScratchCommitBundle | None = None
+        if target_scratch_enabled:
+            assert packed is not None
+            # Build commit bundle: per-parent winner row's path_node_ids,
+            # truncated to suffix length (pre-EOS; postprocess may slice further).
+            #
+            # IMPORTANT — copy length must equal ``len(new_suffix)``:
+            # ``build_flat_pivot_target_scratch_packed_inputs`` writes ALL L
+            # candidate positions (j=0..L-1) into scratch, including the
+            # rejection slot. Standard ``postprocess_speculate`` advances
+            # ``num_cached_tokens`` by ``len(new_suffix)`` — to keep the cache
+            # frontier consistent we must commit the same number of slots from
+            # scratch. The recovery token's KV is the one written from the
+            # (possibly rejected) speculation at that position; this matches
+            # COW path semantics, where the entire L-slot fork is grafted onto
+            # the parent regardless of where the rejection happened.
+            #
+            # Bonus-token edge case: if ``len(new_suffix) > L`` (full-accept +
+            # bonus appended by ``verify``), we still only have L scratch slots
+            # — clamp via slice. The bonus token has no KV anywhere on the
+            # COW path either; postprocess metadata accounts for it but a
+            # subsequent forward pass regenerates KV when needed.
+            winner_target_node_ids: list[list[int]] = []
+            raw_suffix_lens: list[int] = []
+            num_committed_total = 0
+            L_eff = self.lookahead + 1
+            for pidx in range(parent_bsz):
+                wrow = winner_rows[pidx]
+                suffix_len = len(new_suffixes[pidx])
+                copy_len = min(suffix_len, L_eff)
+                row_nodes = packed.path_node_ids[wrow][:copy_len]
+                winner_target_node_ids.append(list(row_nodes))
+                raw_suffix_lens.append(int(suffix_len))
+                num_committed_total += int(len(row_nodes))
+            flat_commit = FlatPivotTargetScratchCommitBundle(
+                winner_target_node_ids=winner_target_node_ids,
+                target_node_slot=packed.node_to_slot,
+                raw_suffix_lens=raw_suffix_lens,
+                scratch_owner=packed.scratch_owner,
+                num_scratch_blocks=len(packed.scratch_owner.target_block_ids),
+                num_committed_slots=num_committed_total,
+            )
+            # Draft/inter COW commit still required (target COW is what we
+            # skipped). Use a slimmed variant: target tail transfer is a no-op
+            # because parent target block_table was never forked.
+            self._commit_winner_and_release_forks(seqs, bundle, winners)
+        else:
+            # Commit winner branch KV onto parent block tables BEFORE releasing
+            # losers; without this, the parent's draft/target KV would not match
+            # the suffix that ``postprocess_speculate`` is about to commit, and the
+            # next decode step would see ``num_*_cached_tokens`` ahead of the real
+            # KV frontier.
+            self._commit_winner_and_release_forks(seqs, bundle, winners)
         return VerifyResult(
             new_suffixes=new_suffixes,
             recovery_tokens=recovery_tokens,
@@ -357,4 +508,5 @@ class PivotExecutorFlat(VerifierBase):
             winning_branch_row_idx_per_parent=winner_rows,
             pivot_before_expansion_batch_size=int(parent_bsz),
             pivot_after_expansion_batch_size=int(len(bundle.parent_index_per_branch)),
+            flat_target_scratch_commit_bundle=flat_commit,
         )

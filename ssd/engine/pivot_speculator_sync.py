@@ -451,7 +451,7 @@ class PivotRootSpeculatorSync(SpeculatorSync):
         # "full_block". Full-block trades extra bytes for a single kernel launch
         # regardless of how many partial lengths the batch has — see
         # ``_copy_cow_block_full_batched`` for the safety argument.
-        mode = os.environ.get("SSD_PIVOT_DRAFT_COW_COPY_MODE", "bucketed_partial")
+        mode = os.environ.get("SSD_PIVOT_DRAFT_COW_COPY_MODE", "full_block")
         if mode == "full_block":
             self._copy_cow_block_full_batched(
                 kv_cache,
@@ -880,13 +880,13 @@ class PivotRootSpeculatorSync(SpeculatorSync):
         inter_cow_copy_s = t_inter_copy1 - t_inter_copy0
         cow_copy_s = target_cow_copy_s + draft_cow_copy_s + inter_cow_copy_s
         draft_cow_copy_mode = os.environ.get(
-            "SSD_PIVOT_DRAFT_COW_COPY_MODE", "bucketed_partial"
+            "SSD_PIVOT_DRAFT_COW_COPY_MODE", "full_block"
         )
         target_cow_copy_mode = os.environ.get(
-            "SSD_PIVOT_TARGET_COW_COPY_MODE", "bucketed_partial"
+            "SSD_PIVOT_TARGET_COW_COPY_MODE", "full_block"
         )
         inter_cow_copy_mode = os.environ.get(
-            "SSD_PIVOT_INTER_COW_COPY_MODE", "bucketed_partial"
+            "SSD_PIVOT_INTER_COW_COPY_MODE", "full_block"
         )
         branch0_setup_s = t_branch0_setup1 - t_branch0_setup0
         initial_pack_s = t_initial_pack1 - t_initial_pack0
