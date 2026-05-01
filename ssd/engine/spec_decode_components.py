@@ -7,6 +7,8 @@ from ssd.config import Config
 from ssd.engine.helpers.speculate_types import SpeculatorBase, VerifierBase
 from ssd.engine.pivot_branch_planner import PivotExpansionConfig
 from ssd.engine.pivot_executor_flat import PivotExecutorFlat
+from ssd.engine.pivot_precollapse_speculator_sync import PivotPrecollapseSpeculatorSync
+from ssd.engine.pivot_precollapse_verifier import PivotPrecollapseVerifier
 from ssd.engine.pivot_speculator_sync import PivotRootSpeculatorSync
 from ssd.engine.pivot_tree_executor import PivotTreeScratchExecutor
 from ssd.engine.pivot_tree_speculator import PivotTreeScratchSpeculator
@@ -21,6 +23,14 @@ from ssd.engine.verifier_pivot import VerifierPivot
 class SpecDecodeComponents:
     speculator: SpeculatorBase
     verifier: VerifierBase
+
+
+def _pivot_expansion_threshold_domain_label(criteria: str) -> str:
+    return (
+        "full_softmax_p_top1_minus_p_top2"
+        if criteria == "softmax_residual"
+        else "binary_top1_vs_top2_proxy"
+    )
 
 
 def build_spec_components(
@@ -62,6 +72,9 @@ def build_spec_components(
                 "pivot_expansion_pct": config.pivot_expansion_pct,
                 "pivot_expansion_threshold": config.pivot_expansion_threshold,
                 "pivot_expansion_criteria": config.pivot_expansion_criteria,
+                "pivot_expansion_threshold_domain": _pivot_expansion_threshold_domain_label(
+                    config.pivot_expansion_criteria
+                ),
                 "pivot_topk": config.pivot_topk,
                 "max_expand_rows": max_expand_rows,
             },
@@ -89,6 +102,61 @@ def build_spec_components(
             device=config.device,
             target_model_runner=model_runner,
             scheduler=scheduler,
+            metrics=metrics,
+            enable_profile_trace=enable_profile_trace,
+        )
+        return SpecDecodeComponents(speculator=speculator, verifier=verifier)
+
+    if config.spec_policy == "pivot_precollapse":
+        max_expand_rows = config.max_num_seqs * max(1, int(config.pivot_topk))
+        if config.pivot_expansion_policy == "dynamic" and float(config.pivot_expansion_pct) > 0.0:
+            max_expand_reqs = int(math.floor(config.max_num_seqs * float(config.pivot_expansion_pct)))
+            max_expand_rows = config.max_num_seqs + max(0, max_expand_reqs) * max(
+                0, int(config.pivot_topk) - 1
+            )
+        print(
+            {
+                "spec_policy": config.spec_policy,
+                "pivot_expansion_policy": config.pivot_expansion_policy,
+                "pivot_expansion_pct": config.pivot_expansion_pct,
+                "pivot_expansion_threshold": config.pivot_expansion_threshold,
+                "pivot_expansion_criteria": config.pivot_expansion_criteria,
+                "pivot_expansion_threshold_domain": _pivot_expansion_threshold_domain_label(
+                    config.pivot_expansion_criteria
+                ),
+                "pivot_precollapse_score_method": config.pivot_precollapse_score_method,
+                "pivot_topk": config.pivot_topk,
+                "max_expand_rows": max_expand_rows,
+            },
+            flush=True,
+        )
+        speculator = PivotPrecollapseSpeculatorSync(
+            lookahead=config.speculate_k,
+            device=config.device,
+            draft_model_runner=draft_runner,
+            target_model_runner=model_runner,
+            intermediate_runner=intermediate_runner,
+            scheduler=scheduler,
+            expansion_cfg=PivotExpansionConfig(
+                policy=config.pivot_expansion_policy,
+                criteria=config.pivot_expansion_criteria,
+                expansion_pct=config.pivot_expansion_pct,
+                threshold=config.pivot_expansion_threshold,
+                topk=config.pivot_topk,
+            ),
+            max_expand_rows=max_expand_rows,
+            enable_profile_trace=enable_profile_trace,
+            score_method=config.pivot_precollapse_score_method,
+            score_temperature_aware=config.pivot_precollapse_score_temperature_aware,
+        )
+        verifier = PivotPrecollapseVerifier(
+            lookahead=config.speculate_k,
+            device=config.device,
+            target_model_runner=model_runner,
+            sampler_x=config.sampler_x,
+            async_fan_out=config.async_fan_out,
+            jit_speculate=config.jit_speculate,
+            tokenizer=tokenizer,
             metrics=metrics,
             enable_profile_trace=enable_profile_trace,
         )

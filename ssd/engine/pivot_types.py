@@ -25,6 +25,27 @@ class BranchForkState:
     target_private_tail_block_ids: list[int]
     inter_private_tail_block_ids: list[int]
     is_parent_inplace: bool = False
+    # When False on precollapse alt branches, commit/release must not touch target KV.
+    target_kv_owned: bool = True
+    draft_kv_owned: bool = True
+    inter_kv_owned: bool = True
+
+
+@dataclass
+class PivotPrecollapseDecision:
+    """Draft-score collapse metadata (expanded row indices, B_exp-sized scores)."""
+
+    winning_branch_idx_per_parent: list[int]
+    winning_expanded_row_idx_per_parent: list[int]
+    winning_root_token_per_parent: list[int]
+    branch_score_per_row: list[float]  # len == B_exp before collapse
+    winning_score_per_parent: list[float]  # len == B
+    branch_count_per_parent: list[int]
+    before_expansion_batch_size: int
+    after_expansion_batch_size: int
+    score_method: str = "logprob_sum"
+    # Per-parent ``num_tokens`` before recovery append (debug rollback asserts).
+    committed_len_per_parent: list[int] | None = None
 
 
 @dataclass
@@ -41,6 +62,7 @@ class PivotBranchBundle:
     host_plan: "PivotHostPlan"
     expanded_seqs: list["Sequence"] | None = None
     branch_states: list[BranchForkState] | None = None
+    precollapse_decision: "PivotPrecollapseDecision | None" = None
 
     @property
     def parent_index_per_branch(self) -> list[int]:

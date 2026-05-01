@@ -58,11 +58,14 @@ class Config:
     expansion_pct: float = 1.0
     # planner-owned pivot expansion knobs (sync pivot / pivot_hierarchical)
     pivot_expansion_policy: Literal["static", "dynamic"] = "dynamic"
-    pivot_expansion_criteria: Literal["top1", "residual"] = "residual"
+    pivot_expansion_criteria: Literal["top1", "residual", "softmax_residual"] = "residual"
     pivot_expansion_pct: float = 0.2
     pivot_expansion_threshold: float = 0.8
     pivot_topk: int = 5
     pivot_max_root_branches: int | None = None
+    # pivot_precollapse: draft-score collapse before B-row target verify
+    pivot_precollapse_score_method: Literal["logprob_sum", "logit_sum"] = "logprob_sum"
+    pivot_precollapse_score_temperature_aware: bool = False
 
     # hierarchical verification (sync spec, single verify per step)
     intermediate: str = ""  # HF model dir; empty => use same path as draft
@@ -139,13 +142,14 @@ class Config:
                 "default",
                 "pivot",
                 "pivot_tree_scratch",
+                "pivot_precollapse",
                 "hierarchical",
                 "pivot_hierarchical",
                 "pivot_legacy",
             }:
                 raise ValueError(
                     f"Unsupported spec_policy={self.spec_policy}. "
-                    "Use 'default', 'pivot', 'pivot_tree_scratch', "
+                    "Use 'default', 'pivot', 'pivot_tree_scratch', 'pivot_precollapse', "
                     "'hierarchical', 'pivot_hierarchical', or 'pivot_legacy'.")
             if is_pivot_legacy(self.spec_policy):
                 if self.interval < 0:
@@ -156,8 +160,11 @@ class Config:
                     raise ValueError("expansion_pct must be > 0 for pivot_legacy")
             if self.pivot_expansion_policy not in {"static", "dynamic"}:
                 raise ValueError("pivot_expansion_policy must be one of {'static', 'dynamic'}")
-            if self.pivot_expansion_criteria not in {"top1", "residual"}:
-                raise ValueError("pivot_expansion_criteria must be one of {'top1', 'residual'}")
+            if self.pivot_expansion_criteria not in {"top1", "residual", "softmax_residual"}:
+                raise ValueError(
+                    "pivot_expansion_criteria must be one of "
+                    "{'top1', 'residual', 'softmax_residual'}"
+                )
             if not (0.0 <= self.pivot_expansion_pct <= 1.0):
                 raise ValueError("pivot_expansion_pct must be in [0, 1]")
             if not (0.0 <= self.pivot_expansion_threshold <= 1.0):
@@ -166,8 +173,17 @@ class Config:
                 raise ValueError("pivot_topk must be >= 1")
             if self.pivot_max_root_branches is not None and self.pivot_max_root_branches < 1:
                 raise ValueError("pivot_max_root_branches must be >= 1 when set")
-            if self.pivot_topk == 1 and self.spec_policy in {"pivot", "pivot_hierarchical"}:
+            if self.pivot_topk == 1 and self.spec_policy in {"pivot", "pivot_hierarchical", "pivot_precollapse"}:
                 print("[Config] pivot_topk=1: root expansion is effectively disabled.", flush=True)
+
+            if self.spec_policy == "pivot_precollapse":
+                if self.speculate_k < 1:
+                    raise ValueError("pivot_precollapse requires speculate_k >= 1")
+                if self.pivot_precollapse_score_method not in {"logprob_sum", "logit_sum"}:
+                    raise ValueError(
+                        "pivot_precollapse_score_method must be one of "
+                        "{'logprob_sum', 'logit_sum'}"
+                    )
 
             if uses_pivot_root_expansion(self.spec_policy):
                 assert not self.draft_async, f"{self.spec_policy} requires draft_async=False (sync spec)"

@@ -43,7 +43,12 @@ def parse_args():
     p.add_argument("--threshold", type=float, default=0.8)
     p.add_argument("--expansion_pct", type=float, default=1.0)
     p.add_argument("--pivot_expansion_policy", type=str, choices=["static", "dynamic"], default="dynamic")
-    p.add_argument("--pivot_expansion_criteria", type=str, choices=["top1", "residual"], default="residual")
+    p.add_argument(
+        "--pivot_expansion_criteria",
+        type=str,
+        choices=["top1", "residual", "softmax_residual"],
+        default="residual",
+    )
     p.add_argument("--pivot_expansion_pct", type=float, default=0.0)
     p.add_argument("--pivot_expansion_threshold", type=float, default=0.8)
     p.add_argument("--pivot_topk", type=int, default=5)

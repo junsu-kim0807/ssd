@@ -474,7 +474,9 @@ class PivotRootSpeculatorSync(SpeculatorSync):
         recovery_already_appended: bool = False,
         fork_target_kv: bool = True,
     ) -> SpeculateResult:
-        assert not verify_result.eagle_acts, "Eagle is not supported for pivot sync speculation"
+        assert verify_result.eagle_acts is None, (
+            "Eagle is not supported for pivot sync speculation"
+        )
         batch_size = len(seqs)
         if batch_size == 0:
             return SpeculateResult(

@@ -12,7 +12,9 @@ class SpeculatorSync(SpeculatorBase):
         self.draft_model_runner = draft_model_runner
 
     def prefill(self, seqs: list[Sequence], verify_result: VerifyResult) -> SpeculateResult:
-        assert not verify_result.eagle_acts, "Eagle is not currently supported for synchronous speculation"
+        assert verify_result.eagle_acts is None, (
+            "Eagle is not currently supported for synchronous speculation"
+        )
         print('[spec_prefill] target prefill', flush=True)
         self.draft_model_runner.call("run", seqs, True)
 
@@ -30,7 +32,9 @@ class SpeculatorSync(SpeculatorBase):
         recovery_already_appended: bool = False,
     ) -> SpeculateResult:
         """Generate k speculative tokens using the draft model."""
-        assert not verify_result.eagle_acts, "Eagle is not currently supported for synchronous speculation"
+        assert verify_result.eagle_acts is None, (
+            "Eagle is not currently supported for synchronous speculation"
+        )
 
         batch_size = len(seqs)
         speculations = torch.zeros(

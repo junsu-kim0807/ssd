@@ -9,7 +9,8 @@ from ssd.engine.model_runner import ModelRunner
 from ssd.engine.sequence import Sequence
 from ssd.engine.scheduler import Scheduler
 from ssd.engine.helpers.speculate_types import SpeculatorBase, VerifierBase, VerifyResult
-from ssd.engine.spec_policy_traits import uses_pivot_tree_scratch
+from ssd.engine.pivot_precollapse_verifier import attach_precollapse_rollback_asserts
+from ssd.engine.spec_policy_traits import uses_pivot_precollapse, uses_pivot_tree_scratch
 from ssd.engine.verifier_hierarchical import VerifierHierarchical
 from ssd.utils.misc import decode_tokens
 from ssd.utils.profiler import SSDProfiler
@@ -313,6 +314,8 @@ class SpecDecodeStep(InferenceStep):
                     seq.last_token = orig_lt
                     seq.num_draft_cached_tokens = orig_ndc
                     seq.num_cached_tokens = orig_nct
+                if uses_pivot_precollapse(getattr(self.scheduler.config, "spec_policy", "")):
+                    attach_precollapse_rollback_asserts(self.scheduler, seqs, speculate_result)
 
             #### STEP 3: POSTPROCESS ####
             dbg_vanilla_raw_suffixes: list[list[int]] | None = None
@@ -440,7 +443,13 @@ class SpecDecodeStep(InferenceStep):
                 )
                 bundle = getattr(speculate_result, "branch_bundle", None)
                 winners = getattr(out_verify_result, "winning_branch_idx_per_parent", None)
-                if bundle is not None and winners is not None:
+                _pol = getattr(self.scheduler.config, "spec_policy", "")
+                _precollapse = uses_pivot_precollapse(_pol)
+                _already_b_shaped = (
+                    speculate_result.logits_q is not None
+                    and speculate_result.logits_q.shape[0] == len(seqs)
+                )
+                if bundle is not None and winners is not None and not _precollapse and not _already_b_shaped:
                     # Collapse expanded-row draft metadata to parent winners.
                     by_parent_rows: list[list[int]] = [[] for _ in range(len(seqs))]
                     for row_idx, pidx in enumerate(bundle.parent_index_per_branch):

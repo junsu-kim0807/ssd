@@ -85,6 +85,7 @@ def parse_arguments():
         choices=[
             "default",
             "pivot",
+            "pivot_precollapse",
             "pivot_tree_scratch",
             "pivot_opt",
             "pivot_opt_hierarchical",
@@ -123,13 +124,21 @@ def parse_arguments():
     parser.add_argument(
         "--pivot_expansion_criteria",
         type=str,
-        choices=["top1", "residual"],
+        choices=["top1", "residual", "softmax_residual"],
         default="residual",
-        help="Planner uncertainty criteria for pivot expansion",
+        help="Pivot expansion uncertainty: top1/residual use binary logit-margin proxy; "
+        "softmax_residual uses full-vocab p_top1 - p_top2 (expand when residual < threshold).",
     )
     parser.add_argument("--pivot_expansion_pct", type=float, default=0.2)
     parser.add_argument("--pivot_expansion_threshold", type=float, default=0.8)
     parser.add_argument("--pivot_topk", type=int, default=5)
+    parser.add_argument(
+        "--pivot_precollapse_score_method",
+        type=str,
+        choices=["logprob_sum", "logit_sum"],
+        default="logprob_sum",
+        help="pivot_precollapse only: collapse picks branch by sum of draft token logprobs or logits.",
+    )
     parser.add_argument(
         "--enable_pivot_draft_scratch_phase2",
         action=argparse.BooleanOptionalAction,
@@ -505,6 +514,9 @@ def initialize_wandb(args, run_name):
             "pivot_expansion_pct": args.pivot_expansion_pct,
             "pivot_expansion_threshold": args.pivot_expansion_threshold,
             "pivot_topk": args.pivot_topk,
+            "pivot_precollapse_score_method": getattr(
+                args, "pivot_precollapse_score_method", "logprob_sum"
+            ),
             "gpu_memory_utilization_arg": getattr(args, "gpu_memory_utilization", None),
         }
     )
@@ -549,6 +561,9 @@ def create_llm_kwargs(args, draft_path):
         pivot_expansion_pct=args.pivot_expansion_pct,
         pivot_expansion_threshold=args.pivot_expansion_threshold,
         pivot_topk=args.pivot_topk,
+        pivot_precollapse_score_method=getattr(
+            args, "pivot_precollapse_score_method", "logprob_sum"
+        ),
         debug_phase0_flat_compare=bool(getattr(args, "debug_phase0_flat_compare", False)),
         enable_pivot_draft_scratch_phase2=bool(
             getattr(args, "enable_pivot_draft_scratch_phase2", False)

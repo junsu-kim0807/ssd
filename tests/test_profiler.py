@@ -4,6 +4,7 @@ import json
 from pathlib import Path
 from types import SimpleNamespace
 
+import pytest
 import torch
 
 from ssd.utils.profiler import (
@@ -523,6 +524,15 @@ def test_trace_to_row_indexed_cost_fields(tmp_path):
     assert row["request_id"] == 7
     assert row["step_wall_time_s"] == 0.01
     assert row["verification_model"] == "target"
+    assert row["accumulated_draft_token_confidence"] == pytest.approx(0.4 * 0.3)
+
+
+def test_accumulated_draft_token_confidence():
+    from ssd.utils.profiler_metadata import accumulated_draft_token_confidence
+
+    assert accumulated_draft_token_confidence([]) is None
+    assert accumulated_draft_token_confidence([0.5]) == pytest.approx(0.5)
+    assert accumulated_draft_token_confidence([0.2, 0.5, 0.5]) == pytest.approx(0.05)
 
 
 def test_trace_to_row_indexed_hierarchical_intermediate_chain_columns(tmp_path):
@@ -582,6 +592,7 @@ def test_trace_to_row_indexed_hierarchical_intermediate_chain_columns(tmp_path):
     assert row["intermediate_verify_chain_token_ids_per_position"] == [10, 11, 12]
     assert row["intermediate_verify_chain_token_confidence_per_position"] == [0.5, 0.6, 0.7]
     assert row["inter_accept_len"] == 1
+    assert row["accumulated_draft_token_confidence"] == pytest.approx(0.0)
 
 
 def test_prefill_metadata_rows(tmp_path):
@@ -614,3 +625,4 @@ def test_prefill_metadata_rows(tmp_path):
     assert len(rows) == 2
     assert rows[0]["is_prefill"] is True
     assert rows[0]["num_draft"] == 2 and rows[0]["num_verification"] == 2
+    assert rows[0]["accumulated_draft_token_confidence"] == pytest.approx(0.0)

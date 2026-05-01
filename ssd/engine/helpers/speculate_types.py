@@ -63,6 +63,9 @@ class VerifyResult:
     # Pivot batch expansion summary (works even when profile trace is disabled, e.g. cost mode).
     pivot_before_expansion_batch_size: int | None = None
     pivot_after_expansion_batch_size: int | None = None
+    # pivot_precollapse: B after draft-score collapse; target verify batch (always B).
+    pivot_after_collapse_batch_size: int | None = None
+    pivot_target_verify_batch_size: int | None = None
     scratch_commit_bundle: "PivotTreeCommitBundle | None" = None
 
 

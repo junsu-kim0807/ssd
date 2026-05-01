@@ -16,16 +16,15 @@ intermediate verifies plus one target verify. If ``--hv-rounds`` is omitted, gen
 With ``--batch`` or ``--length``, method ``pivot`` also sweeps ``--pivot_topk`` and
 ``--pivot_expansion_pct`` over ``{2,3,5} × {0.1,0.2,0.5}`` (``pivot_legacy`` uses CLI defaults only).
 
-When **either** ``--batch`` or ``--length`` is set, generated jobs cover the profile dataset set
+When **either** ``--batch`` / ``--length`` / ``--temp`` is set, generated jobs cover the profile dataset set
 (alpaca, humaneval, gsm8k, math500, codeelo, livecodebench): profiler paths ``.../b<b>/k.../t0/r<R>/<dataset>/`` for hierarchical.
 By default, **one Slurm script per dataset** (job name ``<dataset>_<family>_<method>_b<b>_<kpath>_<temp_tag>``).
 With ``--all``, one Slurm script runs every dataset in a ``for`` loop. ``--dataset`` is ignored in that mode.
 Job scripts and logs live under the same ``.../b<b>/k.../<pair>/t<tag>/`` layout; hierarchical adds ``r<R>/`` after ``t<tag>``.
 
-When using ``--batch`` (or ``--length``) for the multi-dataset profile sweep, a companion **bench-only** bash
-script is written: ``profile/run_batch.sh`` if ``--batch`` is set, and ``profile/run_length.sh`` if ``--length``
-is set (``sleep 5`` between ``python -O bench/bench.py`` blocks). If both flags are set, both files are written
-with the same command list.
+When using ``--batch`` / ``--length`` / ``--temp`` for the multi-dataset profile sweep, companion **bench-only**
+bash scripts are written: ``profile/run_batch.sh`` (``--batch``), ``profile/run_length.sh`` (``--length``),
+and ``profile/run_temp.sh`` (``--temp``), with ``sleep 5`` between ``python -O bench/bench.py`` blocks.
 
 Sweep flags (optional, Cartesian product with other dimensions):
   --batch   → batch sizes 1, 4, 16, 64, 256
@@ -81,7 +80,10 @@ DEFAULT_MEM_PER_GPU = "128G"
 DEFAULT_TIME_LIMIT = "04:00:00"
 DEFAULT_CPUS_PER_TASK = 16
 
-BATCH_SWEEP = (1, 2, 4, 8, 16)
+# BATCH_SWEEP = (1, 2, 4, 8, 16)
+
+BATCH_SWEEP = (16, 32)
+
 K_SWEEP = (3, 5, 7, 9, 11)
 TEMP_SWEEP = (0.0, 0.3, 0.7, 1.0)
 
@@ -93,7 +95,7 @@ FIXED_OUTPUT_LEN = 512
 
 PROFILE_MODE_CHOICES = ("cost", "metadata", "cost_metadata")
 
-# When --batch and --length are both passed: one job script runs these bench datasets in order.
+# Multi-dataset profile sweep datasets used by --batch / --length / --temp.
 MULTI_DATASET_PROFILE_SLUGS: tuple[str, ...] = (
     "alpaca",
     "qa",
@@ -194,6 +196,9 @@ def uses_pivot_profiler_layout(method_id: str) -> bool:
 # With ``--batch`` / ``--length`` and method ``pivot`` only (not ``pivot_legacy``).
 PIVOT_BATCH_LENGTH_TOPK_SWEEP = (2, 3, 5)
 PIVOT_BATCH_LENGTH_EXPANSION_PCT_SWEEP = (0.1, 0.2, 0.5)
+PIVOT_STATIC_TOPK_SWEEP = (2, 3, 4, 5)
+PIVOT_STATIC_EXPANSION_PCT = 1.0
+PIVOT_STATIC_POLICY = "static"
 
 
 def uses_pivot_batch_length_topk_pct_sweep(method_id: str) -> bool:
@@ -206,7 +211,10 @@ def iter_pivot_topk_pct_for_profile_sweep(
     method_id: str,
     cli_topk: int,
     cli_pct: float,
+    static_mode: bool = False,
 ) -> tuple[tuple[int, float], ...]:
+    if static_mode and method_id == "pivot":
+        return tuple((int(tk), float(PIVOT_STATIC_EXPANSION_PCT)) for tk in PIVOT_STATIC_TOPK_SWEEP)
     if multi_dataset_sweep and uses_pivot_batch_length_topk_pct_sweep(method_id):
         return tuple(
             (int(tk), float(pc)) for tk in PIVOT_BATCH_LENGTH_TOPK_SWEEP for pc in PIVOT_BATCH_LENGTH_EXPANSION_PCT_SWEEP
@@ -382,15 +390,16 @@ def profiler_rel_dir(
     pivot_round: str = "na",
     pivot_topk: int = 5,
     pivot_expansion_pct: float = 0.2,
+    pivot_expansion_policy: str = "dynamic",
 ) -> str:
     """Path relative to bench cwd (``profile_mode``: cost | metadata | cost_metadata).
 
     When ``hv_round`` is set (hierarchical jobs), insert ``r<hv_round>/`` (``--round`` value) after
     the temperature tag and before the optional dataset slug.
 
-    For ``pivot`` / ``pivot_legacy``, results go under
-    ``.../<pair>/<t*temp>/r_<round>/topk<k>/<pct*>/[<dataset>]`` (matches ``--temp``, ``--pivot_topk``,
-    ``--pivot_expansion_pct``; ``r_<round>`` is from ``--pivot-profiler-round`` here, not bench ``--round``).
+    For ``pivot``, results go under
+    ``.../pivot/<policy>/b*/k*/<pair>/<t*temp>/r_<round>/topk<k>/<pct*>/[<dataset>]``.
+    For ``pivot_legacy``, keep the legacy method layout.
     """
     base = [
         "results",
@@ -400,7 +409,24 @@ def profiler_rel_dir(
         k_path_token,
         pair_slug,
     ]
-    if uses_pivot_profiler_layout(method_id):
+    if method_id == "pivot":
+        parts = [
+            "results",
+            profile_mode,
+            "pivot",
+            sanitize_path_component(pivot_expansion_policy),
+            f"b{int(batch_size)}",
+            k_path_token,
+            pair_slug,
+            temp_path_tag(temp),
+            f"r_{sanitize_path_component(str(pivot_round))}",
+            f"topk{int(pivot_topk)}",
+            pct_path_component(float(pivot_expansion_pct)),
+        ]
+        if dataset_slug:
+            parts.append(sanitize_path_component(dataset_slug))
+        return os.path.join(*parts)
+    if method_id == "pivot_legacy":
         parts = [
             *base,
             temp_path_tag(temp),
@@ -437,6 +463,7 @@ def build_bench_argv(
     hv_target_verify_interval: int | None = None,
     pivot_topk: int | None = None,
     pivot_expansion_pct: float | None = None,
+    pivot_expansion_policy: str | None = None,
 ) -> list[str]:
     argv: list[str] = [
         "python",
@@ -469,6 +496,8 @@ def build_bench_argv(
                 str(float(pivot_expansion_pct)),
             ]
         )
+        if pivot_expansion_policy is not None:
+            argv.extend(["--pivot_expansion_policy", str(pivot_expansion_policy)])
     argv.extend(
         [
             "--profile",
@@ -543,6 +572,7 @@ def profiler_mkdirs_block_for_datasets(
     pivot_round: str = "na",
     pivot_topk: int = 5,
     pivot_expansion_pct: float = 0.2,
+    pivot_expansion_policy: str = "dynamic",
 ) -> str:
     lines: list[str] = []
     for ds in dataset_slugs:
@@ -558,6 +588,7 @@ def profiler_mkdirs_block_for_datasets(
             pivot_round=pivot_round,
             pivot_topk=pivot_topk,
             pivot_expansion_pct=pivot_expansion_pct,
+            pivot_expansion_policy=pivot_expansion_policy,
         ).replace(os.sep, "/")
         lines.append(f'mkdir -p "${{BENCH_DIR}}/{rel}"')
     return ("\n".join(lines) + "\n") if lines else ""
@@ -580,6 +611,7 @@ def build_multi_dataset_profile_loop_sh(
     hv_target_verify_interval: int | None = None,
     pivot_topk: int | None = None,
     pivot_expansion_pct: float | None = None,
+    pivot_expansion_policy: str | None = None,
 ) -> str:
     """Bash loop: ``--profiler_output_dir`` = ``$PROFILE_BASE/$dataset`` (``dataset`` in MULTI_DATASET_PROFILE_SLUGS)."""
     prof_base_q = shell_quote_single("./" + profiler_base_rel.replace(os.sep, "/"))
@@ -616,6 +648,8 @@ def build_multi_dataset_profile_loop_sh(
             raise ValueError("pivot_topk and pivot_expansion_pct required for pivot multi-dataset loop")
         body_lines.append(f"    --pivot_topk {int(pivot_topk)} \\")
         body_lines.append(f"    --pivot_expansion_pct {float(pivot_expansion_pct)} \\")
+        if pivot_expansion_policy is not None:
+            body_lines.append(f"    --pivot_expansion_policy {shlex.quote(str(pivot_expansion_policy))} \\")
     for tok in extra_bench_args:
         body_lines.append(f"    {shlex.quote(str(tok))} \\")
     body_lines += [
@@ -724,12 +758,15 @@ def iter_job_configs(
     ks: Sequence[int],
     temps: Sequence[float],
     sweep_length: bool,
+    explicit_ks: Sequence[int] | None = None,
 ) -> Iterable[tuple[str, str, int, int, float, BenchMethodSpec]]:
     for fam in model_families:
         for mid in methods:
             spec = METHOD_REGISTRY[mid]
             k_candidates: tuple[int, ...]
-            if sweep_length and spec.uses_spec_k:
+            if explicit_ks is not None and spec.uses_spec_k:
+                k_candidates = tuple(int(k) for k in explicit_ks)
+            elif sweep_length and spec.uses_spec_k:
                 k_candidates = tuple(ks)
             elif spec.uses_spec_k:
                 k_candidates = (spec.default_k,)
@@ -772,7 +809,7 @@ def main() -> None:
     p.add_argument(
         "--methods",
         type=str,
-        default="ar,sync,pivot",
+        default="pivot",
         help="Comma-separated method ids: ar | sync | async | hierarchical | pivot | pivot_legacy "
         "(default ar,sync,pivot; pivot is sync planner policy; pivot_legacy keeps async + spec_hive path).",
     )
@@ -786,23 +823,29 @@ def main() -> None:
     p.add_argument(
         "--batch",
         action="store_true",
-        help=f"Sweep batch sizes {BATCH_SWEEP}. With --batch or --length, jobs use the five profile datasets "
+        help=f"Sweep batch sizes {BATCH_SWEEP}. With --batch/--length/--temp, jobs use the five profile datasets "
         f"(one Slurm script per dataset unless --all).",
     )
     p.add_argument(
         "--length",
         action="store_true",
-        help=f"Sweep speculative k {K_SWEEP} (methods with uses_spec_k). With --batch or --length, same multi-dataset "
+        help=f"Sweep speculative k {K_SWEEP} (methods with uses_spec_k). With --batch/--length/--temp, same multi-dataset "
         f"behaviour as --batch.",
     )
     p.add_argument(
         "--all",
         action="store_true",
         dest="multids_all_in_one",
-        help="With --batch or --length: emit one Slurm script that loops all profile datasets. "
+        help="With --batch/--length/--temp: emit one Slurm script that loops all profile datasets. "
         "Default (omit --all): one Slurm script per dataset.",
     )
     p.add_argument("--temp", action="store_true", help=f"Sweep temperatures {TEMP_SWEEP}")
+    p.add_argument(
+        "--static",
+        action="store_true",
+        help="Pivot static expansion preset: --pivot_expansion_policy static, --pivot_expansion_pct 1.0, "
+        "pivot topk sweep 2,3,4,5, and defaults b=16/k=5 when not overridden.",
+    )
 
     p.add_argument("--batch-sizes", type=str, default="", help="Override batch sweep, e.g. '1,8,32'")
     p.add_argument("--ks", type=str, default="", help="Override k sweep, e.g. '4,6,8'")
@@ -825,6 +868,13 @@ def main() -> None:
         type=float,
         default=0.2,
         help="pivot / pivot_legacy: bench.py --pivot_expansion_pct and profiler pct* segment (default 0.2).",
+    )
+    p.add_argument(
+        "--pivot-expansion-policy",
+        type=str,
+        choices=("static", "dynamic"),
+        default="dynamic",
+        help="pivot / pivot_legacy: bench.py --pivot_expansion_policy (default dynamic).",
     )
     p.add_argument(
         "--pivot-profiler-round",
@@ -865,6 +915,20 @@ def main() -> None:
         help="With --length (multi-dataset sweep): write this bash script with bench.py commands only "
         "(sleep 5 between each). Ignored if --length is not set.",
     )
+    p.add_argument(
+        "--run-temp-sh",
+        type=str,
+        default=str(_REPO_ROOT / "profile" / "run_temp.sh"),
+        help="With --temp: write this bash script with bench.py commands only "
+        "(sleep 5 between each).",
+    )
+    p.add_argument(
+        "--run-pivot-static-sh",
+        type=str,
+        default=str(_REPO_ROOT / "profile" / "run_pivot_static.sh"),
+        help="With --static: write this bash script with pivot static bench commands only "
+        "(sleep 5 between each).",
+    )
     p.add_argument("--dry-run", action="store_true")
     args = p.parse_args()
 
@@ -880,17 +944,20 @@ def main() -> None:
 
     model_families = normalize_model_families(args.models)
     methods = normalize_methods(args.methods)
-    multi_dataset_sweep = bool(args.batch or args.length)
+    if args.static and "pivot" not in methods:
+        print("--static enabled: adding method 'pivot' automatically.", file=sys.stderr)
+        methods = tuple(dict.fromkeys([*methods, "pivot"]))
+    multi_dataset_sweep = bool(args.batch or args.length or args.temp or args.static)
     if multi_dataset_sweep:
         if args.multids_all_in_one:
             print(
-                "batch/length sweep + --all: one Slurm script per sweep cell runs "
+                "batch/length/temp sweep + --all: one Slurm script per sweep cell runs "
                 f"{', '.join(MULTI_DATASET_PROFILE_SLUGS)} in a loop; --dataset ignored.",
                 file=sys.stderr,
             )
         else:
             print(
-                "batch/length sweep: one Slurm script per dataset "
+                "batch/length/temp sweep: one Slurm script per dataset "
                 f"({', '.join(MULTI_DATASET_PROFILE_SLUGS)}); use --all for a single loop script. "
                 "--dataset ignored.",
                 file=sys.stderr,
@@ -898,16 +965,22 @@ def main() -> None:
     dataset_flags = dataset_bench_flags(args.dataset)
 
     batch_sizes = (
-        parse_csv_ints(args.batch_sizes) if args.batch_sizes.strip() else (BATCH_SWEEP if args.batch else (1,))
+        parse_csv_ints(args.batch_sizes)
+        if args.batch_sizes.strip()
+        else (BATCH_SWEEP if args.batch else ((16,) if args.static else (1,)))
     )
     temps = parse_csv_floats(args.temps) if args.temps.strip() else (TEMP_SWEEP if args.temp else (0.0,))
 
+    explicit_ks: tuple[int, ...] | None = None
     if args.ks.strip():
-        ks_final = parse_csv_ints(args.ks)
-    elif args.length:
+        explicit_ks = parse_csv_ints(args.ks)
+    if args.length:
         ks_final = tuple(K_SWEEP)
     else:
-        ks_final = (6,)
+        ks_final = (5,) if args.static else (6,)
+
+    pivot_policy_for_run = PIVOT_STATIC_POLICY if args.static else str(args.pivot_expansion_policy)
+    pivot_pct_for_run = float(PIVOT_STATIC_EXPANSION_PCT) if args.static else float(args.pivot_expansion_pct)
 
     gpus_global: int | None = int(args.gpus) if str(args.gpus).strip() else None
 
@@ -920,12 +993,18 @@ def main() -> None:
     n_written = 0
     run_batch_chunks: list[list[str]] = []
     run_length_chunks: list[list[str]] = []
+    run_temp_chunks: list[list[str]] = []
+    run_pivot_static_chunks: list[list[str]] = []
 
-    def _record_run_script_argv(argv_cmd: list[str]) -> None:
+    def _record_run_script_argv(argv_cmd: list[str], *, method_id: str) -> None:
         if args.batch:
             run_batch_chunks.append(argv_cmd)
         if args.length:
             run_length_chunks.append(argv_cmd)
+        if args.temp:
+            run_temp_chunks.append(argv_cmd)
+        if args.static and method_id == "pivot":
+            run_pivot_static_chunks.append(argv_cmd)
 
     for fam, mid, k_val, b_val, temp_val, spec in iter_job_configs(
         model_families=model_families,
@@ -934,6 +1013,7 @@ def main() -> None:
         ks=ks_final,
         temps=temps,
         sweep_length=args.length,
+        explicit_ks=explicit_ks,
     ):
         hv_round_cells: tuple[int | None, ...] = (
             tuple(int(r) for r in hv_rounds_parsed) if spec.id == "hierarchical" else (None,)
@@ -942,7 +1022,8 @@ def main() -> None:
             multi_dataset_sweep=multi_dataset_sweep,
             method_id=spec.id,
             cli_topk=int(args.pivot_topk),
-            cli_pct=float(args.pivot_expansion_pct),
+            cli_pct=float(pivot_pct_for_run),
+            static_mode=bool(args.static),
         )
         for hv_round, (pivot_topk_val, pivot_pct_val) in product(
             hv_round_cells,
@@ -959,6 +1040,7 @@ def main() -> None:
                 pivot_round=str(args.pivot_profiler_round),
                 pivot_topk=int(pivot_topk_val),
                 pivot_expansion_pct=float(pivot_pct_val),
+                pivot_expansion_policy=str(pivot_policy_for_run),
             )
 
             prof_base_rel = profiler_rel_dir(
@@ -996,6 +1078,7 @@ def main() -> None:
                 hv_target_verify_interval=hv_round,
                 pivot_topk=pivot_bench_topk,
                 pivot_expansion_pct=pivot_bench_pct,
+                pivot_expansion_policy=(pivot_policy_for_run if uses_pivot_profiler_layout(spec.id) else None),
             )
 
             temp_tag = temp_path_tag(temp_val)
@@ -1005,7 +1088,8 @@ def main() -> None:
                 rel_bits = (
                     Path(args.profile_mode)
                     / fam
-                    / spec.id
+                    / ("pivot" if spec.id == "pivot" else spec.id)
+                    / (sanitize_path_component(str(pivot_policy_for_run)) if spec.id == "pivot" else "")
                     / f"b{b_val}"
                     / k_path
                     / pair_slug
@@ -1014,6 +1098,18 @@ def main() -> None:
                     / f"topk{int(pivot_topk_val)}"
                     / pct_path_component(float(pivot_pct_val))
                 )
+                if spec.id == "pivot_legacy":
+                    rel_bits = (
+                        Path(args.profile_mode)
+                        / spec.id
+                        / f"b{b_val}"
+                        / k_path
+                        / pair_slug
+                        / temp_tag
+                        / f"r_{sanitize_path_component(str(args.pivot_profiler_round))}"
+                        / f"topk{int(pivot_topk_val)}"
+                        / pct_path_component(float(pivot_pct_val))
+                    )
             else:
                 rel_bits = Path(args.profile_mode) / fam / spec.id / f"b{b_val}" / k_path / pair_slug / temp_tag
                 if hv_round is not None:
@@ -1062,6 +1158,7 @@ def main() -> None:
                     hv_target_verify_interval=hv_round,
                     pivot_topk=pivot_bench_topk,
                     pivot_expansion_pct=pivot_bench_pct,
+                    pivot_expansion_policy=(pivot_policy_for_run if uses_pivot_profiler_layout(spec.id) else None),
                 )
                 for ds in MULTI_DATASET_PROFILE_SLUGS:
                     ds_rb = dataset_bench_flags(ds)
@@ -1094,7 +1191,10 @@ def main() -> None:
                             hv_target_verify_interval=hv_round,
                             pivot_topk=pivot_bench_topk,
                             pivot_expansion_pct=pivot_bench_pct,
+                            pivot_expansion_policy=(pivot_policy_for_run if uses_pivot_profiler_layout(spec.id) else None),
                         )
+                        ,
+                        method_id=spec.id
                     )
                 text = make_slurm_script(
                     job_name=job_name,
@@ -1154,8 +1254,9 @@ def main() -> None:
                         hv_target_verify_interval=hv_round,
                         pivot_topk=pivot_bench_topk,
                         pivot_expansion_pct=pivot_bench_pct,
+                        pivot_expansion_policy=(pivot_policy_for_run if uses_pivot_profiler_layout(spec.id) else None),
                     )
-                    _record_run_script_argv(bench_argv_ds)
+                    _record_run_script_argv(bench_argv_ds, method_id=spec.id)
                     text = make_slurm_script(
                         job_name=job_name,
                         account=args.account,
@@ -1206,8 +1307,16 @@ def main() -> None:
                     os.chmod(script_path, 0o755)
                 n_written += 1
 
-    def _write_run_only_script(path_str: str, chunks: list[list[str]], label: str) -> None:
-        if not multi_dataset_sweep or not chunks:
+    def _write_run_only_script(
+        path_str: str,
+        chunks: list[list[str]],
+        label: str,
+        *,
+        require_multi_dataset: bool,
+    ) -> None:
+        if require_multi_dataset and not multi_dataset_sweep:
+            return
+        if not chunks:
             return
         out_path = Path(path_str).expanduser()
         lines = [
@@ -1231,9 +1340,33 @@ def main() -> None:
             print(f"Wrote {label} script ({len(chunks)} bench command(s)): {out_path}", file=sys.stderr)
 
     if args.batch:
-        _write_run_only_script(args.run_batch_sh, run_batch_chunks, "run-batch")
+        _write_run_only_script(
+            args.run_batch_sh,
+            run_batch_chunks,
+            "run-batch",
+            require_multi_dataset=True,
+        )
     if args.length:
-        _write_run_only_script(args.run_length_sh, run_length_chunks, "run-length")
+        _write_run_only_script(
+            args.run_length_sh,
+            run_length_chunks,
+            "run-length",
+            require_multi_dataset=True,
+        )
+    if args.temp:
+        _write_run_only_script(
+            args.run_temp_sh,
+            run_temp_chunks,
+            "run-temp",
+            require_multi_dataset=False,
+        )
+    if args.static:
+        _write_run_only_script(
+            args.run_pivot_static_sh,
+            run_pivot_static_chunks,
+            "run-pivot-static",
+            require_multi_dataset=False,
+        )
 
     print(f"Generated {n_written} job script(s) under {job_root}")
 

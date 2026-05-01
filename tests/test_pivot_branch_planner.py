@@ -69,6 +69,21 @@ def test_dynamic_residual_threshold():
     assert plan.expand_mask.tolist() == [False, True, False]
 
 
+def test_dynamic_softmax_residual_uses_full_vocab_p1_minus_p2():
+    logits = _logits_from_probs(
+        [
+            [0.50, 0.30, 0.20],  # p1 - p2 = 0.2
+            [0.90, 0.05, 0.05],  # 0.85
+            [0.34, 0.33, 0.33],  # 0.01
+        ]
+    )
+    cfg = PivotExpansionConfig(
+        policy="dynamic", criteria="softmax_residual", threshold=0.25, topk=2
+    )
+    plan = build_pivot_expansion_plan(logits, cfg)
+    assert plan.expand_mask.tolist() == [True, False, True]
+
+
 def test_topk_rows_shape():
     logits = _logits_from_probs(
         [

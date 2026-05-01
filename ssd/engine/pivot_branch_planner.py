@@ -10,21 +10,26 @@ import torch
 @dataclass
 class PivotExpansionConfig:
     policy: Literal["static", "dynamic"] = "dynamic"
-    criteria: Literal["top1", "residual"] = "residual"
-    # User-facing probability threshold:
-    # - top1: p1 threshold
-    # - residual: (p1 - p2) threshold
+    criteria: Literal["top1", "residual", "softmax_residual"] = "residual"
+    # User-facing threshold in [0, 1]:
+    # - top1: top-1 probability (binary proxy), converted to logit-margin threshold
+    # - residual: (p1-p2) under binary top1-vs-top2 proxy, converted to logit-margin threshold
+    # - softmax_residual: full-vocab softmax p_top1 - p_top2; compared directly (no logit conversion)
     threshold: float = 0.8
     expansion_pct: float = 0.0
     topk: int = 5
-    # Internal hot-path threshold in logit-margin domain.
+    # For top1/residual: logit-margin-domain threshold after conversion.
+    # For softmax_residual: set equal to ``threshold`` for bookkeeping only; dynamic expansion
+    # uses ``_score_threshold`` (user probability-difference), not logit space.
     logit_threshold: float = field(init=False)
 
     def __post_init__(self) -> None:
         if self.policy not in {"static", "dynamic"}:
             raise ValueError("policy must be one of {'static', 'dynamic'}")
-        if self.criteria not in {"top1", "residual"}:
-            raise ValueError("criteria must be one of {'top1', 'residual'}")
+        if self.criteria not in {"top1", "residual", "softmax_residual"}:
+            raise ValueError(
+                "criteria must be one of {'top1', 'residual', 'softmax_residual'}"
+            )
         if not (0.0 <= float(self.expansion_pct) <= 1.0):
             raise ValueError("expansion_pct must be in [0, 1]")
         if not (0.0 <= float(self.threshold) <= 1.0):
@@ -34,8 +39,11 @@ class PivotExpansionConfig:
 
         if self.criteria == "top1":
             self.logit_threshold = _top1_prob_to_logit_margin_threshold(float(self.threshold))
-        else:
+        elif self.criteria == "residual":
             self.logit_threshold = _residual_prob_to_logit_margin_threshold(float(self.threshold))
+        else:
+            # softmax_residual: compare criteria_scores (p_top1 - p_top2) directly to threshold.
+            self.logit_threshold = float(self.threshold)
 
 
 @dataclass
@@ -120,6 +128,12 @@ def _cap_low_scores(
     return out
 
 
+def _score_threshold(cfg: PivotExpansionConfig) -> float:
+    if cfg.criteria == "softmax_residual":
+        return float(cfg.threshold)
+    return float(cfg.logit_threshold)
+
+
 def _select_expand_mask(
     scores: torch.Tensor,
     cfg: PivotExpansionConfig,
@@ -130,7 +144,7 @@ def _select_expand_mask(
         return torch.zeros(0, dtype=torch.bool, device=device)
 
     if cfg.policy == "dynamic":
-        candidates = scores < float(cfg.logit_threshold)
+        candidates = scores < _score_threshold(cfg)
         if float(cfg.expansion_pct) <= 0.0:
             return candidates
         max_expand = int(math.floor(bsz * float(cfg.expansion_pct)))
@@ -179,9 +193,12 @@ def build_pivot_expansion_plan(
     """Build expansion indices and optional host mirror.
 
     When ``profile_metadata`` is False (normal decode / cost-only profiling), skip
-    top-``k`` softmax and per-branch root probability gather; keep a zero tensor for
-    ``root_token_probs`` shape compatibility. Expansion decisions use logit-margin
-    scores only (plus ``torch.topk`` on logits for candidate token ids).
+    per-branch root probability gather; keep a zero tensor for ``root_token_probs``
+    shape compatibility.
+
+    Expansion scores: for ``softmax_residual``, full-vocab ``p_top1 - p_top2`` from
+    ``logsumexp``; otherwise binary logit margin ``logit_top1 - logit_top2`` (top-2
+    slice). Candidate token ids still come from ``torch.topk`` on logits.
     """
     if first_step_logits.ndim != 2:
         raise ValueError(
@@ -191,16 +208,30 @@ def build_pivot_expansion_plan(
     device = first_step_logits.device
     topk = min(int(cfg.topk), max(1, vocab_size))
 
-    # Need top-2 for logit margin and top-k for root candidates.
+    # Need top-2 for logit margin / full-softmax residual and top-k for root candidates.
     topk_eff = min(max(topk, 2), vocab_size)
-    top_vals_all, top_ids_all = torch.topk(first_step_logits.float(), k=topk_eff, dim=-1)
+    logits_f = first_step_logits.float()
+    top_vals_all, top_ids_all = torch.topk(logits_f, k=topk_eff, dim=-1)
 
     if vocab_size >= 2:
         logit_margin_scores = top_vals_all[:, 0] - top_vals_all[:, 1]
     else:
         logit_margin_scores = torch.full((bsz,), float("inf"), dtype=torch.float32, device=device)
 
-    criteria_scores = logit_margin_scores
+    log_z: torch.Tensor | None = None
+    p1: torch.Tensor | None = None
+    p2: torch.Tensor | None = None
+    if cfg.criteria == "softmax_residual":
+        if vocab_size >= 2:
+            log_z = torch.logsumexp(logits_f, dim=-1)
+            p1 = torch.exp(top_vals_all[:, 0] - log_z)
+            p2 = torch.exp(top_vals_all[:, 1] - log_z)
+            criteria_scores = p1 - p2
+        else:
+            criteria_scores = torch.full((bsz,), 1.0, dtype=torch.float32, device=device)
+    else:
+        criteria_scores = logit_margin_scores
+
     expand_mask = _select_expand_mask(criteria_scores, cfg)
     expand_mask = apply_capacity_limit(
         expand_mask,
@@ -210,13 +241,22 @@ def build_pivot_expansion_plan(
     )
 
     topk_ids = top_ids_all[:, :topk]
-    # Optional profile proxies (sigmoid/tanh): only when metadata rows need them.
     if profile_metadata:
-        top1_probs = torch.sigmoid(logit_margin_scores)
-        residual_scores = torch.tanh(logit_margin_scores / 2.0)
+        if cfg.criteria == "softmax_residual":
+            if vocab_size >= 2:
+                assert p1 is not None and p2 is not None
+                top1_probs = p1
+                residual_scores = p1 - p2
+            else:
+                top1_probs = torch.ones((bsz,), dtype=torch.float32, device=device)
+                residual_scores = torch.ones((bsz,), dtype=torch.float32, device=device)
+        else:
+            top1_probs = torch.sigmoid(logit_margin_scores)
+            residual_scores = torch.tanh(logit_margin_scores / 2.0)
     else:
-        top1_probs = logit_margin_scores  # placeholder; not materialized to host
-        residual_scores = logit_margin_scores  # placeholder; not materialized to host
+        # Same tensor as expansion scores; host/metadata paths do not materialize these when off.
+        top1_probs = criteria_scores
+        residual_scores = criteria_scores
     branch_counts_t = torch.where(
         expand_mask,
         torch.full((bsz,), topk, dtype=torch.int64, device=device),
@@ -236,11 +276,19 @@ def build_pivot_expansion_plan(
         - starts_per_branch
     )
     root_token_ids = topk_ids[parent_index_per_branch, branch_index_per_parent]
-    # Per-branch softmax probability within the top-k column slice: used for profiling /
-    # trace rows only. Winner selection uses verify accept_len, not these values.
+    # Profiling / trace only. For softmax_residual + full vocab, use global softmax prob
+    # of the chosen root token; else top-k local softmax over the candidate slice.
     if profile_metadata:
-        topk_probs = torch.softmax(top_vals_all[:, :topk], dim=-1)
-        root_token_probs = topk_probs[parent_index_per_branch, branch_index_per_parent]
+        if cfg.criteria == "softmax_residual" and vocab_size >= 2:
+            assert log_z is not None
+            log_z_exp = log_z[parent_index_per_branch]
+            root_logits = top_vals_all[
+                parent_index_per_branch, branch_index_per_parent
+            ]
+            root_token_probs = torch.exp(root_logits - log_z_exp).to(torch.float32)
+        else:
+            topk_probs = torch.softmax(top_vals_all[:, :topk], dim=-1)
+            root_token_probs = topk_probs[parent_index_per_branch, branch_index_per_parent]
     else:
         root_token_probs = torch.zeros(
             expanded_batch_size, dtype=torch.float32, device=device

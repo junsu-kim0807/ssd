@@ -14,7 +14,11 @@ def uses_hierarchical_verify(policy: str) -> bool:
 
 
 def uses_pivot_root_expansion(policy: str) -> bool:
-    return policy in {"pivot", "pivot_tree_scratch", "pivot_hierarchical"}
+    return policy in {"pivot", "pivot_tree_scratch", "pivot_hierarchical", "pivot_precollapse"}
+
+
+def uses_pivot_precollapse(policy: str) -> bool:
+    return policy == "pivot_precollapse"
 
 
 def uses_pivot_tree_scratch(policy: str) -> bool:

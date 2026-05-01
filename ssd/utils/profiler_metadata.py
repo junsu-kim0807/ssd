@@ -14,6 +14,11 @@ fields hold the **intermediate** model chain (length K+1), not the target verifi
 chain. They are written as ``intermediate_verify_chain_*``; ``target_*`` columns
 are null. Per-position accept/recovery/bonus for that round remain in ``inter_*``.
 
+Each row includes ``accumulated_draft_token_confidence``: the product of
+``draft_token_confidence_per_position`` (draft model softmax probability of the
+sampled token at each of the ``K`` draft positions), or ``null`` when the list is
+empty.
+
 Target hierarchical rows may include ``inter_target_prefix_accept_len``: greedy
 acceptance count restricted to candidate indices before the last ``K`` draft tail
 tokens (``K = num_speculative_token``).
@@ -25,6 +30,21 @@ from typing import Any
 
 import torch
 import torch.nn.functional as F
+
+
+def accumulated_draft_token_confidence(confs: list[float]) -> float | None:
+    """Product of per-position draft softmax probs (chosen token at each step).
+
+    For ``speculate_k == K``, this equals ``∏_{j=0}^{K-1} p(draft_{j+1} | …)`` using the
+    same probabilities as ``draft_token_confidence_per_position``. Returns ``None`` if
+    ``confs`` is empty.
+    """
+    if not confs:
+        return None
+    out = 1.0
+    for c in confs:
+        out *= float(c)
+    return out
 
 
 def profile_greedy_token_confidence(logits_p: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
@@ -163,6 +183,9 @@ def trace_to_row_indexed(
         "first_draft_token_confidence": first_draft_token_confidence,
         "draft_token_ids_per_position": draft_token_ids_per_position,
         "draft_token_confidence_per_position": draft_token_confidence_per_position,
+        "accumulated_draft_token_confidence": accumulated_draft_token_confidence(
+            draft_token_confidence_per_position
+        ),
         "cache_hit": cache_hit,
     }
     if trace is not None:

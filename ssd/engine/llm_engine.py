@@ -161,7 +161,8 @@ class LLMEngine:
         )
         os.environ["SSD_PROFILE_PIVOT_SYNC"] = (
             "1"
-            if _pivot_cost_cuda_sync and config.spec_policy in {"pivot", "pivot_tree_scratch"}
+            if _pivot_cost_cuda_sync
+            and config.spec_policy in {"pivot", "pivot_tree_scratch", "pivot_precollapse"}
             else "0"
         )
 
