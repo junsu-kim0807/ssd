@@ -78,9 +78,22 @@ def parse_arguments():
 
     # Speculative decoding configuration
     parser.add_argument("--spec", action="store_true", help="Enable speculative decoding")
-    parser.add_argument("--eagle", action="store_true", help="Enable eagle speculative decoding (implies --spec, uses default eagle draft for model)")
+    parser.add_argument(
+        "--eagle",
+        action="store_true",
+        help="Enable eagle speculative decoding (implies --spec, uses default eagle draft for model). "
+        "Sync mode is allowed without --async for any --spec_policy (use optional --sync); "
+        "async mode requires --async.",
+    )
     parser.add_argument("--k", type=int, default=6, help="Speculative decoding k value")
     parser.add_argument("--async", action="store_true", help="Enable async speculative decoding")
+    parser.add_argument(
+        "--sync",
+        action="store_true",
+        dest="sync_spec",
+        help="Synchronous speculative decoding (explicit; mutually exclusive with --async). "
+        "Compatible with --eagle without requiring --async.",
+    )
     parser.add_argument("--f", type=int, default=3, help="Async fan out value")
     parser.add_argument("--fl", type=int, nargs='+', default=None, help="Fan out list (e.g., --fl 1 3 4 becomes [1, 3, 4])")
     parser.add_argument("--flh", type=int, nargs='+', default=None, help="Fan out list (e.g., --flh 1 3 4 becomes [1, 3, 4])")
@@ -298,6 +311,8 @@ def parse_arguments():
     )
 
     args = parser.parse_args()
+    if getattr(args, "sync_spec", False) and getattr(args, "async", False):
+        parser.error("--sync and --async are mutually exclusive")
     _n_hf_preset = int(bool(args.qwen)) + int(bool(getattr(args, "gemma", False))) + int(
         bool(getattr(args, "vicuna", False))
     ) + int(bool(getattr(args, "vicuna13b_160m", False)))
@@ -328,11 +343,9 @@ def parse_arguments():
                     "Eagle with --spec_policy pivot_precollapse requires synchronous speculative decoding "
                     "(omit --async; pivot_precollapse is sync-only)."
                 )
-        else:
-            assert getattr(args, "async", False), (
-                "Eagle currently only supports async speculative decoding "
-                "(except --spec_policy pivot_precollapse, which uses sync EAGLE3)."
-            )
+        # Otherwise: sync EAGLE allowed for any spec_policy (--eagle without --async, optionally with --sync).
+    if getattr(args, "sync_spec", False) and not args.spec:
+        parser.error("--sync requires --spec")
     args.debug_phase0_flat_compare = args.spec_policy == "pivot_opt"
     if args.enable_pivot_draft_scratch_phase2 is None:
         args.enable_pivot_draft_scratch_phase2 = args.spec_policy == "pivot_opt"

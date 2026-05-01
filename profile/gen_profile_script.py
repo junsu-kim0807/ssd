@@ -138,7 +138,7 @@ DEFAULT_GPU_BY_FAMILY_METHOD: dict[tuple[str, str], int] = {
     ("qwen", "hierarchical"): 2,
     ("qwen", "pivot"): 2,
     ("qwen", "pivot_precollapse"): 2,
-    ("qwen", "eagle3"): 3,
+    ("qwen", "eagle3"): 2,
     ("qwen", "pivot_static10"): 2,
     ("qwen", "pivot_precollapse_dyn10"): 2,
     ("qwen", "pivot_precollapse_de10"): 2,
@@ -149,7 +149,7 @@ DEFAULT_GPU_BY_FAMILY_METHOD: dict[tuple[str, str], int] = {
     ("gemma", "hierarchical"): 2,
     ("gemma", "pivot"): 2,
     ("gemma", "pivot_precollapse"): 2,
-    ("gemma", "eagle3"): 3,
+    ("gemma", "eagle3"): 2,
     ("gemma", "pivot_static10"): 2,
     ("gemma", "pivot_precollapse_dyn10"): 2,
     ("gemma", "pivot_precollapse_de10"): 2,
@@ -160,7 +160,7 @@ DEFAULT_GPU_BY_FAMILY_METHOD: dict[tuple[str, str], int] = {
     ("vicuna13b_160m", "hierarchical"): 2,
     ("vicuna13b_160m", "pivot"): 2,
     ("vicuna13b_160m", "pivot_precollapse"): 2,
-    ("vicuna13b_160m", "eagle3"): 3,
+    ("vicuna13b_160m", "eagle3"): 2,
     ("vicuna13b_160m", "pivot_static10"): 2,
     ("vicuna13b_160m", "pivot_precollapse_dyn10"): 2,
     ("vicuna13b_160m", "pivot_precollapse_de10"): 2,
@@ -342,7 +342,7 @@ def _args_pivot(k: int, f: int) -> list[str]:
 
 
 def _args_pivot_precollapse(k: int, _f: int) -> list[str]:
-    """Sync EAGLE3 + pivot_precollapse (bench enables --eagle only without --async for this policy)."""
+    """Sync EAGLE3 + pivot_precollapse (no ``--async``; bench also accepts explicit ``--sync``)."""
     return [
         "--spec",
         "--k",
@@ -368,8 +368,16 @@ def _args_pivot_legacy(k: int, f: int) -> list[str]:
 
 
 def _args_eagle3(k: int, f: int) -> list[str]:
-    """Async EAGLE3 (bench requires --async with --eagle unless pivot_precollapse)."""
-    return ["--spec", "--async", "--eagle", "--k", str(k), "--f", str(f)]
+    """Sync EAGLE3: explicit ``--sync`` plus ``pivot_precollapse`` + ``--eagle`` (no ``--async``)."""
+    return [
+        "--spec",
+        "--sync",
+        "--k",
+        str(k),
+        "--spec_policy",
+        "pivot_precollapse",
+        "--eagle",
+    ]
 
 
 def _args_pivot_static10(k: int, _f: int) -> list[str]:
@@ -401,7 +409,7 @@ METHOD_REGISTRY: dict[str, BenchMethodSpec] = {
     ),
     "eagle3": BenchMethodSpec(
         id="eagle3",
-        description="Async EAGLE3 speculative decoding (--spec --async --eagle)",
+        description="Sync EAGLE3 (--spec --sync --spec_policy pivot_precollapse --eagle)",
         uses_spec_k=True,
         default_k=5,
         extra_bench_args=_args_eagle3,
@@ -983,7 +991,7 @@ def main() -> None:
         default="sync,eagle3,pivot_static10,pivot_precollapse_dyn10,pivot_precollapse_de10",
         help="Comma-separated method ids: ar | sync | eagle3 | async | hierarchical | pivot | pivot_static10 | "
         "pivot_precollapse | pivot_precollapse_dyn10 | pivot_precollapse_de10 | pivot_legacy | … "
-        "(defaults cover sync spec, async EAGLE3, pivot static top10, pivot_precollapse dynamic top10, "
+        "(defaults cover sync spec, sync EAGLE3 via pivot_precollapse, pivot static top10, pivot_precollapse dynamic top10, "
         "pivot_precollapse dynamic_expansion top10).",
     )
     p.add_argument(
