@@ -246,9 +246,8 @@ PIVOT_STATIC_TOPK_SWEEP = (10,)
 PIVOT_STATIC_EXPANSION_PCT = 1.0
 PIVOT_STATIC_POLICY = "static"
 
-# Default slope CSV for generated pivot_precollapse + dynamic_expansion jobs (Config fills if empty).
-DEFAULT_PIVOT_DE_SLOPE_THRESHOLDS = "-0.06,-0.05"
-
+# Default CLI for ``--pivot_expansion_policy dynamic_expansion`` profile jobs (with ``pivot_topk`` 10).
+DEFAULT_PIVOT_DE_SLOPE_THRESHOLDS = "-0.06,-0.05,-0.04"
 
 def resolve_pivot_policy(spec_id: str, args: argparse.Namespace) -> str:
     if spec_id == "pivot_static10":
@@ -262,11 +261,22 @@ def resolve_pivot_policy(spec_id: str, args: argparse.Namespace) -> str:
     return str(args.pivot_expansion_policy)
 
 
-def pivot_criteria_slope_for_spec(spec_id: str) -> tuple[str | None, str | None]:
-    """Extra bench CLI for pivot_precollapse + dynamic_expansion (criteria required by Config)."""
-    if spec_id == "pivot_precollapse_de10":
-        return ("softmax_residual", DEFAULT_PIVOT_DE_SLOPE_THRESHOLDS)
-    return (None, None)
+def pivot_profiler_dynamic_expansion_extras(
+    pivot_policy: str, pivot_topk_val: int
+) -> tuple[str | None, str | None, str | None]:
+    """When policy is ``dynamic_expansion``: softmax_residual + default slope + optional branch tiers.
+
+    Branch CSV is ``2,3,5,<pivot_topk>`` when ``pivot_topk > 5`` (Config forbids non-decreasing ``…,5,5`` when topk==5).
+    """
+    if pivot_policy != "dynamic_expansion":
+        return (None, None, None)
+    tk = int(pivot_topk_val)
+    crit = "softmax_residual"
+    slope_csv = DEFAULT_PIVOT_DE_SLOPE_THRESHOLDS
+    if tk <= 5:
+        return (crit, slope_csv, None)
+    branch_csv = f"2,3,5,{tk}"
+    return (crit, slope_csv, branch_csv)
 
 
 def uses_pivot_batch_length_topk_pct_sweep(method_id: str) -> bool:
@@ -623,6 +633,7 @@ def build_bench_argv(
     pivot_expansion_policy: str | None = None,
     pivot_expansion_criteria: str | None = None,
     pivot_expansion_slope_thresholds: str | None = None,
+    pivot_expansion_slope_branch_counts: str | None = None,
 ) -> list[str]:
     argv: list[str] = [
         "python",
@@ -661,6 +672,8 @@ def build_bench_argv(
             argv.extend(["--pivot_expansion_criteria", str(pivot_expansion_criteria)])
         if pivot_expansion_slope_thresholds is not None and str(pivot_expansion_slope_thresholds).strip():
             argv.extend(["--pivot_expansion_slope_thresholds", str(pivot_expansion_slope_thresholds)])
+        if pivot_expansion_slope_branch_counts is not None and str(pivot_expansion_slope_branch_counts).strip():
+            argv.extend(["--pivot_expansion_slope_branch_counts", str(pivot_expansion_slope_branch_counts)])
     argv.extend(
         [
             "--profile",
@@ -777,6 +790,7 @@ def build_multi_dataset_profile_loop_sh(
     pivot_expansion_policy: str | None = None,
     pivot_expansion_criteria: str | None = None,
     pivot_expansion_slope_thresholds: str | None = None,
+    pivot_expansion_slope_branch_counts: str | None = None,
 ) -> str:
     """Bash loop: ``--profiler_output_dir`` = ``$PROFILE_BASE/$dataset`` (``dataset`` in MULTI_DATASET_PROFILE_SLUGS)."""
     prof_base_q = shell_quote_single("./" + profiler_base_rel.replace(os.sep, "/"))
@@ -820,6 +834,10 @@ def build_multi_dataset_profile_loop_sh(
         if pivot_expansion_slope_thresholds is not None and str(pivot_expansion_slope_thresholds).strip():
             body_lines.append(
                 f"    --pivot_expansion_slope_thresholds {shlex.quote(str(pivot_expansion_slope_thresholds))} \\"
+            )
+        if pivot_expansion_slope_branch_counts is not None and str(pivot_expansion_slope_branch_counts).strip():
+            body_lines.append(
+                f"    --pivot_expansion_slope_branch_counts {shlex.quote(str(pivot_expansion_slope_branch_counts))} \\"
             )
     for tok in extra_bench_args:
         body_lines.append(f"    {shlex.quote(str(tok))} \\")
@@ -1203,7 +1221,9 @@ def main() -> None:
             pivot_topk_pct_cells,
         ):
             pivot_policy_this = resolve_pivot_policy(spec.id, args)
-            p_crit, p_slope = pivot_criteria_slope_for_spec(spec.id)
+            p_crit, p_slope, p_branch = pivot_profiler_dynamic_expansion_extras(
+                pivot_policy_this, int(pivot_topk_val)
+            )
             prof_layout_mid = (
                 profiler_method_id_for_layout(spec.id) if uses_pivot_profiler_layout(spec.id) else spec.id
             )
@@ -1259,6 +1279,7 @@ def main() -> None:
                 pivot_expansion_policy=(pivot_policy_this if uses_pivot_profiler_layout(spec.id) else None),
                 pivot_expansion_criteria=(p_crit if uses_pivot_profiler_layout(spec.id) else None),
                 pivot_expansion_slope_thresholds=(p_slope if uses_pivot_profiler_layout(spec.id) else None),
+                pivot_expansion_slope_branch_counts=(p_branch if uses_pivot_profiler_layout(spec.id) else None),
             )
 
             temp_tag = temp_path_tag(temp_val)
@@ -1343,6 +1364,7 @@ def main() -> None:
                     pivot_expansion_policy=(pivot_policy_this if uses_pivot_profiler_layout(spec.id) else None),
                     pivot_expansion_criteria=(p_crit if uses_pivot_profiler_layout(spec.id) else None),
                     pivot_expansion_slope_thresholds=(p_slope if uses_pivot_profiler_layout(spec.id) else None),
+                    pivot_expansion_slope_branch_counts=(p_branch if uses_pivot_profiler_layout(spec.id) else None),
                 )
                 for ds in MULTI_DATASET_PROFILE_SLUGS:
                     ds_rb = dataset_bench_flags(ds)
@@ -1378,6 +1400,7 @@ def main() -> None:
                             pivot_expansion_policy=(pivot_policy_this if uses_pivot_profiler_layout(spec.id) else None),
                             pivot_expansion_criteria=(p_crit if uses_pivot_profiler_layout(spec.id) else None),
                             pivot_expansion_slope_thresholds=(p_slope if uses_pivot_profiler_layout(spec.id) else None),
+                            pivot_expansion_slope_branch_counts=(p_branch if uses_pivot_profiler_layout(spec.id) else None),
                         ),
                         method_id=spec.id,
                     )
@@ -1442,6 +1465,7 @@ def main() -> None:
                         pivot_expansion_policy=(pivot_policy_this if uses_pivot_profiler_layout(spec.id) else None),
                         pivot_expansion_criteria=(p_crit if uses_pivot_profiler_layout(spec.id) else None),
                         pivot_expansion_slope_thresholds=(p_slope if uses_pivot_profiler_layout(spec.id) else None),
+                        pivot_expansion_slope_branch_counts=(p_branch if uses_pivot_profiler_layout(spec.id) else None),
                     )
                     _record_run_script_argv(bench_argv_ds, method_id=spec.id)
                     text = make_slurm_script(

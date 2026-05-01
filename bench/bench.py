@@ -32,6 +32,13 @@ def parse_pivot_expansion_slope_thresholds(s: str | None) -> tuple[float, ...]:
     return tuple(float(x.strip()) for x in str(s).split(",") if str(x).strip())
 
 
+def parse_pivot_expansion_slope_branch_counts(s: str | None) -> tuple[int, ...]:
+    """Comma-separated ints for ``dynamic_expansion`` bucket branch counts (validated in Config)."""
+    if s is None or not str(s).strip():
+        return ()
+    return tuple(int(x.strip()) for x in str(s).split(",") if str(x).strip())
+
+
 def parse_arguments():
     """Parse command line arguments for benchmarking."""
     parser = argparse.ArgumentParser(description="Benchmark SSD performance (API similar to example.py)")
@@ -162,6 +169,14 @@ def parse_arguments():
         metavar="T0,T1,...",
         help="dynamic_expansion only: comma-separated strictly increasing slope thresholds "
         "(len in [1, pivot_topk-2]). Example: -0.06,-0.05",
+    )
+    parser.add_argument(
+        "--pivot_expansion_slope_branch_counts",
+        type=str,
+        default="",
+        metavar="N0,N1,...",
+        help="dynamic_expansion optional: per-bucket branch counts (length len(slope_thresholds)+1; "
+        "last must equal --pivot_topk). Example with three thresholds and topk=10: 2,3,5,10",
     )
     parser.add_argument(
         "--pivot_topk",
@@ -563,6 +578,9 @@ def initialize_wandb(args, run_name):
             "pivot_expansion_slope_thresholds": parse_pivot_expansion_slope_thresholds(
                 getattr(args, "pivot_expansion_slope_thresholds", "") or ""
             ),
+            "pivot_expansion_slope_branch_counts": parse_pivot_expansion_slope_branch_counts(
+                getattr(args, "pivot_expansion_slope_branch_counts", "") or ""
+            ),
             "pivot_topk": args.pivot_topk,
             "pivot_precollapse_score_method": getattr(
                 args, "pivot_precollapse_score_method", "logprob_sum"
@@ -612,6 +630,9 @@ def create_llm_kwargs(args, draft_path):
         pivot_expansion_threshold=args.pivot_expansion_threshold,
         pivot_expansion_slope_thresholds=parse_pivot_expansion_slope_thresholds(
             getattr(args, "pivot_expansion_slope_thresholds", "") or ""
+        ),
+        pivot_expansion_slope_branch_counts=parse_pivot_expansion_slope_branch_counts(
+            getattr(args, "pivot_expansion_slope_branch_counts", "") or ""
         ),
         pivot_topk=args.pivot_topk,
         pivot_precollapse_score_method=getattr(

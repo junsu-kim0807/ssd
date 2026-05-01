@@ -66,6 +66,9 @@ class Config:
     pivot_expansion_threshold: float = 0.8
     # Only used when pivot_expansion_policy == dynamic_expansion; empty uses (-0.06, -0.05).
     pivot_expansion_slope_thresholds: tuple[float, ...] = ()
+    # Optional; dynamic_expansion only. Length len(slope_thresholds)+1; last entry must equal pivot_topk.
+    # Empty uses consecutive counts ``2..n+1`` then full topk (see ``PivotExpansionConfig``).
+    pivot_expansion_slope_branch_counts: tuple[int, ...] = ()
     # Sync pivot / pivot_precollapse / pivot_tree_scratch: max 10 root candidates per parent.
     pivot_topk: int = 5
     pivot_max_root_branches: int | None = None
@@ -175,6 +178,17 @@ class Config:
             else:
                 self.pivot_expansion_slope_thresholds = tuple(float(x) for x in sth_raw)
             sth = self.pivot_expansion_slope_thresholds
+            sbc_raw = self.pivot_expansion_slope_branch_counts
+            if isinstance(sbc_raw, list):
+                self.pivot_expansion_slope_branch_counts = tuple(int(x) for x in sbc_raw)
+            else:
+                self.pivot_expansion_slope_branch_counts = tuple(int(x) for x in sbc_raw)
+            sbc = self.pivot_expansion_slope_branch_counts
+            if len(sbc) > 0 and self.pivot_expansion_policy != "dynamic_expansion":
+                raise ValueError(
+                    "pivot_expansion_slope_branch_counts is only valid when "
+                    "pivot_expansion_policy='dynamic_expansion'"
+                )
             if len(sth) > 0 and self.pivot_expansion_policy != "dynamic_expansion":
                 raise ValueError(
                     "pivot_expansion_slope_thresholds is only valid when "
@@ -205,6 +219,30 @@ class Config:
                     )
                 if n >= 2 and any(sth[i] >= sth[i + 1] for i in range(n - 1)):
                     raise ValueError("pivot_expansion_slope_thresholds must be strictly increasing")
+                tk_de = int(self.pivot_topk)
+                if len(sbc) > 0:
+                    if len(sbc) != n + 1:
+                        raise ValueError(
+                            "len(pivot_expansion_slope_branch_counts) must be "
+                            "len(pivot_expansion_slope_thresholds) + 1 "
+                            f"(got {len(sbc)} vs {n + 1})"
+                        )
+                    for i, c in enumerate(sbc):
+                        if not (2 <= int(c) <= tk_de):
+                            raise ValueError(
+                                f"pivot_expansion_slope_branch_counts[{i}]={c} must satisfy "
+                                f"2 <= count <= pivot_topk ({tk_de})"
+                            )
+                    if int(sbc[-1]) != tk_de:
+                        raise ValueError(
+                            "pivot_expansion_slope_branch_counts[-1] must equal pivot_topk "
+                            "(full-expansion bucket)"
+                        )
+                    for i in range(len(sbc) - 1):
+                        if int(sbc[i]) > int(sbc[i + 1]):
+                            raise ValueError(
+                                "pivot_expansion_slope_branch_counts must be non-decreasing"
+                            )
             if self.pivot_expansion_criteria not in {"top1", "residual", "softmax_residual"}:
                 raise ValueError(
                     "pivot_expansion_criteria must be one of "

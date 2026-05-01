@@ -16,6 +16,12 @@ TARGET = resolve_snapshot(f"{HF_CACHE_DIR}/models--meta-llama--Llama-3.1-70B-Ins
 DRAFT = resolve_snapshot(f"{HF_CACHE_DIR}/models--meta-llama--Llama-3.2-1B-Instruct")
 
 
+def _parse_pivot_expansion_slope_branch_counts(s: str | None) -> tuple[int, ...]:
+    if s is None or not str(s).strip():
+        return ()
+    return tuple(int(x.strip()) for x in str(s).split(",") if str(x).strip())
+
+
 def _parse_pivot_expansion_slope_thresholds(s: str | None) -> tuple[float, ...]:
     if s is None or not str(s).strip():
         return ()
@@ -69,6 +75,13 @@ def parse_args():
         default="",
         metavar="T0,T1,...",
         help="dynamic_expansion: comma-separated strictly increasing thresholds.",
+    )
+    p.add_argument(
+        "--pivot_expansion_slope_branch_counts",
+        type=str,
+        default="",
+        metavar="N0,N1,...",
+        help="dynamic_expansion optional: branch counts per slope bucket (len thresholds + 1; ends with pivot_topk).",
     )
     p.add_argument(
         "--pivot_topk",
@@ -127,6 +140,9 @@ def ssd_chat(args):
               pivot_expansion_threshold=args.pivot_expansion_threshold,
               pivot_expansion_slope_thresholds=_parse_pivot_expansion_slope_thresholds(
                   getattr(args, "pivot_expansion_slope_thresholds", "") or ""
+              ),
+              pivot_expansion_slope_branch_counts=_parse_pivot_expansion_slope_branch_counts(
+                  getattr(args, "pivot_expansion_slope_branch_counts", "") or ""
               ),
               pivot_topk=args.pivot_topk)
 

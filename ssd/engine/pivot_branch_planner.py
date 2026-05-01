@@ -25,6 +25,9 @@ class PivotExpansionConfig:
     # dynamic_expansion only: strictly increasing thresholds for
     # (p_topK - p_top2) / (K - 2) slope buckets (K == topk).
     slope_thresholds: tuple[float, ...] = ()
+    # Optional override for per-bucket branch counts (len == len(slope_thresholds) + 1).
+    # Default when empty: ``[2, 3, ..., n+1, topk]`` via ``range(2, 2+n) + [topk]``.
+    slope_branch_counts: tuple[int, ...] = ()
 
     def __post_init__(self) -> None:
         if self.policy not in {"static", "dynamic", "dynamic_expansion"}:
@@ -60,6 +63,26 @@ class PivotExpansionConfig:
                     "dynamic_expansion requires criteria='softmax_residual' "
                     "(selection score domain must match slope domain)"
                 )
+            bc = tuple(int(x) for x in self.slope_branch_counts)
+            self.slope_branch_counts = bc
+            if len(bc) > 0:
+                if len(bc) != n + 1:
+                    raise ValueError(
+                        "len(slope_branch_counts) must be len(slope_thresholds) + 1 "
+                        f"when slope_branch_counts is set (got {len(bc)} vs n+1={n + 1})"
+                    )
+                for i, c in enumerate(bc):
+                    if not (2 <= int(c) <= tk):
+                        raise ValueError(
+                            f"slope_branch_counts[{i}]={c} must satisfy 2 <= count <= topk ({tk})"
+                        )
+                if int(bc[-1]) != tk:
+                    raise ValueError(
+                        "slope_branch_counts[-1] must equal topk (full-expansion bucket)"
+                    )
+                for i in range(len(bc) - 1):
+                    if int(bc[i]) > int(bc[i + 1]):
+                        raise ValueError("slope_branch_counts must be non-decreasing")
 
         if self.criteria == "top1":
             self.logit_threshold = _top1_prob_to_logit_margin_threshold(float(self.threshold))
@@ -205,7 +228,11 @@ def _dynamic_expansion_branch_counts_from_slope(
     bucket = torch.bucketize(slope_scores.float(), thresholds, right=False)
     n = len(cfg.slope_thresholds)
     topk = int(cfg.topk)
-    branch_options = list(range(2, 2 + n)) + [topk]
+    custom = tuple(int(x) for x in (cfg.slope_branch_counts or ()))
+    if custom:
+        branch_options = list(custom)
+    else:
+        branch_options = list(range(2, 2 + n)) + [topk]
     branch_options_t = torch.tensor(branch_options, dtype=torch.int64, device=device)
     counts = branch_options_t[bucket]
     return torch.where(

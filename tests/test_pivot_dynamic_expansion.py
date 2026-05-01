@@ -30,6 +30,23 @@ def test_dynamic_expansion_bucketize_boundary_table() -> None:
     assert counts.tolist() == [2, 3, 3, 5]
 
 
+def test_dynamic_expansion_custom_slope_branch_counts() -> None:
+    """Optional ``slope_branch_counts`` maps buckets to 2,3,5,topk instead of 2,3,4,topk."""
+    cfg = PivotExpansionConfig(
+        policy="dynamic_expansion",
+        criteria="softmax_residual",
+        threshold=0.0,
+        expansion_pct=1.0,
+        topk=10,
+        slope_thresholds=(-0.06, -0.05, -0.04),
+        slope_branch_counts=(2, 3, 5, 10),
+    )
+    slopes = torch.tensor([-0.0700, -0.0550, -0.0450, -0.0350], dtype=torch.float32)
+    expand = torch.ones(4, dtype=torch.bool)
+    counts = _dynamic_expansion_branch_counts_from_slope(slopes, expand, cfg)
+    assert counts.tolist() == [2, 3, 5, 10]
+
+
 def test_non_expanded_parents_get_branch_count_one() -> None:
     cfg = PivotExpansionConfig(
         policy="dynamic_expansion",

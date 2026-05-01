@@ -89,6 +89,7 @@ def build_spec_components(
                 "pivot_expansion_threshold": config.pivot_expansion_threshold,
                 "pivot_expansion_criteria": config.pivot_expansion_criteria,
                 "pivot_expansion_slope_thresholds": config.pivot_expansion_slope_thresholds,
+                "pivot_expansion_slope_branch_counts": config.pivot_expansion_slope_branch_counts,
                 "pivot_expansion_threshold_domain": _pivot_expansion_threshold_domain_label(
                     config.pivot_expansion_criteria
                 ),
@@ -111,6 +112,7 @@ def build_spec_components(
                 threshold=config.pivot_expansion_threshold,
                 topk=config.pivot_topk,
                 slope_thresholds=tuple(config.pivot_expansion_slope_thresholds),
+                slope_branch_counts=tuple(config.pivot_expansion_slope_branch_counts),
             ),
             max_expand_rows=max_expand_rows,
             enable_profile_trace=enable_profile_trace,
@@ -142,6 +144,7 @@ def build_spec_components(
                 "pivot_expansion_threshold": config.pivot_expansion_threshold,
                 "pivot_expansion_criteria": config.pivot_expansion_criteria,
                 "pivot_expansion_slope_thresholds": config.pivot_expansion_slope_thresholds,
+                "pivot_expansion_slope_branch_counts": config.pivot_expansion_slope_branch_counts,
                 "pivot_expansion_threshold_domain": _pivot_expansion_threshold_domain_label(
                     config.pivot_expansion_criteria
                 ),
@@ -165,6 +168,7 @@ def build_spec_components(
                 threshold=config.pivot_expansion_threshold,
                 topk=config.pivot_topk,
                 slope_thresholds=tuple(config.pivot_expansion_slope_thresholds),
+                slope_branch_counts=tuple(config.pivot_expansion_slope_branch_counts),
             ),
             max_expand_rows=max_expand_rows,
             enable_profile_trace=enable_profile_trace,
@@ -207,6 +211,7 @@ def build_spec_components(
                 threshold=config.pivot_expansion_threshold,
                 topk=config.pivot_topk,
                 slope_thresholds=tuple(config.pivot_expansion_slope_thresholds),
+                slope_branch_counts=tuple(config.pivot_expansion_slope_branch_counts),
             ),
             max_expand_rows=max_expand_rows,
             enable_profile_trace=enable_profile_trace,
