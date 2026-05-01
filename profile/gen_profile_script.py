@@ -368,16 +368,8 @@ def _args_pivot_legacy(k: int, f: int) -> list[str]:
 
 
 def _args_eagle3(k: int, f: int) -> list[str]:
-    """Sync EAGLE3: explicit ``--sync`` plus ``pivot_precollapse`` + ``--eagle`` (no ``--async``)."""
-    return [
-        "--spec",
-        "--sync",
-        "--k",
-        str(k),
-        "--spec_policy",
-        "pivot_precollapse",
-        "--eagle",
-    ]
+    """Sync EAGLE3: ``--spec --sync --eagle`` with default ``bench.py --spec_policy`` (no override)."""
+    return ["--spec", "--sync", "--k", str(k), "--eagle"]
 
 
 def _args_pivot_static10(k: int, _f: int) -> list[str]:
@@ -409,7 +401,7 @@ METHOD_REGISTRY: dict[str, BenchMethodSpec] = {
     ),
     "eagle3": BenchMethodSpec(
         id="eagle3",
-        description="Sync EAGLE3 (--spec --sync --spec_policy pivot_precollapse --eagle)",
+        description="Sync EAGLE3 (--spec --sync --eagle; default spec_policy)",
         uses_spec_k=True,
         default_k=5,
         extra_bench_args=_args_eagle3,
@@ -991,7 +983,7 @@ def main() -> None:
         default="sync,eagle3,pivot_static10,pivot_precollapse_dyn10,pivot_precollapse_de10",
         help="Comma-separated method ids: ar | sync | eagle3 | async | hierarchical | pivot | pivot_static10 | "
         "pivot_precollapse | pivot_precollapse_dyn10 | pivot_precollapse_de10 | pivot_legacy | … "
-        "(defaults cover sync spec, sync EAGLE3 via pivot_precollapse, pivot static top10, pivot_precollapse dynamic top10, "
+        "(defaults cover sync spec, sync EAGLE3 (default spec_policy), pivot static top10, pivot_precollapse dynamic top10, "
         "pivot_precollapse dynamic_expansion top10).",
     )
     p.add_argument(
