@@ -66,7 +66,12 @@ def prepare_decode_tensors_from_seqs(
     *,
     hv_block_debug: bool = False,
     decode_lookahead_hint: int = 0,
+    use_eagle: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    # EAGLE draft prefill consumes ``skip_first_token=1``, leaving draft KV one slot
+    # short of the logical token count. Apply pos_offset=-1 in sync draft decode so
+    # the recovery token lands at slot N-1 (matching async jit_speculate semantics).
+    eagle_pos_offset = -1 if (is_draft and use_eagle and not verify) else 0
     input_ids = []
     positions = []
     slot_mapping = []
@@ -97,8 +102,8 @@ def prepare_decode_tensors_from_seqs(
                 context_len = len(seq) + pt
             else:
                 last_tok = seq.last_token
-                logical_pos = len(seq) - 1
-                context_len = len(seq)
+                logical_pos = len(seq) - 1 + eagle_pos_offset
+                context_len = len(seq) + eagle_pos_offset
             required_blocks_now = (context_len + block_size - 1) // block_size
             required_blocks_with_lookahead = (
                 (context_len + decode_lookahead_hint + block_size - 1) // block_size

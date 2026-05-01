@@ -35,9 +35,12 @@ Output top-level schema:
 Notes:
   - "motivation" reads analysis.jsonl and drops the "notes" field.
   - "insight" reads metadata.jsonl and computes:
-      1) misspeculation top-k inclusiveness for target_accept_len == 0 rows,
+      1) misspeculation top-k inclusiveness (top1..top10) for target_accept_len == 0 rows,
       2) misspeculation confidence correlation for target_accept_len == 0 rows,
-      3) confidence_distribution for all metadata rows.
+      3) confidence_distribution for all metadata rows,
+      4) confidence_misspeuclation_position_correlation (buckets top2..top5, top10, others) for target_accept_len == 0 rows
+      5) oracle_acceptance_length from metadata.jsonl plus analysis.jsonl,
+      6) markov_chain over consecutive target_accept_len values within each request_id.
   - "trace" reads metadata.jsonl and stores target_accept_len for request IDs
     4..14 and step IDs 1..20 by default. Missing steps are stored as None.
   - "results" reads cost_breakdown.json and drops the "notes" field.
@@ -52,6 +55,8 @@ import re
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 
+# Align with ``ssd.utils.profiler_metadata.FIRST_DRAFT_METADATA_TOPK`` (first-position draft top-k in metadata rows).
+FIRST_DRAFT_METADATA_TOPK = 10
 
 # -----------------------------
 # Basic parsing helpers
@@ -141,6 +146,47 @@ def strip_notes(obj: Dict[str, Any]) -> Dict[str, Any]:
     return {k: v for k, v in obj.items() if k != "notes"}
 
 
+def read_first_jsonl_object(path: Path) -> Optional[Dict[str, Any]]:
+    """Read the first JSON object from a JSONL file. Return None when empty or missing."""
+    if not path.exists():
+        return None
+
+    for obj in iter_jsonl(path):
+        return obj
+
+    return None
+
+
+def _as_int(value: Any) -> Optional[int]:
+    """Best-effort conversion to int. Return None for missing or invalid values."""
+    if value is None:
+        return None
+
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _as_float(value: Any) -> Optional[float]:
+    """Best-effort conversion to float. Return None for missing or invalid values."""
+    if value is None:
+        return None
+
+    try:
+        out = float(value)
+    except (TypeError, ValueError):
+        return None
+
+    return out if math.isfinite(out) else None
+
+
+def _mean(values: List[int]) -> Optional[float]:
+    if not values:
+        return None
+    return sum(values) / len(values)
+
+
 # -----------------------------
 # Run discovery and context
 # -----------------------------
@@ -181,7 +227,11 @@ def parse_context(run_dir: Path, keyed_root: Path) -> Dict[str, Any]:
     pivot_topk: int | None = None
     pivot_expansion_pct: Any | None = None
 
-    if len(parts) >= 10 and parts[0] == "pivot" and parts[1] in {"dynamic", "static"}:
+    if len(parts) >= 10 and parts[0] == "pivot" and parts[1] in {
+        "dynamic",
+        "static",
+        "dynamic_expansion",
+    }:
         # New pivot layout:
         # pivot/<policy>/b*/k*/pair/t*/r_*/topk*/pct*/dataset
         method = "pivot"
@@ -279,14 +329,346 @@ def build_motivation_entries(analysis_path: Path, ctx: Dict[str, Any]) -> List[D
 # -----------------------------
 
 
+TARGET_VERIFY_MODELS = ("target", "pivot_target")
+
+
+def is_target_verify_row(row: Dict[str, Any]) -> bool:
+    """Return True for target-side verification rows only."""
+    return row.get("verification_model") in TARGET_VERIFY_MODELS
+
+
 def is_target_misspeculation_row(row: Dict[str, Any]) -> bool:
     """A misspeculation row is a *target* verify slot with target_accept_len == 0."""
-    if row.get("verification_model") not in ("target", "pivot_target"):
+    if not is_target_verify_row(row):
         return False
     return row.get("target_accept_len") == 0
 
 
-def compute_topk_inclusiveness(miss_rows: List[Dict[str, Any]], max_topk: int = 5) -> Dict[str, Any]:
+def _get_row_speculative_length(
+    row: Dict[str, Any],
+    ctx: Dict[str, Any],
+    analysis_obj: Optional[Dict[str, Any]],
+) -> Optional[int]:
+    """Resolve num_speculative_token for a metadata row, then fall back to run context."""
+    candidates = [
+        row.get("num_speculative_token"),
+        ctx.get("speculative_length"),
+    ]
+    if analysis_obj is not None:
+        candidates.append(analysis_obj.get("speculate_k"))
+
+    for candidate in candidates:
+        out = _as_int(candidate)
+        if out is not None:
+            return out
+
+    return None
+
+
+def _target_accept_len_rows(
+    rows: List[Dict[str, Any]],
+    ctx: Dict[str, Any],
+    analysis_obj: Optional[Dict[str, Any]],
+) -> List[Tuple[int, Optional[int]]]:
+    """Return target accept lengths with their per-row speculative length in file order."""
+    out: List[Tuple[int, Optional[int]]] = []
+
+    for row in rows:
+        if not is_target_verify_row(row):
+            continue
+
+        accept_len = _as_int(row.get("target_accept_len"))
+        if accept_len is None:
+            continue
+
+        out.append((accept_len, _get_row_speculative_length(row, ctx, analysis_obj)))
+
+    return out
+
+
+def compute_oracle_acceptance_length(
+    rows: List[Dict[str, Any]],
+    ctx: Dict[str, Any],
+    analysis_obj: Optional[Dict[str, Any]],
+    mean_check_atol: float = 1e-6,
+    mean_check_rtol: float = 1e-6,
+) -> Dict[str, Any]:
+    """
+    Build the oracle acceptance-length summary requested for the insight key.
+
+    Procedure:
+      1. Read avg_target_accept_len, avg_target_accept_len_incl_recovery, and
+         total_target_verification_rounds from analysis.jsonl.
+      2. Read target_accept_len from all target verification rows in metadata.jsonl.
+      3. Check that the metadata mean equals avg_target_accept_len.
+      4. Replace every 0 accept length with num_speculative_token.
+      5. Accumulate replaced_accept_len + 1 until reaching generated-token count.
+      6. Truncate at that point and report the oracle average.
+    """
+    target_pairs = _target_accept_len_rows(rows, ctx, analysis_obj)
+    target_accept_len_list = [accept_len for accept_len, _ in target_pairs]
+
+    true_avg_accept_len = None
+    avg_target_accept_len_incl_recovery = None
+    total_target_verification_rounds = None
+    num_generated_tokens = None
+
+    if analysis_obj is not None:
+        true_avg_accept_len = _as_float(analysis_obj.get("avg_target_accept_len"))
+        avg_target_accept_len_incl_recovery = _as_float(
+            analysis_obj.get("avg_target_accept_len_incl_recovery")
+        )
+        total_target_verification_rounds = _as_int(
+            analysis_obj.get("total_target_verification_rounds")
+        )
+
+        if (
+            avg_target_accept_len_incl_recovery is not None
+            and total_target_verification_rounds is not None
+        ):
+            num_generated_tokens = (
+                avg_target_accept_len_incl_recovery * total_target_verification_rounds
+            )
+
+    metadata_avg_target_accept_len = _mean(target_accept_len_list)
+    mean_abs_error = None
+    mean_matches = None
+
+    if true_avg_accept_len is not None and metadata_avg_target_accept_len is not None:
+        mean_abs_error = abs(metadata_avg_target_accept_len - true_avg_accept_len)
+        mean_matches = math.isclose(
+            metadata_avg_target_accept_len,
+            true_avg_accept_len,
+            rel_tol=mean_check_rtol,
+            abs_tol=mean_check_atol,
+        )
+
+    default_k = None
+    k_candidates: List[int] = []
+    for _, row_k in target_pairs:
+        if row_k is not None:
+            k_candidates.append(row_k)
+    if k_candidates:
+        default_k = max(k_candidates)
+    else:
+        default_k = _get_row_speculative_length({}, ctx, analysis_obj)
+
+    zero_replacement_missing_k_count = 0
+    oracle_target_accept_len_list: List[int] = []
+    for accept_len, row_k in target_pairs:
+        if accept_len == 0:
+            replacement = row_k if row_k is not None else default_k
+            if replacement is None:
+                zero_replacement_missing_k_count += 1
+                replacement = accept_len
+            oracle_target_accept_len_list.append(replacement)
+        else:
+            oracle_target_accept_len_list.append(accept_len)
+
+    sum_accepted_tokens = 0.0
+    truncation_index = None
+
+    if num_generated_tokens is not None:
+        for idx, accept_len in enumerate(oracle_target_accept_len_list):
+            sum_accepted_tokens += accept_len + 1
+            if sum_accepted_tokens >= num_generated_tokens:
+                truncation_index = idx
+                break
+
+    if truncation_index is None:
+        truncated_oracle_target_accept_len_list = list(oracle_target_accept_len_list)
+        if num_generated_tokens is None:
+            sum_accepted_tokens_until_truncation = None
+        else:
+            sum_accepted_tokens_until_truncation = sum(
+                accept_len + 1 for accept_len in truncated_oracle_target_accept_len_list
+            )
+    else:
+        truncated_oracle_target_accept_len_list = oracle_target_accept_len_list[
+            : truncation_index + 1
+        ]
+        sum_accepted_tokens_until_truncation = sum_accepted_tokens
+
+    oracle_avg_acceptance_length = _mean(truncated_oracle_target_accept_len_list)
+    oracle_avg_committed_length = (
+        oracle_avg_acceptance_length + 1
+        if oracle_avg_acceptance_length is not None
+        else None
+    )
+
+    return {
+        "analysis_jsonl_available": analysis_obj is not None,
+        "true_avg_accept_len": true_avg_accept_len,
+        "avg_target_accept_len_incl_recovery": avg_target_accept_len_incl_recovery,
+        "total_target_verification_rounds": total_target_verification_rounds,
+        "num_generated_tokens": num_generated_tokens,
+        "num_target_accept_len_rows": len(target_accept_len_list),
+        "target_accept_len_list": target_accept_len_list,
+        "metadata_avg_target_accept_len": metadata_avg_target_accept_len,
+        "metadata_avg_matches_true_avg_accept_len": mean_matches,
+        "metadata_avg_abs_error": mean_abs_error,
+        "zero_replacement_value_default": default_k,
+        "zero_replacement_missing_k_count": zero_replacement_missing_k_count,
+        "oracle_target_accept_len_list": oracle_target_accept_len_list,
+        "truncation_index": truncation_index,
+        "truncated_rounds": len(truncated_oracle_target_accept_len_list),
+        "truncated_oracle_target_accept_len_list": truncated_oracle_target_accept_len_list,
+        "sum_accepted_tokens_until_truncation": sum_accepted_tokens_until_truncation,
+        "oracle_reached_num_generated_tokens": (
+            bool(
+                num_generated_tokens is not None
+                and sum_accepted_tokens_until_truncation is not None
+                and sum_accepted_tokens_until_truncation >= num_generated_tokens
+            )
+        ),
+        "oracle_avg_acceptance_length": oracle_avg_acceptance_length,
+        "oracle_avg_committed_length": oracle_avg_committed_length,
+    }
+
+
+def compute_markov_chain(
+    rows: List[Dict[str, Any]],
+    ctx: Dict[str, Any],
+    analysis_obj: Optional[Dict[str, Any]],
+) -> Dict[str, Any]:
+    """
+    Compute P(next target_accept_len | current target_accept_len) per request.
+
+    metadata.jsonl is usually ordered by decode step, then by request. Adjacent
+    file rows can therefore correspond to different requests. A temporal Markov
+    transition must instead be computed within each request_id sequence:
+
+      request r: step t accept_len -> step t+1 accept_len
+
+    The global transition matrix below pools those per-request transitions.
+    """
+    target_accept_lens_file_order: List[int] = []
+    row_k_values: List[int] = []
+
+    # request_id -> list of (sort_key, accept_len)
+    events_by_request: Dict[int, List[Tuple[Tuple[int, int, int, int], int]]] = {}
+
+    skipped_missing_accept_len_rows = 0
+    skipped_missing_request_id_rows = 0
+
+    for file_idx, row in enumerate(rows):
+        if not is_target_verify_row(row):
+            continue
+
+        accept_len = _as_int(row.get("target_accept_len"))
+        if accept_len is None:
+            skipped_missing_accept_len_rows += 1
+            continue
+
+        target_accept_lens_file_order.append(accept_len)
+
+        row_k = _get_row_speculative_length(row, ctx, analysis_obj)
+        if row_k is not None:
+            row_k_values.append(row_k)
+
+        request_id = _as_int(row.get("request_id"))
+        if request_id is None:
+            skipped_missing_request_id_rows += 1
+            continue
+
+        step_id = _as_int(row.get("step_id"))
+        target_round = _as_int(row.get("target_verification_round"))
+        intermediate_round = _as_int(row.get("intermediate_verification_round"))
+
+        sort_step = step_id if step_id is not None else file_idx
+        sort_target_round = target_round if target_round is not None else 0
+        sort_intermediate_round = intermediate_round if intermediate_round is not None else 0
+        sort_key = (sort_step, sort_target_round, sort_intermediate_round, file_idx)
+
+        events_by_request.setdefault(request_id, []).append((sort_key, accept_len))
+
+    max_state_candidates = [0]
+    max_state_candidates.extend(target_accept_lens_file_order)
+    max_state_candidates.extend(row_k_values)
+
+    ctx_k = _get_row_speculative_length({}, ctx, analysis_obj)
+    if ctx_k is not None:
+        max_state_candidates.append(ctx_k)
+
+    max_state = max(max_state_candidates)
+    states = list(range(max_state + 1))
+
+    transition_counts: Dict[int, List[int]] = {
+        state: [0 for _ in states] for state in states
+    }
+    outgoing_counts: Dict[int, int] = {state: 0 for state in states}
+
+    target_accept_len_by_request: Dict[str, List[int]] = {}
+    request_sequence_lengths: Dict[str, int] = {}
+    skipped_transitions = 0
+    num_transitions = 0
+    num_requests_with_transitions = 0
+
+    for request_id, events in sorted(events_by_request.items()):
+        events.sort(key=lambda item: item[0])
+        seq = [accept_len for _, accept_len in events]
+
+        target_accept_len_by_request[str(request_id)] = seq
+        request_sequence_lengths[str(request_id)] = len(seq)
+
+        if len(seq) < 2:
+            continue
+
+        num_requests_with_transitions += 1
+
+        for cur, nxt in zip(seq, seq[1:]):
+            if cur < 0 or nxt < 0 or cur > max_state or nxt > max_state:
+                skipped_transitions += 1
+                continue
+
+            transition_counts[cur][nxt] += 1
+            outgoing_counts[cur] += 1
+            num_transitions += 1
+
+    transition_probs: Dict[str, List[float]] = {}
+    transition_counts_out: Dict[str, List[int]] = {}
+    outgoing_counts_out: Dict[str, int] = {}
+
+    for state in states:
+        denom = outgoing_counts[state]
+        counts = transition_counts[state]
+        if denom > 0:
+            probs = [count / denom for count in counts]
+        else:
+            probs = [0.0 for _ in counts]
+
+        transition_probs[str(state)] = probs
+        transition_counts_out[str(state)] = counts
+        outgoing_counts_out[str(state)] = denom
+
+    file_order_transition_count = max(0, len(target_accept_lens_file_order) - 1)
+
+    return {
+        "transition_scope": "per_request",
+        "transition_order": "sort by (step_id, target_verification_round, intermediate_verification_round, file_idx) within each request_id",
+        "states": states,
+        "target_accept_len_list": target_accept_lens_file_order,
+        "target_accept_len_by_request": target_accept_len_by_request,
+        "request_sequence_lengths": request_sequence_lengths,
+        "num_target_accept_len_rows": len(target_accept_lens_file_order),
+        "num_request_sequences": len(events_by_request),
+        "num_requests_with_transitions": num_requests_with_transitions,
+        "num_transitions": num_transitions,
+        "file_order_transition_count_not_used": file_order_transition_count,
+        "cross_request_file_order_transitions_excluded": file_order_transition_count - num_transitions,
+        "skipped_missing_accept_len_rows": skipped_missing_accept_len_rows,
+        "skipped_missing_request_id_rows": skipped_missing_request_id_rows,
+        "skipped_transitions": skipped_transitions,
+        "transition_probabilities": transition_probs,
+        "transition_counts": transition_counts_out,
+        "outgoing_counts": outgoing_counts_out,
+    }
+
+
+def compute_topk_inclusiveness(
+    miss_rows: List[Dict[str, Any]],
+    max_topk: int = FIRST_DRAFT_METADATA_TOPK,
+) -> Dict[str, Any]:
     counts = {f"top{k}": 0 for k in range(1, max_topk + 1)}
     n = len(miss_rows)
 
@@ -389,16 +771,206 @@ def compute_confidence_distribution_rows(all_rows: List[Dict[str, Any]]) -> List
     return rows
 
 
-def build_insight_entry(metadata_path: Path, ctx: Dict[str, Any]) -> Dict[str, Any]:
+MISSPEC_POSITION_CATEGORIES = ("top2", "top3", "top4", "top5", "top10", "others")
+
+
+def _empty_category_lists() -> Dict[str, List[Any]]:
+    return {category: [] for category in MISSPEC_POSITION_CATEGORIES}
+
+
+def _target_recovery_rank_category(
+    row: Dict[str, Any],
+    max_topk: int = FIRST_DRAFT_METADATA_TOPK,
+) -> Tuple[str, Optional[int]]:
+    """
+    Classify the misspeculated target token by its rank in ``first_draft_token_ids``.
+
+    For target_accept_len == 0 rows, compare ``target_recovery_token`` to the draft
+    top-``max_topk`` at position 0. Categories: top2..top5 (ranks 2--5), ``top10`` for
+    ranks 6--10 (indices 5--9), and ``others`` (including top1 matches and misses).
+    """
+    recovery = row.get("target_recovery_token")
+    first_ids = row.get("first_draft_token_ids") or []
+
+    if recovery is None or not isinstance(first_ids, list):
+        return "others", None
+
+    try:
+        rank_idx = first_ids[:max_topk].index(recovery)
+    except ValueError:
+        return "others", None
+
+    if rank_idx == 0:
+        return "others", rank_idx
+    if rank_idx == 1:
+        return "top2", rank_idx
+    if rank_idx == 2:
+        return "top3", rank_idx
+    if rank_idx == 3:
+        return "top4", rank_idx
+    if rank_idx == 4:
+        return "top5", rank_idx
+    if 5 <= rank_idx <= 9:
+        return "top10", rank_idx
+    return "others", rank_idx
+
+
+def _ensure_len(values: List[Any], target_len: int, fill_value: Any = 0.0) -> None:
+    while len(values) < target_len:
+        values.append(fill_value)
+
+
+def _average_or_none(total: float, count: int) -> Optional[float]:
+    return total / count if count > 0 else None
+
+
+def compute_confidence_misspeuclation_position_correlation(
+    miss_rows: List[Dict[str, Any]],
+    max_topk: int = FIRST_DRAFT_METADATA_TOPK,
+) -> Dict[str, Any]:
+    """
+    Correlate misspeculation confidence with the target-token draft rank bucket.
+
+    Output schema:
+      selection_criteria:
+        top1_confidence[category] contains first_draft_token_confidence[0]
+        residual_confidence[category] contains
+          first_draft_token_confidence[0] - first_draft_token_confidence[1]
+
+      raw_distribution[category] averages the full first_draft_token_confidence
+      vector over rows whose target_recovery_token lands in that category.
+
+    Categories are top2, top3, top4, top5, top10 (ranks 6--10 within the stored
+    top-k list), and others. The total list length for each selection criterion
+    equals the number of misspeculation rows.
+    """
+    selection_criteria: Dict[str, Dict[str, List[Any]]] = {
+        "top1_confidence": _empty_category_lists(),
+        "residual_confidence": _empty_category_lists(),
+    }
+
+    category_counts: Dict[str, int] = {category: 0 for category in MISSPEC_POSITION_CATEGORIES}
+    unexpected_top1_match_count = 0
+    missing_target_or_topk_count = 0
+
+    raw_sums: Dict[str, List[float]] = {category: [] for category in MISSPEC_POSITION_CATEGORIES}
+    raw_value_counts: Dict[str, List[int]] = {category: [] for category in MISSPEC_POSITION_CATEGORIES}
+
+    rows_by_category: Dict[str, List[Dict[str, Any]]] = {
+        category: [] for category in MISSPEC_POSITION_CATEGORIES
+    }
+
+    for row in miss_rows:
+        category, rank_idx = _target_recovery_rank_category(row, max_topk=max_topk)
+        category_counts[category] += 1
+
+        if rank_idx == 0:
+            unexpected_top1_match_count += 1
+        if rank_idx is None:
+            first_ids = row.get("first_draft_token_ids") or []
+            if row.get("target_recovery_token") is None or not isinstance(first_ids, list):
+                missing_target_or_topk_count += 1
+
+        top1_confidence, residual_confidence = extract_first_draft_confidence_pair(row)
+        selection_criteria["top1_confidence"][category].append(_as_float(top1_confidence))
+        selection_criteria["residual_confidence"][category].append(_as_float(residual_confidence))
+
+        first_conf = row.get("first_draft_token_confidence") or []
+        if isinstance(first_conf, list):
+            _ensure_len(raw_sums[category], len(first_conf), 0.0)
+            _ensure_len(raw_value_counts[category], len(first_conf), 0)
+
+            for pos, value in enumerate(first_conf):
+                value_float = _as_float(value)
+                if value_float is None:
+                    continue
+                raw_sums[category][pos] += value_float
+                raw_value_counts[category][pos] += 1
+
+        rows_by_category[category].append(
+            {
+                "step_id": row.get("step_id"),
+                "request_id": row.get("request_id"),
+                "target_recovery_token": row.get("target_recovery_token"),
+                "target_rank_category": category,
+                "target_rank_index": rank_idx,
+                "first_draft_token_ids": row.get("first_draft_token_ids"),
+                "first_draft_token_confidence": row.get("first_draft_token_confidence"),
+            }
+        )
+
+    raw_distribution: Dict[str, Dict[str, Any]] = {}
+    for category in MISSPEC_POSITION_CATEGORIES:
+        sums = raw_sums[category]
+        counts = raw_value_counts[category]
+        avg = [
+            _average_or_none(total, count)
+            for total, count in zip(sums, counts)
+        ]
+
+        raw_distribution[category] = {
+            "count": category_counts[category],
+            "avg_first_draft_token_confidence": avg,
+            "sum_first_draft_token_confidence": sums,
+            "num_values_per_position": counts,
+        }
+
+    selection_criteria_list_lengths = {
+        criterion: {
+            category: len(values)
+            for category, values in category_values.items()
+        }
+        for criterion, category_values in selection_criteria.items()
+    }
+
+    selection_criteria_total_list_lengths = {
+        criterion: sum(lengths.values())
+        for criterion, lengths in selection_criteria_list_lengths.items()
+    }
+
+    return {
+        "category_definition": "target_recovery_token rank in first_draft_token_ids for target_accept_len == 0 rows",
+        "categories": list(MISSPEC_POSITION_CATEGORIES),
+        "num_misspeculation_steps": len(miss_rows),
+        "category_counts": category_counts,
+        "category_probabilities": {
+            category: (count / len(miss_rows) if miss_rows else None)
+            for category, count in category_counts.items()
+        },
+        "selection_criteria": selection_criteria,
+        "selection_criteria_list_lengths": selection_criteria_list_lengths,
+        "selection_criteria_total_list_lengths": selection_criteria_total_list_lengths,
+        "raw_distribution": raw_distribution,
+        "rows_by_category": rows_by_category,
+        "unexpected_top1_match_count": unexpected_top1_match_count,
+        "missing_target_or_topk_count": missing_target_or_topk_count,
+    }
+
+
+def build_insight_entry(
+    metadata_path: Path,
+    ctx: Dict[str, Any],
+    analysis_path: Optional[Path] = None,
+) -> Dict[str, Any]:
     rows = list(iter_jsonl(metadata_path))
     miss_rows = [row for row in rows if is_target_misspeculation_row(row)]
+    analysis_obj = read_first_jsonl_object(analysis_path) if analysis_path is not None else None
 
     entry = dict(ctx)
     entry["num_metadata_rows"] = len(rows)
     entry["num_misspeculation_steps"] = len(miss_rows)
-    entry["misspeculation_topk_inclusiveness"] = compute_topk_inclusiveness(miss_rows, max_topk=5)
+    entry["misspeculation_topk_inclusiveness"] = compute_topk_inclusiveness(
+        miss_rows, max_topk=FIRST_DRAFT_METADATA_TOPK
+    )
     entry["misspeculation_confidence_correlation"] = compute_confidence_correlation_rows(miss_rows)
     entry["confidence_distribution"] = compute_confidence_distribution_rows(rows)
+    entry["confidence_misspeuclation_position_correlation"] = (
+        compute_confidence_misspeuclation_position_correlation(
+            miss_rows, max_topk=FIRST_DRAFT_METADATA_TOPK
+        )
+    )
+    entry["oracle_acceptance_length"] = compute_oracle_acceptance_length(rows, ctx, analysis_obj)
+    entry["markov_chain"] = compute_markov_chain(rows, ctx, analysis_obj)
 
     return entry
 
@@ -428,7 +1000,7 @@ def build_trace_entry(
     seen: set[Tuple[int, int]] = set()
 
     for row in iter_jsonl(metadata_path):
-        if row.get("verification_model") not in ("target", "pivot_target"):
+        if not is_target_verify_row(row):
             continue
         req = row.get("request_id")
         step = row.get("step_id")
@@ -516,7 +1088,7 @@ def collect_from_metadata_root(
             collected["motivation"].extend(build_motivation_entries(analysis_path, ctx))
 
         if metadata_path.exists():
-            collected["insight"].append(build_insight_entry(metadata_path, ctx))
+            collected["insight"].append(build_insight_entry(metadata_path, ctx, analysis_path))
             collected["trace"].append(
                 build_trace_entry(
                     metadata_path,

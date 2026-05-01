@@ -42,11 +42,19 @@ class PivotRootSpeculatorSync(SpeculatorSync):
         self.max_expand_rows = max_expand_rows
         self.enable_profile_trace = enable_profile_trace
         self._cached_root_tokens_per_parent: list[list[int]] | None = None
+        self._cached_criteria_scores_per_parent: list[float] | None = None
+        self._cached_slope_scores_per_parent: list[float] | None = None
+        self._cached_top1_probs_per_parent: list[float] | None = None
+        self._cached_residual_scores_per_parent: list[float] | None = None
         self._pivot_cost_step_id = -1
         self._pivot_cost_writer_pid = os.getpid()
 
     def reset_step_state(self) -> None:
         self._cached_root_tokens_per_parent = None
+        self._cached_criteria_scores_per_parent = None
+        self._cached_slope_scores_per_parent = None
+        self._cached_top1_probs_per_parent = None
+        self._cached_residual_scores_per_parent = None
         self._pivot_cost_step_id += 1
 
     def _pivot_cost_enabled(self) -> bool:
@@ -188,7 +196,7 @@ class PivotRootSpeculatorSync(SpeculatorSync):
             return plan
         host = plan.host
         assert host is not None, "PivotExpansionPlan.host required for capacity clamp"
-        topk = max(plan.branch_counts) if plan.branch_counts else 1
+        branch_counts_src = list(host.branch_counts)
 
         # Start from planner-selected expand mask (host bool list).
         expand_mask_host = list(host.expand_mask)
@@ -254,7 +262,7 @@ class PivotRootSpeculatorSync(SpeculatorSync):
                 if i_bm is not None
                 else 0
             )
-            extras = topk - 1
+            extras = max(0, int(branch_counts_src[idx]) - 1)
             if fork_target_kv:
                 need_t = per_extra_t * extras
             elif scratch_baseline_ok:
@@ -269,8 +277,10 @@ class PivotRootSpeculatorSync(SpeculatorSync):
                 free_d -= need_d
                 free_i -= need_i
 
-        # Apply ``max_expand_rows`` row-cap on host. Mirrors apply_capacity_limit().
-        clamped_host = self._apply_row_cap_host(kept_host, scores_host, topk)
+        # Apply ``max_expand_rows`` row-cap on host (variable extras per parent).
+        clamped_host = self._apply_variable_row_cap_host(
+            kept_host, scores_host, branch_counts_src
+        )
 
         if clamped_host == host.expand_mask:
             return plan
@@ -313,6 +323,11 @@ class PivotRootSpeculatorSync(SpeculatorSync):
             root_token_probs=rp_out if rp_src is not None else None,
             top1_probs=list(host.top1_probs) if host.top1_probs is not None else None,
             residual_scores=list(host.residual_scores) if host.residual_scores is not None else None,
+            dynamic_expansion_slope_scores=(
+                list(host.dynamic_expansion_slope_scores)
+                if host.dynamic_expansion_slope_scores is not None
+                else None
+            ),
         )
 
         return PivotExpansionPlan(
@@ -328,38 +343,46 @@ class PivotRootSpeculatorSync(SpeculatorSync):
             residual_scores=plan.residual_scores,
             branch_counts=bcounts,
             branch_counts_tensor=torch.tensor(bcounts, dtype=torch.int64, device=self.device),
+            dynamic_expansion_slope_scores=plan.dynamic_expansion_slope_scores,
             host=new_host,
         )
 
-    def _apply_row_cap_host(
+    def _apply_variable_row_cap_host(
         self,
         kept: list[bool],
         scores: list[float],
-        topk: int,
+        branch_counts: list[int],
     ) -> list[bool]:
-        """Host-side equivalent of ``apply_capacity_limit``.
+        """Row cap from ``max_expand_rows`` using per-parent ``branch_counts`` extras.
 
-        Mirrors the GPU implementation: when ``max_expand_rows`` is set, retain
-        at most ``(max_rows - bsz) // (topk - 1)`` expanded parents, prioritized
-        by ascending criteria score (low-uncertainty first).
+        Sort key matches planner ``_cap_low_scores``: ``scores[i] + i * eps`` ascending
+        (same as GPU stable ordering for tie-break).
         """
         if self.max_expand_rows is None:
             return list(kept)
-        if topk <= 1:
-            return [False] * len(kept)
         bsz = len(kept)
         max_rows = int(self.max_expand_rows)
         if max_rows <= bsz:
             return [False] * bsz
-        max_expand_reqs = (max_rows - bsz) // (topk - 1)
-        max_expand_reqs = max(0, min(max_expand_reqs, bsz))
-        if max_expand_reqs == 0:
+        budget = max_rows - bsz
+        if budget <= 0:
             return [False] * bsz
-        # Order by ascending score, then index for determinism.
-        candidate_idxs = [i for i, k in enumerate(kept) if k]
-        candidate_idxs.sort(key=lambda i: (scores[i], i))
-        keep_set = set(candidate_idxs[:max_expand_reqs])
-        return [i in keep_set for i in range(bsz)]
+
+        eps = float(torch.finfo(torch.float32).eps)
+        order = [i for i, k in enumerate(kept) if k]
+        order.sort(key=lambda i: (scores[i] + i * eps, i))
+
+        out = [False] * bsz
+        used = 0
+        for i in order:
+            extra = max(0, int(branch_counts[i]) - 1)
+            if extra == 0:
+                out[i] = True
+                continue
+            if used + extra <= budget:
+                out[i] = True
+                used += extra
+        return out
 
     @staticmethod
     def _copy_kv_block(
@@ -507,7 +530,7 @@ class PivotRootSpeculatorSync(SpeculatorSync):
             plan = build_pivot_expansion_plan(
                 first_logits_q,
                 self.expansion_cfg,
-                max_expand_rows=self.max_expand_rows,
+                max_expand_rows=None,
                 materialize_host=True,
                 profile_metadata=self.enable_profile_trace,
             )
@@ -531,6 +554,20 @@ class PivotRootSpeculatorSync(SpeculatorSync):
                     roots_per_parent[pidx].append(tok)
                 roots_per_parent[pidx][bidx] = tok
             self._cached_root_tokens_per_parent = roots_per_parent
+            self._cached_criteria_scores_per_parent = list(plan.host.criteria_scores or [])
+            self._cached_slope_scores_per_parent = (
+                list(plan.host.dynamic_expansion_slope_scores)
+                if plan.host.dynamic_expansion_slope_scores is not None
+                else None
+            )
+            if self.enable_profile_trace and plan.host.top1_probs is not None:
+                self._cached_top1_probs_per_parent = list(plan.host.top1_probs)
+            else:
+                self._cached_top1_probs_per_parent = None
+            if self.enable_profile_trace and plan.host.residual_scores is not None:
+                self._cached_residual_scores_per_parent = list(plan.host.residual_scores)
+            else:
+                self._cached_residual_scores_per_parent = None
         else:
             parent_index_per_branch: list[int] = []
             branch_index_per_parent: list[int] = []
@@ -556,20 +593,48 @@ class PivotRootSpeculatorSync(SpeculatorSync):
                 root_token_probs_t = torch.zeros(b_exp_cached, dtype=torch.float32, device=self.device)
 
             expand_mask_host = [len(r) > 1 for r in self._cached_root_tokens_per_parent]
-            # Cached path has no fresh logits-derived ordering signal; use zero
-            # scores so capacity clamp falls back to deterministic index order.
+            crit_cached = self._cached_criteria_scores_per_parent or [0.0] * batch_size
+            slope_cached = self._cached_slope_scores_per_parent
+            tp_cached = self._cached_top1_probs_per_parent
+            rs_cached = self._cached_residual_scores_per_parent
             host = PivotHostPlan(
                 parent_index_per_branch=list(parent_index_per_branch),
                 branch_index_per_parent=list(branch_index_per_parent),
                 root_token_ids=list(root_token_ids),
                 branch_counts=list(branch_counts),
                 expand_mask=expand_mask_host,
-                criteria_scores=[0.0] * batch_size,
+                criteria_scores=list(crit_cached),
                 root_token_probs=(
                     root_token_probs_t.tolist() if self.enable_profile_trace else None
                 ),
-                top1_probs=([0.0] * batch_size) if self.enable_profile_trace else None,
-                residual_scores=([0.0] * batch_size) if self.enable_profile_trace else None,
+                top1_probs=(
+                    list(tp_cached)
+                    if self.enable_profile_trace and tp_cached is not None
+                    else ([0.0] * batch_size if self.enable_profile_trace else None)
+                ),
+                residual_scores=(
+                    list(rs_cached)
+                    if self.enable_profile_trace and rs_cached is not None
+                    else ([0.0] * batch_size if self.enable_profile_trace else None)
+                ),
+                dynamic_expansion_slope_scores=(
+                    list(slope_cached) if slope_cached is not None else None
+                ),
+            )
+            slope_t = (
+                torch.tensor(slope_cached, dtype=torch.float32, device=self.device)
+                if slope_cached is not None
+                else None
+            )
+            top1_t = (
+                torch.tensor(tp_cached, dtype=torch.float32, device=self.device)
+                if self.enable_profile_trace and tp_cached is not None
+                else torch.zeros(batch_size, dtype=torch.float32, device=self.device)
+            )
+            res_t = (
+                torch.tensor(rs_cached, dtype=torch.float32, device=self.device)
+                if self.enable_profile_trace and rs_cached is not None
+                else torch.zeros(batch_size, dtype=torch.float32, device=self.device)
             )
             plan = PivotExpansionPlan(
                 parent_batch_size=batch_size,
@@ -583,11 +648,12 @@ class PivotRootSpeculatorSync(SpeculatorSync):
                 branch_index_per_parent=torch.tensor(branch_index_per_parent, dtype=torch.int64, device=self.device),
                 root_token_ids=torch.tensor(root_token_ids, dtype=torch.int64, device=self.device),
                 root_token_probs=root_token_probs_t,
-                criteria_scores=torch.zeros(batch_size, dtype=torch.float32, device=self.device),
-                top1_probs=torch.zeros(batch_size, dtype=torch.float32, device=self.device),
-                residual_scores=torch.zeros(batch_size, dtype=torch.float32, device=self.device),
+                criteria_scores=torch.tensor(crit_cached, dtype=torch.float32, device=self.device),
+                top1_probs=top1_t,
+                residual_scores=res_t,
                 branch_counts=branch_counts,
                 branch_counts_tensor=torch.tensor(branch_counts, dtype=torch.int64, device=self.device),
+                dynamic_expansion_slope_scores=slope_t,
                 host=host,
             )
             t_plan1 = perf_counter()

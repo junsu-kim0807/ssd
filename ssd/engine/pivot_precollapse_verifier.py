@@ -47,6 +47,12 @@ class PivotPrecollapseVerifier(Verifier):
             trace.pivot_branch_count = list(decision.branch_count_per_parent)
             trace.pivot_selected_branch_idx = list(decision.winning_branch_idx_per_parent)
             trace.pivot_selected_root_token_id = list(decision.winning_root_token_per_parent)
+            hp = bundle.host_plan
+            trace.pivot_dynamic_expansion_slope = (
+                list(hp.dynamic_expansion_slope_scores)
+                if hp.dynamic_expansion_slope_scores is not None
+                else None
+            )
         return result
 
 

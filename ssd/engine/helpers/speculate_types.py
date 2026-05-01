@@ -46,6 +46,8 @@ class VerifyProfileTrace:
     pivot_branch_count: list[int] | None = None
     pivot_selected_branch_idx: list[int] | None = None
     pivot_selected_root_token_id: list[int] | None = None
+    # ``dynamic_expansion`` only: per-parent (p_top5 - p_top2) / 3 before bucketize; else None.
+    pivot_dynamic_expansion_slope: list[float] | None = None
 
 
 @dataclass

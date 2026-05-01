@@ -59,7 +59,7 @@ class VerifierPivot(VerifierBase):
             seq.recovery_token_id = token_id
             self._intermediate_round_counters[seq.seq_id] = 0
             if eagle:
-                seq_len = seq.num_prompt_tokens
+                seq_len = max(1, len(seq) - seq.num_cached_tokens)
                 seq.last_target_hidden_state = eagle_acts[offset + seq_len - 1].clone()
                 offset += seq_len
 

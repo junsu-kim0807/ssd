@@ -14,7 +14,11 @@ from ssd.engine.spec_policy_traits import uses_pivot_precollapse, uses_pivot_tre
 from ssd.engine.verifier_hierarchical import VerifierHierarchical
 from ssd.utils.misc import decode_tokens
 from ssd.utils.profiler import SSDProfiler
-from ssd.utils.profiler_metadata import draft_metadata_from_logits, trace_to_row_indexed
+from ssd.utils.profiler_metadata import (
+    FIRST_DRAFT_METADATA_TOPK,
+    draft_metadata_from_logits,
+    trace_to_row_indexed,
+)
 
 
 class InferenceStep(ABC):
@@ -469,8 +473,8 @@ class SpecDecodeStep(InferenceStep):
                             d_ids_w.append(d_ids[r])
                             d_conf_w.append(d_conf[r])
                         else:
-                            f_ids_w.append([0, 0, 0, 0, 0])
-                            f_conf_w.append([0.0, 0.0, 0.0, 0.0, 0.0])
+                            f_ids_w.append([0] * FIRST_DRAFT_METADATA_TOPK)
+                            f_conf_w.append([0.0] * FIRST_DRAFT_METADATA_TOPK)
                             d_ids_w.append([0] * k)
                             d_conf_w.append([0.0] * k)
                     f_ids, f_conf, d_ids, d_conf = f_ids_w, f_conf_w, d_ids_w, d_conf_w

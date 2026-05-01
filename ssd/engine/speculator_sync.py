@@ -10,13 +10,41 @@ class SpeculatorSync(SpeculatorBase):
     def __init__(self, lookahead: int, device: torch.device, draft_model_runner: ModelRunner):
         super().__init__(lookahead, device)
         self.draft_model_runner = draft_model_runner
+        self.use_eagle = bool(getattr(draft_model_runner.config, "use_eagle", False))
 
     def prefill(self, seqs: list[Sequence], verify_result: VerifyResult) -> SpeculateResult:
-        assert verify_result.eagle_acts is None, (
-            "Eagle is not currently supported for synchronous speculation"
-        )
         print('[spec_prefill] target prefill', flush=True)
-        self.draft_model_runner.call("run", seqs, True)
+
+        if self.use_eagle:
+            eagle_acts = verify_result.eagle_acts
+            assert eagle_acts is not None and not isinstance(eagle_acts, bool), (
+                "Eagle sync prefill requires verifier to populate eagle_acts"
+            )
+            # j ↔ j-1 alignment: token at position j is conditioned on target act at j-1.
+            # Stride must match the actual emit count from target prefill (which obeys
+            # the prefix-cache fallback in prepare_prefill_tensors_from_seqs); using
+            # raw len(seq) corrupts cross-seq offsets when any seq had a prefix hit.
+            # NOTE: EAGLE + prefix cache is not fully supported — draft prefill below
+            # still uses skip_first_token=1 from token 0, so non-zero num_cached_tokens
+            # leaves draft conditioning gaps in [0..num_cached_tokens-1]. Asserting for
+            # now so the failure mode is loud rather than silently degraded.
+            sliced = []
+            offset = 0
+            for seq in seqs:
+                emit_len = max(1, len(seq) - seq.num_cached_tokens)
+                assert seq.num_cached_tokens == 0, (
+                    "EAGLE sync prefill currently requires num_cached_tokens==0 "
+                    f"(seq_id={seq.seq_id}, cached={seq.num_cached_tokens}, len={len(seq)}). "
+                    "Prefix cache + EAGLE conditioning alignment is not implemented."
+                )
+                sliced.append(eagle_acts[offset:offset + emit_len - 1])
+                offset += emit_len
+            eagle_acts_shifted = torch.cat(sliced, dim=0).to(self.device)
+            self.draft_model_runner.call(
+                "run", seqs, True, True, False, eagle_acts_shifted, 1,
+            )
+        else:
+            self.draft_model_runner.call("run", seqs, True)
 
         if len(seqs) > 0:
             print(
@@ -32,10 +60,6 @@ class SpeculatorSync(SpeculatorBase):
         recovery_already_appended: bool = False,
     ) -> SpeculateResult:
         """Generate k speculative tokens using the draft model."""
-        assert verify_result.eagle_acts is None, (
-            "Eagle is not currently supported for synchronous speculation"
-        )
-
         batch_size = len(seqs)
         speculations = torch.zeros(
             batch_size, self.lookahead + 1,
@@ -67,10 +91,29 @@ class SpeculatorSync(SpeculatorBase):
         speculations[:, 0] = torch.tensor(
             recovery_tokens, dtype=torch.int64, device=self.device)
 
+        # Eagle: stack target conditioning for each seq. The draft model's forward
+        # auto-applies fc on the first step (3*d_model_target -> d_model_draft) and
+        # passes through prenorm on subsequent steps.
+        conditioning = None
+        if self.use_eagle:
+            for seq in seqs:
+                assert seq.last_target_hidden_state is not None, (
+                    "Eagle sync speculate requires seq.last_target_hidden_state "
+                    "(set by Verifier.prefill / scheduler post-verify)"
+                )
+            conditioning = torch.stack(
+                [seq.last_target_hidden_state for seq in seqs], dim=0,
+            ).to(self.device)
+
         for k in range(self.lookahead + 1):
             # Draft model forward pass - emits [B] tokens, True is for draft_return_logits
-            token_ids, step_logits_q = self.draft_model_runner.call(
-                "run", seqs, False, True, True)
+            if self.use_eagle:
+                token_ids, step_logits_q, conditioning = self.draft_model_runner.call(
+                    "run", seqs, False, True, True, conditioning,
+                )
+            else:
+                token_ids, step_logits_q = self.draft_model_runner.call(
+                    "run", seqs, False, True, True)
             # make sure we include this even on last iter since we put K+1 tokens thru draft cache
             for s in seqs:
                 s.num_draft_cached_tokens += 1

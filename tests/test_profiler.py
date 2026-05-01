@@ -14,6 +14,7 @@ from ssd.utils.profiler import (
     NOOP_PROFILER,
 )
 from ssd.utils.profiler_metadata import (
+    FIRST_DRAFT_METADATA_TOPK,
     draft_metadata_from_logits,
     prefill_metadata_rows,
     trace_to_row_indexed,
@@ -44,8 +45,13 @@ def test_draft_metadata_from_logits_shapes():
     spec[:, 0] = 1
     spec[:, 1:] = torch.randint(0, v, (b, k))
     f_ids, f_conf, d_ids, d_conf = draft_metadata_from_logits(logits_q, spec, k)
-    assert len(f_ids) == b and len(f_ids[0]) == 5
+    assert len(f_ids) == b and len(f_ids[0]) == FIRST_DRAFT_METADATA_TOPK
     assert len(d_ids[0]) == k
+
+    logits_small = torch.randn(1, 2, 3)
+    spec_s = torch.zeros(1, 3, dtype=torch.long)
+    fi_s, _, _, _ = draft_metadata_from_logits(logits_small, spec_s, 2)
+    assert len(fi_s[0]) == FIRST_DRAFT_METADATA_TOPK
 
 
 def test_prefill_step_only_prefill_wall_not_draft(tmp_path):
@@ -509,8 +515,8 @@ def test_trace_to_row_indexed_cost_fields(tmp_path):
         draft_async=False,
         cache_hit=1,
         trace=tr,
-        first_draft_token_ids=[1, 0, 0, 0, 0],
-        first_draft_token_confidence=[0.5, 0.0, 0.0, 0.0, 0.0],
+        first_draft_token_ids=[1] + [0] * 9,
+        first_draft_token_confidence=[0.5] + [0.0] * 9,
         draft_token_ids_per_position=[1, 2],
         draft_token_confidence_per_position=[0.4, 0.3],
         step_wall_time_s=0.01,
@@ -574,8 +580,8 @@ def test_trace_to_row_indexed_hierarchical_intermediate_chain_columns(tmp_path):
         draft_async=False,
         cache_hit=None,
         trace=tr,
-        first_draft_token_ids=[0, 0, 0, 0, 0],
-        first_draft_token_confidence=[0.0, 0.0, 0.0, 0.0, 0.0],
+        first_draft_token_ids=[0] * 10,
+        first_draft_token_confidence=[0.0] * 10,
         draft_token_ids_per_position=[0, 0],
         draft_token_confidence_per_position=[0.0, 0.0],
         step_wall_time_s=0.01,

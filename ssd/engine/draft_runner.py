@@ -44,9 +44,9 @@ class DraftRunner(ModelRunner):
         self.prev_num_tokens = None
         super().__init__(self.draft_cfg, rank=rank, event=None, is_draft=True, num_tp_gpus=1, init_q=init_q)
         
-        if self.config.use_eagle:
+        if self.config.use_eagle and cfg.draft_async:
             assert self.config.jit_speculate, \
-                "EAGLE requires jit_speculate=True (cache misses need draft activations)"
+                "EAGLE async requires jit_speculate=True (cache misses need draft activations)"
 
         if self.is_draft and self.draft_async:
             self._reset_tree_cache_tensors()

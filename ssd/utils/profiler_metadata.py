@@ -31,6 +31,9 @@ from typing import Any
 import torch
 import torch.nn.functional as F
 
+# Length of ``first_draft_token_ids`` / ``first_draft_token_confidence`` (position-0 draft softmax top-k).
+FIRST_DRAFT_METADATA_TOPK = 10
+
 
 def accumulated_draft_token_confidence(confs: list[float]) -> float | None:
     """Product of per-position draft softmax probs (chosen token at each step).
@@ -69,16 +72,16 @@ def draft_metadata_from_logits(
     list[list[int]],
     list[list[float]],
 ]:
-    """Draft fields: raw-softmax top-5 at position 0; chosen-token conf per draft position (k rows)."""
+    """Draft fields: raw-softmax top-10 at position 0; chosen-token conf per draft position (k rows)."""
     device = logits_q.device
     b, kq, v = logits_q.shape
     assert kq == k, (kq, k)
     probs0 = F.softmax(logits_q[:, 0, :].float(), dim=-1)
-    tk = min(5, v)
-    top5 = torch.topk(probs0, k=tk, dim=-1)
-    first_ids = top5.indices.cpu().tolist()
-    first_conf = top5.values.cpu().tolist()
-    pad = 5 - tk
+    tk = min(FIRST_DRAFT_METADATA_TOPK, v)
+    topk = torch.topk(probs0, k=tk, dim=-1)
+    first_ids = topk.indices.cpu().tolist()
+    first_conf = topk.values.cpu().tolist()
+    pad = FIRST_DRAFT_METADATA_TOPK - tk
     if pad > 0:
         first_ids = [row + [0] * pad for row in first_ids]
         first_conf = [row + [0.0] * pad for row in first_conf]
@@ -124,8 +127,8 @@ def prefill_metadata_rows(
                 draft_async=draft_async,
                 cache_hit=None,
                 trace=None,
-                first_draft_token_ids=[0, 0, 0, 0, 0],
-                first_draft_token_confidence=[0.0, 0.0, 0.0, 0.0, 0.0],
+                first_draft_token_ids=[0] * FIRST_DRAFT_METADATA_TOPK,
+                first_draft_token_confidence=[0.0] * FIRST_DRAFT_METADATA_TOPK,
                 draft_token_ids_per_position=[0] * speculate_k,
                 draft_token_confidence_per_position=[0.0] * speculate_k,
                 step_wall_time_s=step_wall,
@@ -246,6 +249,7 @@ def trace_to_row_indexed(
         pbc = getattr(trace, "pivot_branch_count", None)
         psel = getattr(trace, "pivot_selected_branch_idx", None)
         psel_tok = getattr(trace, "pivot_selected_root_token_id", None)
+        pds = getattr(trace, "pivot_dynamic_expansion_slope", None)
         row["pivot_criteria_score"] = None if pcs is None else pcs[i]
         row["pivot_top1_prob"] = None if ptop1 is None else ptop1[i]
         row["pivot_residual_score"] = None if pres is None else pres[i]
@@ -263,6 +267,7 @@ def trace_to_row_indexed(
         row["pivot_branch_count"] = None if pbc is None else pbc[i]
         row["pivot_selected_branch_idx"] = None if psel is None else psel[i]
         row["pivot_selected_root_token_id"] = None if psel_tok is None else psel_tok[i]
+        row["pivot_dynamic_expansion_slope"] = None if pds is None else pds[i]
     else:
         row["verification_model"] = None
         row["target_token_ids_per_position"] = None
@@ -287,6 +292,7 @@ def trace_to_row_indexed(
         row["pivot_branch_count"] = None
         row["pivot_selected_branch_idx"] = None
         row["pivot_selected_root_token_id"] = None
+        row["pivot_dynamic_expansion_slope"] = None
 
     if cost_fields:
         row["step_wall_time_s"] = step_wall_time_s

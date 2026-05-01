@@ -57,10 +57,15 @@ class Config:
     threshold: float = 0.8
     expansion_pct: float = 1.0
     # planner-owned pivot expansion knobs (sync pivot / pivot_hierarchical)
-    pivot_expansion_policy: Literal["static", "dynamic"] = "dynamic"
-    pivot_expansion_criteria: Literal["top1", "residual", "softmax_residual"] = "residual"
+    # ``dynamic_expansion`` uses full-vocab softmax slope for branch counts; Config therefore
+    # requires ``pivot_expansion_criteria == "softmax_residual"`` and rejects
+    # ``spec_policy == "pivot_tree_scratch"``. See ``pivot_expansion_slope_thresholds``.
+    pivot_expansion_policy: Literal["static", "dynamic", "dynamic_expansion"] = "dynamic"
+    pivot_expansion_criteria: Literal["top1", "residual", "softmax_residual"] = "softmax_residual"
     pivot_expansion_pct: float = 0.2
     pivot_expansion_threshold: float = 0.8
+    # Only used when pivot_expansion_policy == dynamic_expansion; empty uses (-0.06, -0.05).
+    pivot_expansion_slope_thresholds: tuple[float, ...] = ()
     pivot_topk: int = 5
     pivot_max_root_branches: int | None = None
     # pivot_precollapse: draft-score collapse before B-row target verify
@@ -158,8 +163,47 @@ class Config:
                     raise ValueError("threshold must be in [0, 1] for pivot_legacy")
                 if self.expansion_pct <= 0.0:
                     raise ValueError("expansion_pct must be > 0 for pivot_legacy")
-            if self.pivot_expansion_policy not in {"static", "dynamic"}:
-                raise ValueError("pivot_expansion_policy must be one of {'static', 'dynamic'}")
+            if self.pivot_expansion_policy not in {"static", "dynamic", "dynamic_expansion"}:
+                raise ValueError(
+                    "pivot_expansion_policy must be one of "
+                    "{'static', 'dynamic', 'dynamic_expansion'}"
+                )
+            sth_raw = self.pivot_expansion_slope_thresholds
+            if isinstance(sth_raw, list):
+                self.pivot_expansion_slope_thresholds = tuple(float(x) for x in sth_raw)
+            else:
+                self.pivot_expansion_slope_thresholds = tuple(float(x) for x in sth_raw)
+            sth = self.pivot_expansion_slope_thresholds
+            if len(sth) > 0 and self.pivot_expansion_policy != "dynamic_expansion":
+                raise ValueError(
+                    "pivot_expansion_slope_thresholds is only valid when "
+                    "pivot_expansion_policy='dynamic_expansion'"
+                )
+            if self.pivot_expansion_policy == "dynamic_expansion":
+                if len(sth) == 0:
+                    self.pivot_expansion_slope_thresholds = (-0.06, -0.05)
+                    sth = self.pivot_expansion_slope_thresholds
+                if self.spec_policy == "pivot_tree_scratch":
+                    raise ValueError(
+                        "pivot_expansion_policy='dynamic_expansion' is not supported "
+                        "with spec_policy='pivot_tree_scratch'"
+                    )
+                if self.pivot_expansion_criteria != "softmax_residual":
+                    raise ValueError(
+                        "pivot_expansion_policy='dynamic_expansion' requires "
+                        "pivot_expansion_criteria='softmax_residual' "
+                        "(selection scores must match full-vocab slope domain)"
+                    )
+                if int(self.pivot_topk) != 5:
+                    raise ValueError("dynamic_expansion requires pivot_topk == 5")
+                n = len(sth)
+                if not (1 <= n <= int(self.pivot_topk) - 2):
+                    raise ValueError(
+                        "len(pivot_expansion_slope_thresholds) must be in [1, pivot_topk - 2] "
+                        "for dynamic_expansion"
+                    )
+                if n >= 2 and any(sth[i] >= sth[i + 1] for i in range(n - 1)):
+                    raise ValueError("pivot_expansion_slope_thresholds must be strictly increasing")
             if self.pivot_expansion_criteria not in {"top1", "residual", "softmax_residual"}:
                 raise ValueError(
                     "pivot_expansion_criteria must be one of "
@@ -187,15 +231,21 @@ class Config:
 
             if uses_pivot_root_expansion(self.spec_policy):
                 assert not self.draft_async, f"{self.spec_policy} requires draft_async=False (sync spec)"
-                assert not self.use_eagle, f"{self.spec_policy} does not support EAGLE yet"
+                if self.use_eagle and self.spec_policy != "pivot_precollapse":
+                    raise ValueError(
+                        f"{self.spec_policy} does not support EAGLE yet "
+                        "(only spec_policy=pivot_precollapse is wired for sync EAGLE3)."
+                    )
                 if self.pivot_expansion_policy == "static" and self.pivot_expansion_threshold != 0.8:
                     print(
                         "[Config] pivot_expansion_policy='static': pivot_expansion_threshold is unused.",
                         flush=True,
                     )
-                if self.pivot_expansion_policy == "dynamic" and self.pivot_expansion_pct != 0.0:
+                if self.pivot_expansion_policy in {"dynamic", "dynamic_expansion"} and (
+                    self.pivot_expansion_pct != 0.0
+                ):
                     print(
-                        "[Config] pivot_expansion_policy='dynamic': "
+                        f"[Config] pivot_expansion_policy={self.pivot_expansion_policy!r}: "
                         "pivot_expansion_pct is used as a hard cap on expanded requests.",
                         flush=True,
                     )

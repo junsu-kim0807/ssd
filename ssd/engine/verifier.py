@@ -48,8 +48,14 @@ class Verifier(VerifierBase):
         for seq, token_id in zip(seqs, token_ids):
             seq.recovery_token_id = token_id
             if eagle:
-                seq_len = seq.num_prompt_tokens
-                # this doesn't move acts onto cpu does it? 
+                # Target prefill emits one act per *newly forwarded* token,
+                # i.e. ``len(seq) - num_cached_tokens``. Using ``num_prompt_tokens``
+                # mis-indexes after preempt re-prefill (where token_ids contains
+                # committed completions but num_prompt_tokens stays at original prompt).
+                # Full prefix-cache hit triggers the ``raw_start >= seqlen`` fallback
+                # in ``prepare_prefill_tensors_from_seqs`` which re-scores the last
+                # token (1 act emitted), so clamp to 1 to match.
+                seq_len = max(1, len(seq) - seq.num_cached_tokens)
                 seq.last_target_hidden_state = eagle_acts[offset + seq_len - 1].clone()
                 offset += seq_len
 

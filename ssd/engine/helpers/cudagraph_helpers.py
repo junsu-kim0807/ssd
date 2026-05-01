@@ -479,7 +479,8 @@ def capture_cudagraph(model_runner):
     # Keep capture envelope aligned with runtime dynamic expansion cap when enabled.
     if (
         policy == "pivot"
-        and getattr(config, "pivot_expansion_policy", "") == "dynamic"
+        and getattr(config, "pivot_expansion_policy", "")
+        in {"dynamic", "dynamic_expansion"}
         and float(getattr(config, "pivot_expansion_pct", 0.0)) > 0.0
     ):
         max_expand_reqs = int(math.floor(max_seqs_cfg * float(config.pivot_expansion_pct)))
@@ -590,7 +591,8 @@ def capture_verify_cudagraph_generic(
     )
     if (
         policy == "pivot"
-        and getattr(config, "pivot_expansion_policy", "") == "dynamic"
+        and getattr(config, "pivot_expansion_policy", "")
+        in {"dynamic", "dynamic_expansion"}
         and float(getattr(config, "pivot_expansion_pct", 0.0)) > 0.0
     ):
         max_expand_reqs = int(math.floor(max_seqs_cfg * float(config.pivot_expansion_pct)))

@@ -33,6 +33,11 @@ def _pivot_expansion_threshold_domain_label(criteria: str) -> str:
     )
 
 
+def _pivot_expansion_pct_caps_rows(policy: str) -> bool:
+    """Policies that use ``pivot_expansion_pct`` as a hard cap on expandable parents."""
+    return policy in {"dynamic", "dynamic_expansion"}
+
+
 def build_spec_components(
     config: Config,
     *,
@@ -47,6 +52,15 @@ def build_spec_components(
     if config.draft_async:
         raise ValueError("build_spec_components only supports sync spec paths")
 
+    if (
+        config.spec_policy == "pivot_tree_scratch"
+        and config.pivot_expansion_policy == "dynamic_expansion"
+    ):
+        raise ValueError(
+            "dynamic_expansion is only supported for spec_policy pivot and pivot_precollapse "
+            "(not pivot_tree_scratch)"
+        )
+
     if config.spec_policy == "pivot_hierarchical":
         # Mirror the gate enforced in ``LLMEngine.create_inference_step``: the
         # ``pivot_hierarchical`` policy is not implemented yet (it requires
@@ -58,9 +72,11 @@ def build_spec_components(
 
     if config.spec_policy == "pivot":
         max_expand_rows = config.max_num_seqs * max(1, int(config.pivot_topk))
-        if config.pivot_expansion_policy == "dynamic" and float(config.pivot_expansion_pct) > 0.0:
-            # For dynamic policy, reuse ``pivot_expansion_pct`` as a hard expansion cap.
-            # Added rows per expanded request are ``topk - 1`` (branch 0 already exists).
+        if _pivot_expansion_pct_caps_rows(config.pivot_expansion_policy) and float(
+            config.pivot_expansion_pct
+        ) > 0.0:
+            # Reuse ``pivot_expansion_pct`` as a hard expansion cap on parents.
+            # Worst-case added rows per expanded parent are ``topk - 1`` (branch 0 already exists).
             max_expand_reqs = int(math.floor(config.max_num_seqs * float(config.pivot_expansion_pct)))
             max_expand_rows = config.max_num_seqs + max(0, max_expand_reqs) * max(
                 0, int(config.pivot_topk) - 1
@@ -72,6 +88,7 @@ def build_spec_components(
                 "pivot_expansion_pct": config.pivot_expansion_pct,
                 "pivot_expansion_threshold": config.pivot_expansion_threshold,
                 "pivot_expansion_criteria": config.pivot_expansion_criteria,
+                "pivot_expansion_slope_thresholds": config.pivot_expansion_slope_thresholds,
                 "pivot_expansion_threshold_domain": _pivot_expansion_threshold_domain_label(
                     config.pivot_expansion_criteria
                 ),
@@ -93,6 +110,7 @@ def build_spec_components(
                 expansion_pct=config.pivot_expansion_pct,
                 threshold=config.pivot_expansion_threshold,
                 topk=config.pivot_topk,
+                slope_thresholds=tuple(config.pivot_expansion_slope_thresholds),
             ),
             max_expand_rows=max_expand_rows,
             enable_profile_trace=enable_profile_trace,
@@ -109,7 +127,9 @@ def build_spec_components(
 
     if config.spec_policy == "pivot_precollapse":
         max_expand_rows = config.max_num_seqs * max(1, int(config.pivot_topk))
-        if config.pivot_expansion_policy == "dynamic" and float(config.pivot_expansion_pct) > 0.0:
+        if _pivot_expansion_pct_caps_rows(config.pivot_expansion_policy) and float(
+            config.pivot_expansion_pct
+        ) > 0.0:
             max_expand_reqs = int(math.floor(config.max_num_seqs * float(config.pivot_expansion_pct)))
             max_expand_rows = config.max_num_seqs + max(0, max_expand_reqs) * max(
                 0, int(config.pivot_topk) - 1
@@ -121,6 +141,7 @@ def build_spec_components(
                 "pivot_expansion_pct": config.pivot_expansion_pct,
                 "pivot_expansion_threshold": config.pivot_expansion_threshold,
                 "pivot_expansion_criteria": config.pivot_expansion_criteria,
+                "pivot_expansion_slope_thresholds": config.pivot_expansion_slope_thresholds,
                 "pivot_expansion_threshold_domain": _pivot_expansion_threshold_domain_label(
                     config.pivot_expansion_criteria
                 ),
@@ -143,6 +164,7 @@ def build_spec_components(
                 expansion_pct=config.pivot_expansion_pct,
                 threshold=config.pivot_expansion_threshold,
                 topk=config.pivot_topk,
+                slope_thresholds=tuple(config.pivot_expansion_slope_thresholds),
             ),
             max_expand_rows=max_expand_rows,
             enable_profile_trace=enable_profile_trace,
@@ -164,7 +186,9 @@ def build_spec_components(
 
     if config.spec_policy == "pivot_tree_scratch":
         max_expand_rows = config.max_num_seqs * max(1, int(config.pivot_topk))
-        if config.pivot_expansion_policy == "dynamic" and float(config.pivot_expansion_pct) > 0.0:
+        if _pivot_expansion_pct_caps_rows(config.pivot_expansion_policy) and float(
+            config.pivot_expansion_pct
+        ) > 0.0:
             max_expand_reqs = int(math.floor(config.max_num_seqs * float(config.pivot_expansion_pct)))
             max_expand_rows = config.max_num_seqs + max(0, max_expand_reqs) * max(
                 0, int(config.pivot_topk) - 1
@@ -182,6 +206,7 @@ def build_spec_components(
                 expansion_pct=config.pivot_expansion_pct,
                 threshold=config.pivot_expansion_threshold,
                 topk=config.pivot_topk,
+                slope_thresholds=tuple(config.pivot_expansion_slope_thresholds),
             ),
             max_expand_rows=max_expand_rows,
             enable_profile_trace=enable_profile_trace,

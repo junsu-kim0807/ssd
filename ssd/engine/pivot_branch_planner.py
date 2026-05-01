@@ -9,7 +9,7 @@ import torch
 
 @dataclass
 class PivotExpansionConfig:
-    policy: Literal["static", "dynamic"] = "dynamic"
+    policy: Literal["static", "dynamic", "dynamic_expansion"] = "dynamic"
     criteria: Literal["top1", "residual", "softmax_residual"] = "residual"
     # User-facing threshold in [0, 1]:
     # - top1: top-1 probability (binary proxy), converted to logit-margin threshold
@@ -22,10 +22,14 @@ class PivotExpansionConfig:
     # For softmax_residual: set equal to ``threshold`` for bookkeeping only; dynamic expansion
     # uses ``_score_threshold`` (user probability-difference), not logit space.
     logit_threshold: float = field(init=False)
+    # dynamic_expansion only: strictly increasing thresholds for (p_top5-p_top2)/3 slope buckets.
+    slope_thresholds: tuple[float, ...] = ()
 
     def __post_init__(self) -> None:
-        if self.policy not in {"static", "dynamic"}:
-            raise ValueError("policy must be one of {'static', 'dynamic'}")
+        if self.policy not in {"static", "dynamic", "dynamic_expansion"}:
+            raise ValueError(
+                "policy must be one of {'static', 'dynamic', 'dynamic_expansion'}"
+            )
         if self.criteria not in {"top1", "residual", "softmax_residual"}:
             raise ValueError(
                 "criteria must be one of {'top1', 'residual', 'softmax_residual'}"
@@ -36,6 +40,24 @@ class PivotExpansionConfig:
             raise ValueError("threshold must be in [0, 1]")
         if int(self.topk) < 1:
             raise ValueError("topk must be >= 1")
+
+        if self.policy == "dynamic_expansion":
+            if int(self.topk) != 5:
+                raise ValueError("dynamic_expansion currently requires pivot_topk == 5")
+            st = tuple(float(x) for x in self.slope_thresholds)
+            n = len(st)
+            if not (1 <= n <= int(self.topk) - 2):
+                raise ValueError(
+                    "len(slope_thresholds) must be in [1, topk - 2] for dynamic_expansion"
+                )
+            if n >= 2:
+                if any(st[i] >= st[i + 1] for i in range(n - 1)):
+                    raise ValueError("slope_thresholds must be strictly increasing")
+            if self.criteria != "softmax_residual":
+                raise ValueError(
+                    "dynamic_expansion requires criteria='softmax_residual' "
+                    "(selection score domain must match slope domain)"
+                )
 
         if self.criteria == "top1":
             self.logit_threshold = _top1_prob_to_logit_margin_threshold(float(self.threshold))
@@ -65,6 +87,8 @@ class PivotHostPlan:
     root_token_probs: list[float] | None = None
     top1_probs: list[float] | None = None
     residual_scores: list[float] | None = None
+    # dynamic_expansion: per-parent (p_top5 - p_top2) / 3 on full-vocab softmax mass; None otherwise.
+    dynamic_expansion_slope_scores: list[float] | None = None
 
 
 @dataclass
@@ -81,6 +105,8 @@ class PivotExpansionPlan:
     residual_scores: torch.Tensor  # [B], float
     branch_counts: list[int]  # len B
     branch_counts_tensor: torch.Tensor  # [B], int64
+    # [B] when policy==dynamic_expansion else None
+    dynamic_expansion_slope_scores: torch.Tensor | None = None
     host: PivotHostPlan | None = None
 
 
@@ -143,7 +169,7 @@ def _select_expand_mask(
     if bsz == 0:
         return torch.zeros(0, dtype=torch.bool, device=device)
 
-    if cfg.policy == "dynamic":
+    if cfg.policy in {"dynamic", "dynamic_expansion"}:
         candidates = scores < _score_threshold(cfg)
         if float(cfg.expansion_pct) <= 0.0:
             return candidates
@@ -158,6 +184,33 @@ def _select_expand_mask(
 
     candidates = torch.ones(bsz, dtype=torch.bool, device=device)
     return _cap_low_scores(candidates, scores, num_expand)
+
+
+def _dynamic_expansion_branch_counts_from_slope(
+    slope_scores: torch.Tensor,
+    expand_mask: torch.Tensor,
+    cfg: PivotExpansionConfig,
+) -> torch.Tensor:
+    """Map slope to per-parent branch count; non-expanded parents get 1."""
+    device = slope_scores.device
+    bsz = int(slope_scores.numel())
+    thresholds = torch.tensor(
+        list(cfg.slope_thresholds),
+        dtype=torch.float32,
+        device=device,
+    )
+    # Semantics: slope <= T[0] -> 2; T[i-1] < slope <= T[i] -> i+2; slope > T[-1] -> topk.
+    bucket = torch.bucketize(slope_scores.float(), thresholds, right=False)
+    n = len(cfg.slope_thresholds)
+    topk = int(cfg.topk)
+    branch_options = list(range(2, 2 + n)) + [topk]
+    branch_options_t = torch.tensor(branch_options, dtype=torch.int64, device=device)
+    counts = branch_options_t[bucket]
+    return torch.where(
+        expand_mask,
+        counts,
+        torch.ones(bsz, dtype=torch.int64, device=device),
+    )
 
 
 def apply_capacity_limit(
@@ -208,8 +261,16 @@ def build_pivot_expansion_plan(
     device = first_step_logits.device
     topk = min(int(cfg.topk), max(1, vocab_size))
 
-    # Need top-2 for logit margin / full-softmax residual and top-k for root candidates.
-    topk_eff = min(max(topk, 2), vocab_size)
+    if cfg.policy == "dynamic_expansion":
+        if vocab_size < 5:
+            raise ValueError(
+                "dynamic_expansion requires vocab_size >= 5 for top-5 softmax statistics"
+            )
+        topk_eff = min(max(int(cfg.topk), 5), vocab_size)
+    else:
+        # Need top-2 for logit margin / full-softmax residual and top-k for root candidates.
+        topk_eff = min(max(topk, 2), vocab_size)
+
     logits_f = first_step_logits.float()
     top_vals_all, top_ids_all = torch.topk(logits_f, k=topk_eff, dim=-1)
 
@@ -218,14 +279,23 @@ def build_pivot_expansion_plan(
     else:
         logit_margin_scores = torch.full((bsz,), float("inf"), dtype=torch.float32, device=device)
 
+    need_softmax_top_probs = (
+        cfg.criteria == "softmax_residual" or cfg.policy == "dynamic_expansion"
+    )
     log_z: torch.Tensor | None = None
     p1: torch.Tensor | None = None
     p2: torch.Tensor | None = None
+    p5: torch.Tensor | None = None
+    if need_softmax_top_probs and vocab_size >= 2:
+        log_z = torch.logsumexp(logits_f, dim=-1)
+        p1 = torch.exp(top_vals_all[:, 0] - log_z)
+        p2 = torch.exp(top_vals_all[:, 1] - log_z)
+        if cfg.policy == "dynamic_expansion":
+            p5 = torch.exp(top_vals_all[:, 4] - log_z)
+
     if cfg.criteria == "softmax_residual":
         if vocab_size >= 2:
-            log_z = torch.logsumexp(logits_f, dim=-1)
-            p1 = torch.exp(top_vals_all[:, 0] - log_z)
-            p2 = torch.exp(top_vals_all[:, 1] - log_z)
+            assert p1 is not None and p2 is not None
             criteria_scores = p1 - p2
         else:
             criteria_scores = torch.full((bsz,), 1.0, dtype=torch.float32, device=device)
@@ -233,12 +303,32 @@ def build_pivot_expansion_plan(
         criteria_scores = logit_margin_scores
 
     expand_mask = _select_expand_mask(criteria_scores, cfg)
-    expand_mask = apply_capacity_limit(
-        expand_mask,
-        criteria_scores=criteria_scores,
-        topk=topk,
-        max_expand_rows=max_expand_rows,
-    )
+    if cfg.policy != "dynamic_expansion":
+        expand_mask = apply_capacity_limit(
+            expand_mask,
+            criteria_scores=criteria_scores,
+            topk=topk,
+            max_expand_rows=max_expand_rows,
+        )
+    elif max_expand_rows is not None:
+        raise ValueError(
+            "dynamic_expansion row budget must be enforced in host clamp only; "
+            "pass max_expand_rows=None into build_pivot_expansion_plan"
+        )
+
+    slope_tensor: torch.Tensor | None = None
+    if cfg.policy == "dynamic_expansion":
+        assert p2 is not None and p5 is not None
+        slope_tensor = ((p5 - p2) / 3.0).to(torch.float32)
+        branch_counts_t = _dynamic_expansion_branch_counts_from_slope(
+            slope_tensor, expand_mask, cfg
+        )
+    else:
+        branch_counts_t = torch.where(
+            expand_mask,
+            torch.full((bsz,), topk, dtype=torch.int64, device=device),
+            torch.ones((bsz,), dtype=torch.int64, device=device),
+        )
 
     topk_ids = top_ids_all[:, :topk]
     if profile_metadata:
@@ -257,11 +347,6 @@ def build_pivot_expansion_plan(
         # Same tensor as expansion scores; host/metadata paths do not materialize these when off.
         top1_probs = criteria_scores
         residual_scores = criteria_scores
-    branch_counts_t = torch.where(
-        expand_mask,
-        torch.full((bsz,), topk, dtype=torch.int64, device=device),
-        torch.ones((bsz,), dtype=torch.int64, device=device),
-    )
     parent_ids = torch.arange(bsz, dtype=torch.int64, device=device)
     # NOTE: avoid ``output_size=...`` fast-path here. Some environments hit
     # Repeat.cu device-asserts when provided output_size mismatches internal
@@ -335,6 +420,10 @@ def build_pivot_expansion_plan(
             host_residual = None
             host_root_probs = None
 
+        host_slope: list[float] | None = None
+        if cfg.policy == "dynamic_expansion" and slope_tensor is not None:
+            host_slope = slope_tensor.detach().cpu().tolist()
+
         host = PivotHostPlan(
             parent_index_per_branch=host_parent_index,
             branch_index_per_parent=host_branch_index,
@@ -345,6 +434,7 @@ def build_pivot_expansion_plan(
             root_token_probs=host_root_probs,
             top1_probs=host_top1,
             residual_scores=host_residual,
+            dynamic_expansion_slope_scores=host_slope,
         )
     return PivotExpansionPlan(
         parent_batch_size=bsz,
@@ -359,5 +449,6 @@ def build_pivot_expansion_plan(
         residual_scores=residual_scores,
         branch_counts=(host.branch_counts if host is not None else branch_counts_t.tolist()),
         branch_counts_tensor=branch_counts_t,
+        dynamic_expansion_slope_scores=slope_tensor,
         host=host,
     )

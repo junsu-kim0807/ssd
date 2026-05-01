@@ -125,24 +125,28 @@ DEFAULT_GPU_BY_FAMILY_METHOD: dict[tuple[str, str], int] = {
     ("llama", "async"): 4,
     ("llama", "hierarchical"): 4,
     ("llama", "pivot"): 4,
+    ("llama", "pivot_precollapse"): 4,
     ("llama", "pivot_legacy"): 4,
     ("qwen", "ar"): 2,
     ("qwen", "sync"): 2,
     ("qwen", "async"): 3,
     ("qwen", "hierarchical"): 2,
     ("qwen", "pivot"): 2,
+    ("qwen", "pivot_precollapse"): 2,
     ("qwen", "pivot_legacy"): 3,
     ("gemma", "ar"): 2,
     ("gemma", "sync"): 2,
     ("gemma", "async"): 3,
     ("gemma", "hierarchical"): 2,
     ("gemma", "pivot"): 2,
+    ("gemma", "pivot_precollapse"): 2,
     ("gemma", "pivot_legacy"): 3,
     ("vicuna13b_160m", "ar"): 2,
     ("vicuna13b_160m", "sync"): 2,
     ("vicuna13b_160m", "async"): 3,
     ("vicuna13b_160m", "hierarchical"): 2,
     ("vicuna13b_160m", "pivot"): 2,
+    ("vicuna13b_160m", "pivot_precollapse"): 2,
     ("vicuna13b_160m", "pivot_legacy"): 3,
 }
 
@@ -190,7 +194,7 @@ def pct_path_component(pct: float) -> str:
 
 
 def uses_pivot_profiler_layout(method_id: str) -> bool:
-    return method_id in {"pivot", "pivot_legacy"}
+    return method_id in {"pivot", "pivot_precollapse", "pivot_legacy"}
 
 
 # With ``--batch`` / ``--length`` and method ``pivot`` only (not ``pivot_legacy``).
@@ -202,7 +206,7 @@ PIVOT_STATIC_POLICY = "static"
 
 
 def uses_pivot_batch_length_topk_pct_sweep(method_id: str) -> bool:
-    return method_id == "pivot"
+    return method_id in {"pivot", "pivot_precollapse"}
 
 
 def iter_pivot_topk_pct_for_profile_sweep(
@@ -213,7 +217,7 @@ def iter_pivot_topk_pct_for_profile_sweep(
     cli_pct: float,
     static_mode: bool = False,
 ) -> tuple[tuple[int, float], ...]:
-    if static_mode and method_id == "pivot":
+    if static_mode and method_id in {"pivot", "pivot_precollapse"}:
         return tuple((int(tk), float(PIVOT_STATIC_EXPANSION_PCT)) for tk in PIVOT_STATIC_TOPK_SWEEP)
     if multi_dataset_sweep and uses_pivot_batch_length_topk_pct_sweep(method_id):
         return tuple(
@@ -265,6 +269,18 @@ def _args_pivot(k: int, f: int) -> list[str]:
     return ["--spec", "--k", str(k), "--spec_policy", "pivot"]
 
 
+def _args_pivot_precollapse(k: int, _f: int) -> list[str]:
+    """Sync EAGLE3 + pivot_precollapse (bench enables --eagle only without --async for this policy)."""
+    return [
+        "--spec",
+        "--k",
+        str(k),
+        "--spec_policy",
+        "pivot_precollapse",
+        "--eagle",
+    ]
+
+
 def _args_pivot_legacy(k: int, f: int) -> list[str]:
     return [
         "--spec",
@@ -314,6 +330,13 @@ METHOD_REGISTRY: dict[str, BenchMethodSpec] = {
         uses_spec_k=True,
         default_k=5,
         extra_bench_args=_args_pivot,
+    ),
+    "pivot_precollapse": BenchMethodSpec(
+        id="pivot_precollapse",
+        description="Sync pivot_precollapse with EAGLE3 draft (--spec_policy pivot_precollapse --eagle)",
+        uses_spec_k=True,
+        default_k=5,
+        extra_bench_args=_args_pivot_precollapse,
     ),
     "pivot_legacy": BenchMethodSpec(
         id="pivot_legacy",
@@ -414,6 +437,23 @@ def profiler_rel_dir(
             "results",
             profile_mode,
             "pivot",
+            sanitize_path_component(pivot_expansion_policy),
+            f"b{int(batch_size)}",
+            k_path_token,
+            pair_slug,
+            temp_path_tag(temp),
+            f"r_{sanitize_path_component(str(pivot_round))}",
+            f"topk{int(pivot_topk)}",
+            pct_path_component(float(pivot_expansion_pct)),
+        ]
+        if dataset_slug:
+            parts.append(sanitize_path_component(dataset_slug))
+        return os.path.join(*parts)
+    if method_id == "pivot_precollapse":
+        parts = [
+            "results",
+            profile_mode,
+            "pivot_precollapse",
             sanitize_path_component(pivot_expansion_policy),
             f"b{int(batch_size)}",
             k_path_token,
@@ -1003,7 +1043,7 @@ def main() -> None:
             run_length_chunks.append(argv_cmd)
         if args.temp:
             run_temp_chunks.append(argv_cmd)
-        if args.static and method_id == "pivot":
+        if args.static and method_id in {"pivot", "pivot_precollapse"}:
             run_pivot_static_chunks.append(argv_cmd)
 
     for fam, mid, k_val, b_val, temp_val, spec in iter_job_configs(
@@ -1089,7 +1129,11 @@ def main() -> None:
                     Path(args.profile_mode)
                     / fam
                     / ("pivot" if spec.id == "pivot" else spec.id)
-                    / (sanitize_path_component(str(pivot_policy_for_run)) if spec.id == "pivot" else "")
+                    / (
+                        sanitize_path_component(str(pivot_policy_for_run))
+                        if spec.id in {"pivot", "pivot_precollapse"}
+                        else ""
+                    )
                     / f"b{b_val}"
                     / k_path
                     / pair_slug

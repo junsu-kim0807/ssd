@@ -338,6 +338,11 @@ class PivotExecutorFlat(VerifierBase):
                 pivot_branch_count=per_parent_branch_count,
                 pivot_selected_branch_idx=list(winners),
                 pivot_selected_root_token_id=per_parent_selected_root,
+                pivot_dynamic_expansion_slope=(
+                    list(bundle.host_plan.dynamic_expansion_slope_scores)
+                    if bundle.host_plan.dynamic_expansion_slope_scores is not None
+                    else None
+                ),
             )
         self.metrics.setdefault("accepted_suffix_lens_with_recovery", []).extend([len(s) for s in new_suffixes])
         # Commit winner branch KV onto parent block tables BEFORE releasing

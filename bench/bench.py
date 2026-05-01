@@ -25,6 +25,13 @@ from bench_helpers import (
 )
 
 
+def parse_pivot_expansion_slope_thresholds(s: str | None) -> tuple[float, ...]:
+    """Comma-separated floats for ``dynamic_expansion`` (strictly increasing; validated in Config)."""
+    if s is None or not str(s).strip():
+        return ()
+    return tuple(float(x.strip()) for x in str(s).split(",") if str(x).strip())
+
+
 def parse_arguments():
     """Parse command line arguments for benchmarking."""
     parser = argparse.ArgumentParser(description="Benchmark SSD performance (API similar to example.py)")
@@ -117,9 +124,11 @@ def parse_arguments():
     parser.add_argument(
         "--pivot_expansion_policy",
         type=str,
-        choices=["static", "dynamic"],
+        choices=["static", "dynamic", "dynamic_expansion"],
         default="dynamic",
-        help="Planner policy for pivot/pivot_hierarchical",
+        help="Planner policy for pivot / pivot_precollapse. "
+        "dynamic_expansion requires --pivot_topk 5, softmax_residual criteria, "
+        "and --pivot_expansion_slope_thresholds (not supported with pivot_tree_scratch).",
     )
     parser.add_argument(
         "--pivot_expansion_criteria",
@@ -127,10 +136,20 @@ def parse_arguments():
         choices=["top1", "residual", "softmax_residual"],
         default="residual",
         help="Pivot expansion uncertainty: top1/residual use binary logit-margin proxy; "
-        "softmax_residual uses full-vocab p_top1 - p_top2 (expand when residual < threshold).",
+        "softmax_residual uses full-vocab p_top1 - p_top2 (expand when residual < threshold). "
+        "When --pivot_expansion_policy dynamic_expansion, criteria must be softmax_residual "
+        "(enforced in Config).",
     )
     parser.add_argument("--pivot_expansion_pct", type=float, default=0.2)
     parser.add_argument("--pivot_expansion_threshold", type=float, default=0.8)
+    parser.add_argument(
+        "--pivot_expansion_slope_thresholds",
+        type=str,
+        default="",
+        metavar="T0,T1,...",
+        help="dynamic_expansion only: comma-separated strictly increasing slope thresholds "
+        "(len in [1, pivot_topk-2]). Example: -0.06,-0.05",
+    )
     parser.add_argument("--pivot_topk", type=int, default=5)
     parser.add_argument(
         "--pivot_precollapse_score_method",
@@ -298,7 +317,17 @@ def parse_arguments():
         args.spec = True
         assert args.llama, "Eagle currently only supports llama models"
         assert args.temp == 0.0 and args.dtemp is None, "Eagle currently only supports greedy decoding (temp=0)"
-        assert getattr(args, 'async', False), "Eagle currently only supports async speculative decoding"
+        if args.spec_policy == "pivot_precollapse":
+            if getattr(args, "async", False):
+                parser.error(
+                    "Eagle with --spec_policy pivot_precollapse requires synchronous speculative decoding "
+                    "(omit --async; pivot_precollapse is sync-only)."
+                )
+        else:
+            assert getattr(args, "async", False), (
+                "Eagle currently only supports async speculative decoding "
+                "(except --spec_policy pivot_precollapse, which uses sync EAGLE3)."
+            )
     args.debug_phase0_flat_compare = args.spec_policy == "pivot_opt"
     if args.enable_pivot_draft_scratch_phase2 is None:
         args.enable_pivot_draft_scratch_phase2 = args.spec_policy == "pivot_opt"
@@ -513,6 +542,9 @@ def initialize_wandb(args, run_name):
             "pivot_expansion_criteria": args.pivot_expansion_criteria,
             "pivot_expansion_pct": args.pivot_expansion_pct,
             "pivot_expansion_threshold": args.pivot_expansion_threshold,
+            "pivot_expansion_slope_thresholds": parse_pivot_expansion_slope_thresholds(
+                getattr(args, "pivot_expansion_slope_thresholds", "") or ""
+            ),
             "pivot_topk": args.pivot_topk,
             "pivot_precollapse_score_method": getattr(
                 args, "pivot_precollapse_score_method", "logprob_sum"
@@ -560,6 +592,9 @@ def create_llm_kwargs(args, draft_path):
         pivot_expansion_criteria=args.pivot_expansion_criteria,
         pivot_expansion_pct=args.pivot_expansion_pct,
         pivot_expansion_threshold=args.pivot_expansion_threshold,
+        pivot_expansion_slope_thresholds=parse_pivot_expansion_slope_thresholds(
+            getattr(args, "pivot_expansion_slope_thresholds", "") or ""
+        ),
         pivot_topk=args.pivot_topk,
         pivot_precollapse_score_method=getattr(
             args, "pivot_precollapse_score_method", "logprob_sum"

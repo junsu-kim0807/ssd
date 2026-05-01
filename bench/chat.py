@@ -16,6 +16,12 @@ TARGET = resolve_snapshot(f"{HF_CACHE_DIR}/models--meta-llama--Llama-3.1-70B-Ins
 DRAFT = resolve_snapshot(f"{HF_CACHE_DIR}/models--meta-llama--Llama-3.2-1B-Instruct")
 
 
+def _parse_pivot_expansion_slope_thresholds(s: str | None) -> tuple[float, ...]:
+    if s is None or not str(s).strip():
+        return ()
+    return tuple(float(x.strip()) for x in str(s).split(",") if str(x).strip())
+
+
 def parse_args():
     p = argparse.ArgumentParser()
     g = p.add_mutually_exclusive_group(required=True)
@@ -42,15 +48,28 @@ def parse_args():
     p.add_argument("--interval", type=int, default=0)
     p.add_argument("--threshold", type=float, default=0.8)
     p.add_argument("--expansion_pct", type=float, default=1.0)
-    p.add_argument("--pivot_expansion_policy", type=str, choices=["static", "dynamic"], default="dynamic")
+    p.add_argument(
+        "--pivot_expansion_policy",
+        type=str,
+        choices=["static", "dynamic", "dynamic_expansion"],
+        default="dynamic",
+    )
     p.add_argument(
         "--pivot_expansion_criteria",
         type=str,
         choices=["top1", "residual", "softmax_residual"],
         default="residual",
+        help="dynamic_expansion requires softmax_residual (enforced in Config).",
     )
     p.add_argument("--pivot_expansion_pct", type=float, default=0.0)
     p.add_argument("--pivot_expansion_threshold", type=float, default=0.8)
+    p.add_argument(
+        "--pivot_expansion_slope_thresholds",
+        type=str,
+        default="",
+        metavar="T0,T1,...",
+        help="dynamic_expansion: comma-separated strictly increasing thresholds.",
+    )
     p.add_argument("--pivot_topk", type=int, default=5)
     p.add_argument("--b", type=int, default=1)
     p.add_argument("--x", type=float, default=None)
@@ -101,6 +120,9 @@ def ssd_chat(args):
               pivot_expansion_criteria=args.pivot_expansion_criteria,
               pivot_expansion_pct=args.pivot_expansion_pct,
               pivot_expansion_threshold=args.pivot_expansion_threshold,
+              pivot_expansion_slope_thresholds=_parse_pivot_expansion_slope_thresholds(
+                  getattr(args, "pivot_expansion_slope_thresholds", "") or ""
+              ),
               pivot_topk=args.pivot_topk)
 
     history = []

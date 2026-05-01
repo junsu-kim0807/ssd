@@ -85,7 +85,7 @@ class PivotPrecollapseSpeculatorSync(PivotRootSpeculatorSync):
             return plan
         host = plan.host
         assert host is not None, "PivotExpansionPlan.host required for capacity clamp"
-        topk = max(plan.branch_counts) if plan.branch_counts else 1
+        branch_counts_src = list(host.branch_counts)
 
         expand_mask_host = list(host.expand_mask)
         for i, seq in enumerate(seqs):
@@ -110,13 +110,15 @@ class PivotPrecollapseSpeculatorSync(PivotRootSpeculatorSync):
                 required_tokens,
                 seq.block_size,
             )
-            extras = topk - 1
+            extras = max(0, int(branch_counts_src[idx]) - 1)
             need_d = per_extra_d * extras
             if need_d <= free_d:
                 kept_host[idx] = True
                 free_d -= need_d
 
-        clamped_host = self._apply_row_cap_host(kept_host, scores_host, topk)
+        clamped_host = self._apply_variable_row_cap_host(
+            kept_host, scores_host, branch_counts_src
+        )
         if clamped_host == host.expand_mask:
             return plan
 
@@ -156,6 +158,11 @@ class PivotPrecollapseSpeculatorSync(PivotRootSpeculatorSync):
             root_token_probs=rp_out if rp_src is not None else None,
             top1_probs=list(host.top1_probs) if host.top1_probs is not None else None,
             residual_scores=list(host.residual_scores) if host.residual_scores is not None else None,
+            dynamic_expansion_slope_scores=(
+                list(host.dynamic_expansion_slope_scores)
+                if host.dynamic_expansion_slope_scores is not None
+                else None
+            ),
         )
 
         return PivotExpansionPlan(
@@ -171,6 +178,7 @@ class PivotPrecollapseSpeculatorSync(PivotRootSpeculatorSync):
             residual_scores=plan.residual_scores,
             branch_counts=bcounts,
             branch_counts_tensor=torch.tensor(bcounts, dtype=torch.int64, device=self.device),
+            dynamic_expansion_slope_scores=plan.dynamic_expansion_slope_scores,
             host=new_host,
         )
 
@@ -253,9 +261,6 @@ class PivotPrecollapseSpeculatorSync(PivotRootSpeculatorSync):
         assert not recovery_already_appended, (
             "pivot_precollapse does not support recovery_already_appended yet"
         )
-        assert verify_result.eagle_acts is None, (
-            "Eagle is not supported for pivot sync speculation"
-        )
         assert self.lookahead >= 1, "pivot_precollapse requires speculate_k >= 1"
         batch_size = len(seqs)
         if batch_size == 0:
@@ -278,9 +283,23 @@ class PivotPrecollapseSpeculatorSync(PivotRootSpeculatorSync):
             if not skip_append:
                 seq.append_token(seq.recovery_token_id)
 
-        first_token_ids, first_logits_q = self.draft_model_runner.call(
-            "run", seqs, False, True, True
-        )
+        cond_parent_after_first: torch.Tensor | None = None
+        if self.use_eagle:
+            for seq in seqs:
+                assert seq.last_target_hidden_state is not None, (
+                    "Eagle pivot_precollapse requires seq.last_target_hidden_state "
+                    "(from target prefill / post-verify)."
+                )
+            cond0 = torch.stack(
+                [seq.last_target_hidden_state for seq in seqs], dim=0
+            ).to(self.device)
+            first_token_ids, first_logits_q, cond_parent_after_first = self.draft_model_runner.call(
+                "run", seqs, False, True, True, cond0
+            )
+        else:
+            first_token_ids, first_logits_q = self.draft_model_runner.call(
+                "run", seqs, False, True, True
+            )
         for s in seqs:
             s.num_draft_cached_tokens += 1
 
@@ -289,7 +308,7 @@ class PivotPrecollapseSpeculatorSync(PivotRootSpeculatorSync):
             plan = build_pivot_expansion_plan(
                 first_logits_q,
                 self.expansion_cfg,
-                max_expand_rows=self.max_expand_rows,
+                max_expand_rows=None,
                 materialize_host=True,
                 profile_metadata=self.enable_profile_trace,
             )
@@ -310,6 +329,20 @@ class PivotPrecollapseSpeculatorSync(PivotRootSpeculatorSync):
                     roots_per_parent[pidx].append(tok)
                 roots_per_parent[pidx][bidx] = tok
             self._cached_root_tokens_per_parent = roots_per_parent
+            self._cached_criteria_scores_per_parent = list(plan.host.criteria_scores or [])
+            self._cached_slope_scores_per_parent = (
+                list(plan.host.dynamic_expansion_slope_scores)
+                if plan.host.dynamic_expansion_slope_scores is not None
+                else None
+            )
+            if self.enable_profile_trace and plan.host.top1_probs is not None:
+                self._cached_top1_probs_per_parent = list(plan.host.top1_probs)
+            else:
+                self._cached_top1_probs_per_parent = None
+            if self.enable_profile_trace and plan.host.residual_scores is not None:
+                self._cached_residual_scores_per_parent = list(plan.host.residual_scores)
+            else:
+                self._cached_residual_scores_per_parent = None
         else:
             t_plan0 = perf_counter()
             parent_index_per_branch: list[int] = []
@@ -333,18 +366,48 @@ class PivotPrecollapseSpeculatorSync(PivotRootSpeculatorSync):
                 root_token_probs_t = torch.zeros(b_exp_cached, dtype=torch.float32, device=self.device)
 
             expand_mask_host = [len(r) > 1 for r in self._cached_root_tokens_per_parent]
+            crit_cached = self._cached_criteria_scores_per_parent or [0.0] * batch_size
+            slope_cached = self._cached_slope_scores_per_parent
+            tp_cached = self._cached_top1_probs_per_parent
+            rs_cached = self._cached_residual_scores_per_parent
             host = PivotHostPlan(
                 parent_index_per_branch=list(parent_index_per_branch),
                 branch_index_per_parent=list(branch_index_per_parent),
                 root_token_ids=list(root_token_ids),
                 branch_counts=list(branch_counts),
                 expand_mask=expand_mask_host,
-                criteria_scores=[0.0] * batch_size,
+                criteria_scores=list(crit_cached),
                 root_token_probs=(
                     root_token_probs_t.tolist() if self.enable_profile_trace else None
                 ),
-                top1_probs=([0.0] * batch_size) if self.enable_profile_trace else None,
-                residual_scores=([0.0] * batch_size) if self.enable_profile_trace else None,
+                top1_probs=(
+                    list(tp_cached)
+                    if self.enable_profile_trace and tp_cached is not None
+                    else ([0.0] * batch_size if self.enable_profile_trace else None)
+                ),
+                residual_scores=(
+                    list(rs_cached)
+                    if self.enable_profile_trace and rs_cached is not None
+                    else ([0.0] * batch_size if self.enable_profile_trace else None)
+                ),
+                dynamic_expansion_slope_scores=(
+                    list(slope_cached) if slope_cached is not None else None
+                ),
+            )
+            slope_t = (
+                torch.tensor(slope_cached, dtype=torch.float32, device=self.device)
+                if slope_cached is not None
+                else None
+            )
+            top1_t = (
+                torch.tensor(tp_cached, dtype=torch.float32, device=self.device)
+                if self.enable_profile_trace and tp_cached is not None
+                else torch.zeros(batch_size, dtype=torch.float32, device=self.device)
+            )
+            res_t = (
+                torch.tensor(rs_cached, dtype=torch.float32, device=self.device)
+                if self.enable_profile_trace and rs_cached is not None
+                else torch.zeros(batch_size, dtype=torch.float32, device=self.device)
             )
             plan = PivotExpansionPlan(
                 parent_batch_size=batch_size,
@@ -362,11 +425,12 @@ class PivotPrecollapseSpeculatorSync(PivotRootSpeculatorSync):
                 ),
                 root_token_ids=torch.tensor(root_token_ids, dtype=torch.int64, device=self.device),
                 root_token_probs=root_token_probs_t,
-                criteria_scores=torch.zeros(batch_size, dtype=torch.float32, device=self.device),
-                top1_probs=torch.zeros(batch_size, dtype=torch.float32, device=self.device),
-                residual_scores=torch.zeros(batch_size, dtype=torch.float32, device=self.device),
+                criteria_scores=torch.tensor(crit_cached, dtype=torch.float32, device=self.device),
+                top1_probs=top1_t,
+                residual_scores=res_t,
                 branch_counts=branch_counts,
                 branch_counts_tensor=torch.tensor(branch_counts, dtype=torch.int64, device=self.device),
+                dynamic_expansion_slope_scores=slope_t,
                 host=host,
             )
             t_plan1 = perf_counter()
@@ -505,12 +569,30 @@ class PivotPrecollapseSpeculatorSync(PivotRootSpeculatorSync):
         logits_q_rows = [first_logits_q[plan.parent_index_per_branch]]
         t_initial_pack1 = perf_counter()
 
+        cond_exp: torch.Tensor | None = None
+        if self.use_eagle and b_exp > 0:
+            assert cond_parent_after_first is not None
+            pib = plan.parent_index_per_branch
+            if not isinstance(pib, torch.Tensor):
+                pib = torch.as_tensor(
+                    pib, dtype=torch.long, device=cond_parent_after_first.device
+                )
+            else:
+                pib = pib.to(device=cond_parent_after_first.device, dtype=torch.long)
+            cond_exp = cond_parent_after_first[pib]
+        conditioning: torch.Tensor | None = cond_exp if self.use_eagle else None
+
         t_tail_draft0 = perf_counter()
         if self.lookahead >= 2:
             for _k in range(1, self.lookahead):
-                token_ids_k, logits_k = self.draft_model_runner.call(
-                    "run", expanded_seqs, False, True, True
-                )
+                if self.use_eagle:
+                    token_ids_k, logits_k, conditioning = self.draft_model_runner.call(
+                        "run", expanded_seqs, False, True, True, conditioning
+                    )
+                else:
+                    token_ids_k, logits_k = self.draft_model_runner.call(
+                        "run", expanded_seqs, False, True, True
+                    )
                 for s in expanded_seqs:
                     if s is not None:
                         s.num_draft_cached_tokens += 1
@@ -524,7 +606,12 @@ class PivotPrecollapseSpeculatorSync(PivotRootSpeculatorSync):
 
         t_extra_draft0 = perf_counter()
         if b_exp > 0:
-            self.draft_model_runner.call("run", expanded_seqs, False, True, True)
+            if self.use_eagle:
+                self.draft_model_runner.call(
+                    "run", expanded_seqs, False, True, True, conditioning
+                )
+            else:
+                self.draft_model_runner.call("run", expanded_seqs, False, True, True)
             for s in expanded_seqs:
                 if s is not None:
                     s.num_draft_cached_tokens += 1

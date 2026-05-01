@@ -183,6 +183,7 @@ class PivotTreeScratchSpeculator(PivotRootSpeculatorSync):
             ),
             top1_probs=host.top1_probs,
             residual_scores=host.residual_scores,
+            dynamic_expansion_slope_scores=host.dynamic_expansion_slope_scores,
         )
         return PivotExpansionPlan(
             parent_batch_size=int(plan.parent_batch_size),
@@ -197,6 +198,7 @@ class PivotTreeScratchSpeculator(PivotRootSpeculatorSync):
             residual_scores=plan.residual_scores,
             branch_counts=[int(x) for x in new_branch_counts],
             branch_counts_tensor=torch.tensor(new_branch_counts, dtype=torch.int64, device=device),
+            dynamic_expansion_slope_scores=plan.dynamic_expansion_slope_scores,
             host=new_host,
         )
 

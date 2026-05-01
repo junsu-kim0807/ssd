@@ -1112,10 +1112,12 @@ class ModelRunner:
                 layer_id += 1
 
     
-    def prepare_prefill(self, seqs: list[Sequence]):
+    def prepare_prefill(self, seqs: list[Sequence], skip_first_token: int = 0):
         input_ids, positions, cu_seqlens_q, cu_seqlens_k, max_seqlen_q, max_seqlen_k, slot_mapping = \
             prepare_prefill_tensors_from_seqs(
-                seqs, self.block_size, self.is_draft, is_intermediate=self.intermediate_mode)
+                seqs, self.block_size, self.is_draft,
+                skip_first_token=skip_first_token,
+                is_intermediate=self.intermediate_mode)
 
         block_tables = None
         if cu_seqlens_k[-1] > cu_seqlens_q[-1]:    # prefix cache
@@ -1138,6 +1140,7 @@ class ModelRunner:
                 is_intermediate=self.intermediate_mode,
                 hv_block_debug=_hv_dbg,
                 decode_lookahead_hint=_lookahead_hint,
+                use_eagle=bool(getattr(self.config, "use_eagle", False)),
             )
 
         block_tables = prepare_block_tables_from_seqs(
@@ -1658,7 +1661,22 @@ class ModelRunner:
                 logits = m.compute_logits(outputs, last_only)
                 return logits 
 
-        elif is_tree_decode:
+        # CUDAGraph buffers for EAGLE draft are captured at d_model_draft (the
+        # pass-through branch of Eagle3DraftForCausalLM.forward). Raw target acts
+        # arriving from sync speculate's first step are 3*d_model_target wide; project
+        # them here so the graph dispatch only ever sees draft-dim hidden states.
+        if (
+            self.config.use_eagle
+            and self.is_draft
+            and hidden_states is not None
+            and self.config.d_model_target is not None
+        ):
+            target_dim = 3 * int(self.config.d_model_target)
+            if hidden_states.shape[-1] == target_dim:
+                hidden_states = self.model.fc(
+                    hidden_states.to(self.model.fc.weight.dtype)
+                )
+        if is_tree_decode:
             return run_fi_tree_decode_cudagraph(self, input_ids, positions, last_only, self.graph_vars["fi_tree_decode"], tree_decode_step, cache_hits, hidden_states=hidden_states)
         elif is_mq_kp1 and hidden_states is not None and "glue_decode" in self.graph_vars:
             # EAGLE draft glue decode with 2K+1 per seq
@@ -1676,7 +1694,8 @@ class ModelRunner:
         is_prefill: bool,
         last_only: bool = True,
         draft_return_logits: bool = False,
-        hidden_states: torch.Tensor | None = None
+        hidden_states: torch.Tensor | None = None,
+        skip_first_token: int = 0,
     ) -> list[int] | tuple[list[int], torch.Tensor]:
         _pt = os.environ.get("SSD_PROFILE_TARGET", "0") == "1" and not is_prefill and not last_only
         if _pt:
@@ -1684,7 +1703,7 @@ class ModelRunner:
             _r0 = time.perf_counter()
 
         if is_prefill:
-            input_ids, positions = self.prepare_prefill(seqs)
+            input_ids, positions = self.prepare_prefill(seqs, skip_first_token=skip_first_token)
         else:
             input_ids, positions = self.prepare_decode(seqs, verify=not last_only)
         temperatures = self.prepare_sample(seqs) if self.rank == 0 else None
@@ -1710,6 +1729,8 @@ class ModelRunner:
             token_ids = self.sampler(logits, temperatures).tolist() if self.rank == 0 else None
             reset_context()
             if conditioning is not None:
+                if draft_return_logits:
+                    return token_ids, logits, conditioning
                 return token_ids, conditioning
             return (token_ids, logits) if draft_return_logits else token_ids
         else:
