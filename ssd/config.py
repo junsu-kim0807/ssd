@@ -66,6 +66,7 @@ class Config:
     pivot_expansion_threshold: float = 0.8
     # Only used when pivot_expansion_policy == dynamic_expansion; empty uses (-0.06, -0.05).
     pivot_expansion_slope_thresholds: tuple[float, ...] = ()
+    # Sync pivot / pivot_precollapse / pivot_tree_scratch: max 10 root candidates per parent.
     pivot_topk: int = 5
     pivot_max_root_branches: int | None = None
     # pivot_precollapse: draft-score collapse before B-row target verify
@@ -194,8 +195,8 @@ class Config:
                         "pivot_expansion_criteria='softmax_residual' "
                         "(selection scores must match full-vocab slope domain)"
                     )
-                if int(self.pivot_topk) != 5:
-                    raise ValueError("dynamic_expansion requires pivot_topk == 5")
+                if not (3 <= int(self.pivot_topk) <= 10):
+                    raise ValueError("dynamic_expansion requires 3 <= pivot_topk <= 10")
                 n = len(sth)
                 if not (1 <= n <= int(self.pivot_topk) - 2):
                     raise ValueError(
@@ -215,6 +216,8 @@ class Config:
                 raise ValueError("pivot_expansion_threshold must be in [0, 1]")
             if self.pivot_topk < 1:
                 raise ValueError("pivot_topk must be >= 1")
+            if int(self.pivot_topk) > 10:
+                raise ValueError("pivot_topk must be <= 10")
             if self.pivot_max_root_branches is not None and self.pivot_max_root_branches < 1:
                 raise ValueError("pivot_max_root_branches must be >= 1 when set")
             if self.pivot_topk == 1 and self.spec_policy in {"pivot", "pivot_hierarchical", "pivot_precollapse"}:

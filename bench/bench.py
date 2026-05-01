@@ -127,8 +127,8 @@ def parse_arguments():
         choices=["static", "dynamic", "dynamic_expansion"],
         default="dynamic",
         help="Planner policy for pivot / pivot_precollapse. "
-        "dynamic_expansion requires --pivot_topk 5, softmax_residual criteria, "
-        "and --pivot_expansion_slope_thresholds (not supported with pivot_tree_scratch).",
+        "dynamic_expansion requires 3<= --pivot_topk <=10, softmax_residual criteria, "
+        "and slope thresholds (not supported with pivot_tree_scratch).",
     )
     parser.add_argument(
         "--pivot_expansion_criteria",
@@ -150,7 +150,12 @@ def parse_arguments():
         help="dynamic_expansion only: comma-separated strictly increasing slope thresholds "
         "(len in [1, pivot_topk-2]). Example: -0.06,-0.05",
     )
-    parser.add_argument("--pivot_topk", type=int, default=5)
+    parser.add_argument(
+        "--pivot_topk",
+        type=int,
+        default=5,
+        help="Pivot root candidate count (1..10 for pivot / pivot_precollapse; Config-enforced).",
+    )
     parser.add_argument(
         "--pivot_precollapse_score_method",
         type=str,

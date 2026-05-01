@@ -22,7 +22,8 @@ class PivotExpansionConfig:
     # For softmax_residual: set equal to ``threshold`` for bookkeeping only; dynamic expansion
     # uses ``_score_threshold`` (user probability-difference), not logit space.
     logit_threshold: float = field(init=False)
-    # dynamic_expansion only: strictly increasing thresholds for (p_top5-p_top2)/3 slope buckets.
+    # dynamic_expansion only: strictly increasing thresholds for
+    # (p_topK - p_top2) / (K - 2) slope buckets (K == topk).
     slope_thresholds: tuple[float, ...] = ()
 
     def __post_init__(self) -> None:
@@ -42,8 +43,9 @@ class PivotExpansionConfig:
             raise ValueError("topk must be >= 1")
 
         if self.policy == "dynamic_expansion":
-            if int(self.topk) != 5:
-                raise ValueError("dynamic_expansion currently requires pivot_topk == 5")
+            tk = int(self.topk)
+            if not (3 <= tk <= 10):
+                raise ValueError("dynamic_expansion requires 3 <= pivot_topk <= 10")
             st = tuple(float(x) for x in self.slope_thresholds)
             n = len(st)
             if not (1 <= n <= int(self.topk) - 2):
@@ -87,7 +89,7 @@ class PivotHostPlan:
     root_token_probs: list[float] | None = None
     top1_probs: list[float] | None = None
     residual_scores: list[float] | None = None
-    # dynamic_expansion: per-parent (p_top5 - p_top2) / 3 on full-vocab softmax mass; None otherwise.
+    # dynamic_expansion: per-parent (p_topK - p_top2) / (K - 2); None otherwise.
     dynamic_expansion_slope_scores: list[float] | None = None
 
 
@@ -105,7 +107,7 @@ class PivotExpansionPlan:
     residual_scores: torch.Tensor  # [B], float
     branch_counts: list[int]  # len B
     branch_counts_tensor: torch.Tensor  # [B], int64
-    # [B] when policy==dynamic_expansion else None
+    # [B] when policy==dynamic_expansion ((p_topK-p_top2)/(K-2)); else None
     dynamic_expansion_slope_scores: torch.Tensor | None = None
     host: PivotHostPlan | None = None
 
@@ -262,11 +264,12 @@ def build_pivot_expansion_plan(
     topk = min(int(cfg.topk), max(1, vocab_size))
 
     if cfg.policy == "dynamic_expansion":
-        if vocab_size < 5:
+        tk_req = int(cfg.topk)
+        if vocab_size < tk_req:
             raise ValueError(
-                "dynamic_expansion requires vocab_size >= 5 for top-5 softmax statistics"
+                f"dynamic_expansion requires vocab_size >= {tk_req} for top-{tk_req} softmax statistics"
             )
-        topk_eff = min(max(int(cfg.topk), 5), vocab_size)
+        topk_eff = min(tk_req, vocab_size)
     else:
         # Need top-2 for logit margin / full-softmax residual and top-k for root candidates.
         topk_eff = min(max(topk, 2), vocab_size)
@@ -285,13 +288,14 @@ def build_pivot_expansion_plan(
     log_z: torch.Tensor | None = None
     p1: torch.Tensor | None = None
     p2: torch.Tensor | None = None
-    p5: torch.Tensor | None = None
+    p_topk_rank: torch.Tensor | None = None  # full-softmax prob of draft's K-th root candidate (K == cfg.topk)
     if need_softmax_top_probs and vocab_size >= 2:
         log_z = torch.logsumexp(logits_f, dim=-1)
         p1 = torch.exp(top_vals_all[:, 0] - log_z)
         p2 = torch.exp(top_vals_all[:, 1] - log_z)
         if cfg.policy == "dynamic_expansion":
-            p5 = torch.exp(top_vals_all[:, 4] - log_z)
+            k_idx = int(cfg.topk) - 1
+            p_topk_rank = torch.exp(top_vals_all[:, k_idx] - log_z)
 
     if cfg.criteria == "softmax_residual":
         if vocab_size >= 2:
@@ -318,8 +322,9 @@ def build_pivot_expansion_plan(
 
     slope_tensor: torch.Tensor | None = None
     if cfg.policy == "dynamic_expansion":
-        assert p2 is not None and p5 is not None
-        slope_tensor = ((p5 - p2) / 3.0).to(torch.float32)
+        assert p2 is not None and p_topk_rank is not None
+        tk_slope = float(int(cfg.topk) - 2)
+        slope_tensor = ((p_topk_rank - p2) / tk_slope).to(torch.float32)
         branch_counts_t = _dynamic_expansion_branch_counts_from_slope(
             slope_tensor, expand_mask, cfg
         )

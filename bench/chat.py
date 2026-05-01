@@ -70,7 +70,12 @@ def parse_args():
         metavar="T0,T1,...",
         help="dynamic_expansion: comma-separated strictly increasing thresholds.",
     )
-    p.add_argument("--pivot_topk", type=int, default=5)
+    p.add_argument(
+        "--pivot_topk",
+        type=int,
+        default=5,
+        help="Pivot root branches (1..10; pivot / pivot_precollapse).",
+    )
     p.add_argument("--b", type=int, default=1)
     p.add_argument("--x", type=float, default=None)
     p.add_argument("--eager", action="store_true")

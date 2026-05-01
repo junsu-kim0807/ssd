@@ -31,8 +31,9 @@ Sweep flags (optional, Cartesian product with other dimensions):
   --length  → speculative k 3, 5, 7, 9 (methods with ``uses_spec_k``; AR keeps path segment ``kna``)
   --temp    → temperatures 0, 0.3, 0.7, 1.0
 
-Default ``--methods`` is ``ar,sync,pivot`` (autoregressive, sync spec, planner pivot). Other ids
-(``async``, ``hierarchical``, ``pivot_legacy``, …) remain available via ``--methods``.
+Default ``--methods`` is ``sync,eagle3,pivot_static10,pivot_precollapse_dyn10,pivot_precollapse_de10``.
+Other ids (``ar``, ``async``, ``hierarchical``, ``pivot``, ``pivot_precollapse``, ``pivot_legacy``, …)
+remain available via ``--methods``.
 
 Adding a method
     1. Define ``extra_bench_args(k, async_fan_out) -> list[str]`` (tokens only; no ``--gpus``).
@@ -126,6 +127,10 @@ DEFAULT_GPU_BY_FAMILY_METHOD: dict[tuple[str, str], int] = {
     ("llama", "hierarchical"): 4,
     ("llama", "pivot"): 4,
     ("llama", "pivot_precollapse"): 4,
+    ("llama", "eagle3"): 4,
+    ("llama", "pivot_static10"): 4,
+    ("llama", "pivot_precollapse_dyn10"): 4,
+    ("llama", "pivot_precollapse_de10"): 4,
     ("llama", "pivot_legacy"): 4,
     ("qwen", "ar"): 2,
     ("qwen", "sync"): 2,
@@ -133,6 +138,10 @@ DEFAULT_GPU_BY_FAMILY_METHOD: dict[tuple[str, str], int] = {
     ("qwen", "hierarchical"): 2,
     ("qwen", "pivot"): 2,
     ("qwen", "pivot_precollapse"): 2,
+    ("qwen", "eagle3"): 3,
+    ("qwen", "pivot_static10"): 2,
+    ("qwen", "pivot_precollapse_dyn10"): 2,
+    ("qwen", "pivot_precollapse_de10"): 2,
     ("qwen", "pivot_legacy"): 3,
     ("gemma", "ar"): 2,
     ("gemma", "sync"): 2,
@@ -140,6 +149,10 @@ DEFAULT_GPU_BY_FAMILY_METHOD: dict[tuple[str, str], int] = {
     ("gemma", "hierarchical"): 2,
     ("gemma", "pivot"): 2,
     ("gemma", "pivot_precollapse"): 2,
+    ("gemma", "eagle3"): 3,
+    ("gemma", "pivot_static10"): 2,
+    ("gemma", "pivot_precollapse_dyn10"): 2,
+    ("gemma", "pivot_precollapse_de10"): 2,
     ("gemma", "pivot_legacy"): 3,
     ("vicuna13b_160m", "ar"): 2,
     ("vicuna13b_160m", "sync"): 2,
@@ -147,6 +160,10 @@ DEFAULT_GPU_BY_FAMILY_METHOD: dict[tuple[str, str], int] = {
     ("vicuna13b_160m", "hierarchical"): 2,
     ("vicuna13b_160m", "pivot"): 2,
     ("vicuna13b_160m", "pivot_precollapse"): 2,
+    ("vicuna13b_160m", "eagle3"): 3,
+    ("vicuna13b_160m", "pivot_static10"): 2,
+    ("vicuna13b_160m", "pivot_precollapse_dyn10"): 2,
+    ("vicuna13b_160m", "pivot_precollapse_de10"): 2,
     ("vicuna13b_160m", "pivot_legacy"): 3,
 }
 
@@ -194,18 +211,67 @@ def pct_path_component(pct: float) -> str:
 
 
 def uses_pivot_profiler_layout(method_id: str) -> bool:
-    return method_id in {"pivot", "pivot_precollapse", "pivot_legacy"}
+    return method_id in {
+        "pivot",
+        "pivot_static10",
+        "pivot_precollapse",
+        "pivot_precollapse_dyn10",
+        "pivot_precollapse_de10",
+        "pivot_legacy",
+    }
+
+
+def profiler_method_id_for_layout(method_id: str) -> str:
+    """Profiler directory layout uses canonical pivot / pivot_precollapse segment names."""
+    if method_id in {"pivot_static10"}:
+        return "pivot"
+    if method_id in {"pivot_precollapse_dyn10", "pivot_precollapse_de10"}:
+        return "pivot_precollapse"
+    return method_id
+
+
+def job_layout_method_folder(spec_id: str) -> str:
+    """Human-readable folder segment under profile_mode/<family>/ (matches profiler roots)."""
+    if spec_id in {"pivot", "pivot_static10"}:
+        return "pivot"
+    if spec_id in {"pivot_precollapse", "pivot_precollapse_dyn10", "pivot_precollapse_de10"}:
+        return "pivot_precollapse"
+    return spec_id
 
 
 # With ``--batch`` / ``--length`` and method ``pivot`` only (not ``pivot_legacy``).
 PIVOT_BATCH_LENGTH_TOPK_SWEEP = (2, 3, 5)
 PIVOT_BATCH_LENGTH_EXPANSION_PCT_SWEEP = (0.1, 0.2, 0.5)
-PIVOT_STATIC_TOPK_SWEEP = (2, 3, 4, 5)
+PIVOT_STATIC_TOPK_SWEEP = (10,)
 PIVOT_STATIC_EXPANSION_PCT = 1.0
 PIVOT_STATIC_POLICY = "static"
 
+# Default slope CSV for generated pivot_precollapse + dynamic_expansion jobs (Config fills if empty).
+DEFAULT_PIVOT_DE_SLOPE_THRESHOLDS = "-0.06,-0.05"
+
+
+def resolve_pivot_policy(spec_id: str, args: argparse.Namespace) -> str:
+    if spec_id == "pivot_static10":
+        return PIVOT_STATIC_POLICY
+    if spec_id == "pivot_precollapse_de10":
+        return "dynamic_expansion"
+    if spec_id == "pivot_precollapse_dyn10":
+        return "dynamic"
+    if args.static and spec_id in {"pivot", "pivot_precollapse"}:
+        return PIVOT_STATIC_POLICY
+    return str(args.pivot_expansion_policy)
+
+
+def pivot_criteria_slope_for_spec(spec_id: str) -> tuple[str | None, str | None]:
+    """Extra bench CLI for pivot_precollapse + dynamic_expansion (criteria required by Config)."""
+    if spec_id == "pivot_precollapse_de10":
+        return ("softmax_residual", DEFAULT_PIVOT_DE_SLOPE_THRESHOLDS)
+    return (None, None)
+
 
 def uses_pivot_batch_length_topk_pct_sweep(method_id: str) -> bool:
+    if method_id in {"pivot_static10", "pivot_precollapse_dyn10", "pivot_precollapse_de10"}:
+        return False
     return method_id in {"pivot", "pivot_precollapse"}
 
 
@@ -217,6 +283,12 @@ def iter_pivot_topk_pct_for_profile_sweep(
     cli_pct: float,
     static_mode: bool = False,
 ) -> tuple[tuple[int, float], ...]:
+    if method_id == "pivot_static10":
+        return ((10, float(PIVOT_STATIC_EXPANSION_PCT)),)
+    if method_id == "pivot_precollapse_dyn10":
+        return ((10, float(cli_pct)),)
+    if method_id == "pivot_precollapse_de10":
+        return ((10, float(cli_pct)),)
     if static_mode and method_id in {"pivot", "pivot_precollapse"}:
         return tuple((int(tk), float(PIVOT_STATIC_EXPANSION_PCT)) for tk in PIVOT_STATIC_TOPK_SWEEP)
     if multi_dataset_sweep and uses_pivot_batch_length_topk_pct_sweep(method_id):
@@ -295,6 +367,23 @@ def _args_pivot_legacy(k: int, f: int) -> list[str]:
     ]
 
 
+def _args_eagle3(k: int, f: int) -> list[str]:
+    """Async EAGLE3 (bench requires --async with --eagle unless pivot_precollapse)."""
+    return ["--spec", "--async", "--eagle", "--k", str(k), "--f", str(f)]
+
+
+def _args_pivot_static10(k: int, _f: int) -> list[str]:
+    return ["--spec", "--k", str(k), "--spec_policy", "pivot"]
+
+
+def _args_pivot_precollapse_dyn10(k: int, _f: int) -> list[str]:
+    return _args_pivot_precollapse(k, _f)
+
+
+def _args_pivot_precollapse_de10(k: int, _f: int) -> list[str]:
+    return _args_pivot_precollapse(k, _f)
+
+
 METHOD_REGISTRY: dict[str, BenchMethodSpec] = {
     "ar": BenchMethodSpec(
         id="ar",
@@ -309,6 +398,13 @@ METHOD_REGISTRY: dict[str, BenchMethodSpec] = {
         uses_spec_k=True,
         default_k=5,
         extra_bench_args=_args_sync,
+    ),
+    "eagle3": BenchMethodSpec(
+        id="eagle3",
+        description="Async EAGLE3 speculative decoding (--spec --async --eagle)",
+        uses_spec_k=True,
+        default_k=5,
+        extra_bench_args=_args_eagle3,
     ),
     "async": BenchMethodSpec(
         id="async",
@@ -331,12 +427,33 @@ METHOD_REGISTRY: dict[str, BenchMethodSpec] = {
         default_k=5,
         extra_bench_args=_args_pivot,
     ),
+    "pivot_static10": BenchMethodSpec(
+        id="pivot_static10",
+        description="Pivot static expansion, pivot_topk=10 (profile sweep uses single topk/pct cell)",
+        uses_spec_k=True,
+        default_k=5,
+        extra_bench_args=_args_pivot_static10,
+    ),
     "pivot_precollapse": BenchMethodSpec(
         id="pivot_precollapse",
         description="Sync pivot_precollapse with EAGLE3 draft (--spec_policy pivot_precollapse --eagle)",
         uses_spec_k=True,
         default_k=5,
         extra_bench_args=_args_pivot_precollapse,
+    ),
+    "pivot_precollapse_dyn10": BenchMethodSpec(
+        id="pivot_precollapse_dyn10",
+        description="pivot_precollapse + dynamic policy + pivot_topk=10",
+        uses_spec_k=True,
+        default_k=5,
+        extra_bench_args=_args_pivot_precollapse_dyn10,
+    ),
+    "pivot_precollapse_de10": BenchMethodSpec(
+        id="pivot_precollapse_de10",
+        description="pivot_precollapse + dynamic_expansion + softmax_residual + top10",
+        uses_spec_k=True,
+        default_k=5,
+        extra_bench_args=_args_pivot_precollapse_de10,
     ),
     "pivot_legacy": BenchMethodSpec(
         id="pivot_legacy",
@@ -504,6 +621,8 @@ def build_bench_argv(
     pivot_topk: int | None = None,
     pivot_expansion_pct: float | None = None,
     pivot_expansion_policy: str | None = None,
+    pivot_expansion_criteria: str | None = None,
+    pivot_expansion_slope_thresholds: str | None = None,
 ) -> list[str]:
     argv: list[str] = [
         "python",
@@ -538,6 +657,10 @@ def build_bench_argv(
         )
         if pivot_expansion_policy is not None:
             argv.extend(["--pivot_expansion_policy", str(pivot_expansion_policy)])
+        if pivot_expansion_criteria is not None:
+            argv.extend(["--pivot_expansion_criteria", str(pivot_expansion_criteria)])
+        if pivot_expansion_slope_thresholds is not None and str(pivot_expansion_slope_thresholds).strip():
+            argv.extend(["--pivot_expansion_slope_thresholds", str(pivot_expansion_slope_thresholds)])
     argv.extend(
         [
             "--profile",
@@ -652,6 +775,8 @@ def build_multi_dataset_profile_loop_sh(
     pivot_topk: int | None = None,
     pivot_expansion_pct: float | None = None,
     pivot_expansion_policy: str | None = None,
+    pivot_expansion_criteria: str | None = None,
+    pivot_expansion_slope_thresholds: str | None = None,
 ) -> str:
     """Bash loop: ``--profiler_output_dir`` = ``$PROFILE_BASE/$dataset`` (``dataset`` in MULTI_DATASET_PROFILE_SLUGS)."""
     prof_base_q = shell_quote_single("./" + profiler_base_rel.replace(os.sep, "/"))
@@ -690,6 +815,12 @@ def build_multi_dataset_profile_loop_sh(
         body_lines.append(f"    --pivot_expansion_pct {float(pivot_expansion_pct)} \\")
         if pivot_expansion_policy is not None:
             body_lines.append(f"    --pivot_expansion_policy {shlex.quote(str(pivot_expansion_policy))} \\")
+        if pivot_expansion_criteria is not None:
+            body_lines.append(f"    --pivot_expansion_criteria {shlex.quote(str(pivot_expansion_criteria))} \\")
+        if pivot_expansion_slope_thresholds is not None and str(pivot_expansion_slope_thresholds).strip():
+            body_lines.append(
+                f"    --pivot_expansion_slope_thresholds {shlex.quote(str(pivot_expansion_slope_thresholds))} \\"
+            )
     for tok in extra_bench_args:
         body_lines.append(f"    {shlex.quote(str(tok))} \\")
     body_lines += [
@@ -849,9 +980,11 @@ def main() -> None:
     p.add_argument(
         "--methods",
         type=str,
-        default="pivot",
-        help="Comma-separated method ids: ar | sync | async | hierarchical | pivot | pivot_legacy "
-        "(default ar,sync,pivot; pivot is sync planner policy; pivot_legacy keeps async + spec_hive path).",
+        default="sync,eagle3,pivot_static10,pivot_precollapse_dyn10,pivot_precollapse_de10",
+        help="Comma-separated method ids: ar | sync | eagle3 | async | hierarchical | pivot | pivot_static10 | "
+        "pivot_precollapse | pivot_precollapse_dyn10 | pivot_precollapse_de10 | pivot_legacy | … "
+        "(defaults cover sync spec, async EAGLE3, pivot static top10, pivot_precollapse dynamic top10, "
+        "pivot_precollapse dynamic_expansion top10).",
     )
     p.add_argument(
         "--dataset",
@@ -884,7 +1017,7 @@ def main() -> None:
         "--static",
         action="store_true",
         help="Pivot static expansion preset: --pivot_expansion_policy static, --pivot_expansion_pct 1.0, "
-        "pivot topk sweep 2,3,4,5, and defaults b=16/k=5 when not overridden.",
+        "pivot topk sweep 10 for methods pivot / pivot_precollapse, and defaults b=16/k=5 when not overridden.",
     )
 
     p.add_argument("--batch-sizes", type=str, default="", help="Override batch sweep, e.g. '1,8,32'")
@@ -912,9 +1045,10 @@ def main() -> None:
     p.add_argument(
         "--pivot-expansion-policy",
         type=str,
-        choices=("static", "dynamic"),
+        choices=("static", "dynamic", "dynamic_expansion"),
         default="dynamic",
-        help="pivot / pivot_legacy: bench.py --pivot_expansion_policy (default dynamic).",
+        help="Fallback bench.py --pivot_expansion_policy for generic pivot ids (default dynamic). "
+        "Named methods pivot_static10 / pivot_precollapse_dyn10 / pivot_precollapse_de10 set policy explicitly.",
     )
     p.add_argument(
         "--pivot-profiler-round",
@@ -1019,7 +1153,6 @@ def main() -> None:
     else:
         ks_final = (5,) if args.static else (6,)
 
-    pivot_policy_for_run = PIVOT_STATIC_POLICY if args.static else str(args.pivot_expansion_policy)
     pivot_pct_for_run = float(PIVOT_STATIC_EXPANSION_PCT) if args.static else float(args.pivot_expansion_pct)
 
     gpus_global: int | None = int(args.gpus) if str(args.gpus).strip() else None
@@ -1043,7 +1176,7 @@ def main() -> None:
             run_length_chunks.append(argv_cmd)
         if args.temp:
             run_temp_chunks.append(argv_cmd)
-        if args.static and method_id in {"pivot", "pivot_precollapse"}:
+        if args.static and method_id in {"pivot", "pivot_precollapse", "pivot_static10"}:
             run_pivot_static_chunks.append(argv_cmd)
 
     for fam, mid, k_val, b_val, temp_val, spec in iter_job_configs(
@@ -1069,6 +1202,11 @@ def main() -> None:
             hv_round_cells,
             pivot_topk_pct_cells,
         ):
+            pivot_policy_this = resolve_pivot_policy(spec.id, args)
+            p_crit, p_slope = pivot_criteria_slope_for_spec(spec.id)
+            prof_layout_mid = (
+                profiler_method_id_for_layout(spec.id) if uses_pivot_profiler_layout(spec.id) else spec.id
+            )
             flag_name, target_hub, draft_hub = MODEL_PRESETS[fam]
             pair_slug = target_plus_draft_slug(target_hub, None if not spec.uses_spec_k else draft_hub)
             k_path = "kna" if not spec.uses_spec_k else f"k{int(k_val)}"
@@ -1080,12 +1218,12 @@ def main() -> None:
                 pivot_round=str(args.pivot_profiler_round),
                 pivot_topk=int(pivot_topk_val),
                 pivot_expansion_pct=float(pivot_pct_val),
-                pivot_expansion_policy=str(pivot_policy_for_run),
+                pivot_expansion_policy=str(pivot_policy_this),
             )
 
             prof_base_rel = profiler_rel_dir(
                 profile_mode=args.profile_mode,
-                method_id=spec.id,
+                method_id=prof_layout_mid,
                 batch_size=b_val,
                 k_path_token=k_path,
                 pair_slug=pair_slug,
@@ -1118,34 +1256,34 @@ def main() -> None:
                 hv_target_verify_interval=hv_round,
                 pivot_topk=pivot_bench_topk,
                 pivot_expansion_pct=pivot_bench_pct,
-                pivot_expansion_policy=(pivot_policy_for_run if uses_pivot_profiler_layout(spec.id) else None),
+                pivot_expansion_policy=(pivot_policy_this if uses_pivot_profiler_layout(spec.id) else None),
+                pivot_expansion_criteria=(p_crit if uses_pivot_profiler_layout(spec.id) else None),
+                pivot_expansion_slope_thresholds=(p_slope if uses_pivot_profiler_layout(spec.id) else None),
             )
 
             temp_tag = temp_path_tag(temp_val)
             r_tag = f"r{int(hv_round)}" if hv_round is not None else ""
 
             if uses_pivot_profiler_layout(spec.id):
-                rel_bits = (
-                    Path(args.profile_mode)
-                    / fam
-                    / ("pivot" if spec.id == "pivot" else spec.id)
-                    / (
-                        sanitize_path_component(str(pivot_policy_for_run))
-                        if spec.id in {"pivot", "pivot_precollapse"}
-                        else ""
-                    )
-                    / f"b{b_val}"
-                    / k_path
-                    / pair_slug
-                    / temp_tag
-                    / f"r_{sanitize_path_component(str(args.pivot_profiler_round))}"
-                    / f"topk{int(pivot_topk_val)}"
-                    / pct_path_component(float(pivot_pct_val))
-                )
                 if spec.id == "pivot_legacy":
                     rel_bits = (
                         Path(args.profile_mode)
                         / spec.id
+                        / f"b{b_val}"
+                        / k_path
+                        / pair_slug
+                        / temp_tag
+                        / f"r_{sanitize_path_component(str(args.pivot_profiler_round))}"
+                        / f"topk{int(pivot_topk_val)}"
+                        / pct_path_component(float(pivot_pct_val))
+                    )
+                else:
+                    layout_folder = job_layout_method_folder(spec.id)
+                    rel_bits = Path(args.profile_mode) / fam / layout_folder
+                    if layout_folder in {"pivot", "pivot_precollapse"}:
+                        rel_bits = rel_bits / sanitize_path_component(str(pivot_policy_this))
+                    rel_bits = (
+                        rel_bits
                         / f"b{b_val}"
                         / k_path
                         / pair_slug
@@ -1177,7 +1315,7 @@ def main() -> None:
                 script_path = job_dir / f"{job_name}.sh"
                 mkdir_ov = profiler_mkdirs_block_for_datasets(
                     profile_mode=args.profile_mode,
-                    method_id=spec.id,
+                    method_id=prof_layout_mid,
                     batch_size=b_val,
                     k_path_token=k_path,
                     pair_slug=pair_slug,
@@ -1202,13 +1340,15 @@ def main() -> None:
                     hv_target_verify_interval=hv_round,
                     pivot_topk=pivot_bench_topk,
                     pivot_expansion_pct=pivot_bench_pct,
-                    pivot_expansion_policy=(pivot_policy_for_run if uses_pivot_profiler_layout(spec.id) else None),
+                    pivot_expansion_policy=(pivot_policy_this if uses_pivot_profiler_layout(spec.id) else None),
+                    pivot_expansion_criteria=(p_crit if uses_pivot_profiler_layout(spec.id) else None),
+                    pivot_expansion_slope_thresholds=(p_slope if uses_pivot_profiler_layout(spec.id) else None),
                 )
                 for ds in MULTI_DATASET_PROFILE_SLUGS:
                     ds_rb = dataset_bench_flags(ds)
                     prof_rel_rb = "./" + profiler_rel_dir(
                         profile_mode=args.profile_mode,
-                        method_id=spec.id,
+                        method_id=prof_layout_mid,
                         batch_size=b_val,
                         k_path_token=k_path,
                         pair_slug=pair_slug,
@@ -1235,10 +1375,11 @@ def main() -> None:
                             hv_target_verify_interval=hv_round,
                             pivot_topk=pivot_bench_topk,
                             pivot_expansion_pct=pivot_bench_pct,
-                            pivot_expansion_policy=(pivot_policy_for_run if uses_pivot_profiler_layout(spec.id) else None),
-                        )
-                        ,
-                        method_id=spec.id
+                            pivot_expansion_policy=(pivot_policy_this if uses_pivot_profiler_layout(spec.id) else None),
+                            pivot_expansion_criteria=(p_crit if uses_pivot_profiler_layout(spec.id) else None),
+                            pivot_expansion_slope_thresholds=(p_slope if uses_pivot_profiler_layout(spec.id) else None),
+                        ),
+                        method_id=spec.id,
                     )
                 text = make_slurm_script(
                     job_name=job_name,
@@ -1270,7 +1411,7 @@ def main() -> None:
                     ds_flags = dataset_bench_flags(ds)
                     prof_rel_ds = "./" + profiler_rel_dir(
                         profile_mode=args.profile_mode,
-                        method_id=spec.id,
+                        method_id=prof_layout_mid,
                         batch_size=b_val,
                         k_path_token=k_path,
                         pair_slug=pair_slug,
@@ -1298,7 +1439,9 @@ def main() -> None:
                         hv_target_verify_interval=hv_round,
                         pivot_topk=pivot_bench_topk,
                         pivot_expansion_pct=pivot_bench_pct,
-                        pivot_expansion_policy=(pivot_policy_for_run if uses_pivot_profiler_layout(spec.id) else None),
+                        pivot_expansion_policy=(pivot_policy_this if uses_pivot_profiler_layout(spec.id) else None),
+                        pivot_expansion_criteria=(p_crit if uses_pivot_profiler_layout(spec.id) else None),
+                        pivot_expansion_slope_thresholds=(p_slope if uses_pivot_profiler_layout(spec.id) else None),
                     )
                     _record_run_script_argv(bench_argv_ds, method_id=spec.id)
                     text = make_slurm_script(
