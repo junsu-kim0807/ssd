@@ -27,8 +27,8 @@ bash scripts are written: ``profile/run_batch.sh`` (``--batch``), ``profile/run_
 and ``profile/run_temp.sh`` (``--temp``), with ``sleep 5`` between ``python -O bench/bench.py`` blocks.
 
 Sweep flags (optional, Cartesian product with other dimensions):
-  --batch   → batch sizes 1, 4, 16, 64, 256
-  --length  → speculative k 3, 5, 7, 9 (methods with ``uses_spec_k``; AR keeps path segment ``kna``)
+  --batch   → batch sizes from ``BATCH_SWEEP`` (may be a single value, e.g. ``(16,)``)
+  --length  → speculative k from ``K_SWEEP`` (may be a single value, e.g. ``(5,)``; AR keeps path segment ``kna``)
   --temp    → temperatures 0, 0.3, 0.7, 1.0
 
 Default ``--methods`` is ``sync,eagle3,pivot_static10,pivot_precollapse_dyn10,pivot_precollapse_de10``.
@@ -81,11 +81,10 @@ DEFAULT_MEM_PER_GPU = "128G"
 DEFAULT_TIME_LIMIT = "04:00:00"
 DEFAULT_CPUS_PER_TASK = 16
 
-# BATCH_SWEEP = (1, 2, 4, 8, 16)
+# Single-element sweeps are valid: use a trailing comma, e.g. (16,) not (16) which is an int.
+BATCH_SWEEP = (16,)
 
-BATCH_SWEEP = (16, 32)
-
-K_SWEEP = (3, 5, 7, 9, 11)
+K_SWEEP = (5,)
 TEMP_SWEEP = (0.0, 0.3, 0.7, 1.0)
 
 # Hierarchical: default sweep for ``bench.py --round`` when ``--hv-rounds`` is not passed.
@@ -359,7 +358,6 @@ def _args_pivot_precollapse(k: int, _f: int) -> list[str]:
         str(k),
         "--spec_policy",
         "pivot_precollapse",
-        "--eagle",
     ]
 
 
@@ -446,7 +444,7 @@ METHOD_REGISTRY: dict[str, BenchMethodSpec] = {
     ),
     "pivot_precollapse": BenchMethodSpec(
         id="pivot_precollapse",
-        description="Sync pivot_precollapse with EAGLE3 draft (--spec_policy pivot_precollapse --eagle)",
+        description="Sync pivot_precollapse (--spec_policy pivot_precollapse)",
         uses_spec_k=True,
         default_k=5,
         extra_bench_args=_args_pivot_precollapse,
@@ -998,7 +996,7 @@ def main() -> None:
     p.add_argument(
         "--methods",
         type=str,
-        default="sync,eagle3,pivot_static10,pivot_precollapse_dyn10,pivot_precollapse_de10",
+        default="eagle3,pivot_static10,pivot_precollapse_dyn10,pivot_precollapse_de10",
         help="Comma-separated method ids: ar | sync | eagle3 | async | hierarchical | pivot | pivot_static10 | "
         "pivot_precollapse | pivot_precollapse_dyn10 | pivot_precollapse_de10 | pivot_legacy | … "
         "(defaults cover sync spec, sync EAGLE3 (default spec_policy), pivot static top10, pivot_precollapse dynamic top10, "

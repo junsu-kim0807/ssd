@@ -154,8 +154,8 @@ def parse_arguments():
         "--pivot_expansion_criteria",
         type=str,
         choices=["top1", "residual", "softmax_residual"],
-        default="residual",
-        help="Pivot expansion uncertainty: top1/residual use binary logit-margin proxy; "
+        default="softmax_residual",
+        help="Pivot expansion uncertainty (default softmax_residual): top1/residual use binary logit-margin proxy; "
         "softmax_residual uses full-vocab p_top1 - p_top2 (expand when residual < threshold). "
         "When --pivot_expansion_policy dynamic_expansion, criteria must be softmax_residual "
         "(enforced in Config).",

@@ -64,8 +64,8 @@ def parse_args():
         "--pivot_expansion_criteria",
         type=str,
         choices=["top1", "residual", "softmax_residual"],
-        default="residual",
-        help="dynamic_expansion requires softmax_residual (enforced in Config).",
+        default="softmax_residual",
+        help="dynamic_expansion requires softmax_residual (enforced in Config when policy is dynamic_expansion).",
     )
     p.add_argument("--pivot_expansion_pct", type=float, default=0.0)
     p.add_argument("--pivot_expansion_threshold", type=float, default=0.8)
