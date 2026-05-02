@@ -448,37 +448,73 @@ class SpecDecodeStep(InferenceStep):
                 bundle = getattr(speculate_result, "branch_bundle", None)
                 winners = getattr(out_verify_result, "winning_branch_idx_per_parent", None)
                 _pol = getattr(self.scheduler.config, "spec_policy", "")
-                _precollapse = uses_pivot_precollapse(_pol)
                 _already_b_shaped = (
                     speculate_result.logits_q is not None
                     and speculate_result.logits_q.shape[0] == len(seqs)
                 )
-                if bundle is not None and winners is not None and not _precollapse and not _already_b_shaped:
-                    # Collapse expanded-row draft metadata to parent winners.
-                    by_parent_rows: list[list[int]] = [[] for _ in range(len(seqs))]
+                B = len(seqs)
+                pb_d_ids: list[list[list[int]] | None] = [None] * B
+                pb_d_conf: list[list[list[float]] | None] = [None] * B
+                pb_f_ids: list[list[list[int]] | None] = [None] * B
+                pb_f_conf: list[list[list[float]] | None] = [None] * B
+                # ``score_expansion`` produces a B + selected_count shaped
+                # logits tensor (precollapse=True but _already_b_shaped=False),
+                # so gate purely on the actual row shape. The inner code's
+                # winner lookup uses ``branch_index_per_parent[r] == winner``,
+                # which works for both regular pivot and score_expansion.
+                if bundle is not None and winners is not None and not _already_b_shaped:
+                    # Collapse expanded-row draft metadata to parent winners (flat columns).
+                    # Planner pivot + pivot_expanded: also record every branch in pivot_branches_*.
+                    by_parent_rows: list[list[int]] = [[] for _ in range(B)]
                     for row_idx, pidx in enumerate(bundle.parent_index_per_branch):
-                        by_parent_rows[int(pidx)].append(row_idx)
+                        by_parent_rows[int(pidx)].append(int(row_idx))
+                    trace_bt = out_verify_result.profile_trace
+                    pe_list = (
+                        getattr(trace_bt, "pivot_expanded", None) if trace_bt is not None else None
+                    )
                     f_ids_w: list[list[int]] = []
                     f_conf_w: list[list[float]] = []
                     d_ids_w: list[list[int]] = []
                     d_conf_w: list[list[float]] = []
-                    for pidx in range(len(seqs)):
-                        rows = by_parent_rows[pidx]
-                        if rows:
-                            w = int(winners[pidx]) if pidx < len(winners) else 0
-                            w = max(0, min(w, len(rows) - 1))
-                            r = rows[w]
-                            f_ids_w.append(f_ids[r])
-                            f_conf_w.append(f_conf[r])
-                            d_ids_w.append(d_ids[r])
-                            d_conf_w.append(d_conf[r])
+                    for pidx in range(B):
+                        rows_p = by_parent_rows[pidx]
+                        winner_row: int | None = None
+                        if rows_p:
+                            wb = int(winners[pidx]) if pidx < len(winners) else 0
+                            for r in rows_p:
+                                if int(bundle.branch_index_per_parent[r]) == wb:
+                                    winner_row = r
+                                    break
+                            if winner_row is None:
+                                winner_row = rows_p[0]
+                        if winner_row is not None:
+                            f_ids_w.append(f_ids[winner_row])
+                            f_conf_w.append(f_conf[winner_row])
+                            d_ids_w.append(d_ids[winner_row])
+                            d_conf_w.append(d_conf[winner_row])
                         else:
                             f_ids_w.append([0] * FIRST_DRAFT_METADATA_TOPK)
                             f_conf_w.append([0.0] * FIRST_DRAFT_METADATA_TOPK)
                             d_ids_w.append([0] * k)
                             d_conf_w.append([0.0] * k)
+
+                        store_all = (
+                            _pol in {"pivot", "pivot_precollapse"}
+                            and len(rows_p) > 1
+                            and pe_list is not None
+                            and pidx < len(pe_list)
+                            and bool(pe_list[pidx])
+                        )
+                        if store_all:
+                            rows_sorted = sorted(
+                                rows_p, key=lambda r: int(bundle.branch_index_per_parent[r])
+                            )
+                            pb_d_ids[pidx] = [list(d_ids[r]) for r in rows_sorted]
+                            pb_d_conf[pidx] = [list(d_conf[r]) for r in rows_sorted]
+                            pb_f_ids[pidx] = [list(f_ids[r]) for r in rows_sorted]
+                            pb_f_conf[pidx] = [list(f_conf[r]) for r in rows_sorted]
+
                     f_ids, f_conf, d_ids, d_conf = f_ids_w, f_conf_w, d_ids_w, d_conf_w
-                B = len(seqs)
                 step_wall = pr.current_step_elapsed_s()
                 nd = st.num_draft_requests_step or B
                 nv = st.num_verification_requests_step or B
@@ -515,6 +551,10 @@ class SpecDecodeStep(InferenceStep):
                             num_draft=nd,
                             num_verification=nv,
                             cost_fields=(pr.mode == "cost_metadata"),
+                            pivot_branches_draft_token_ids_per_position=pb_d_ids[bi],
+                            pivot_branches_draft_token_confidence_per_position=pb_d_conf[bi],
+                            pivot_branches_first_draft_token_ids=pb_f_ids[bi],
+                            pivot_branches_first_draft_token_confidence=pb_f_conf[bi],
                         )
                     )
                 pr.flush_spec_decode_rows(seqs, False, rows)
@@ -661,6 +701,10 @@ class HierarchicalFusedStep(SpecDecodeStep):
                     cost_fields=(pr.mode == "cost_metadata"),
                     hv_fused_subround_idx=subround_idx,
                     hv_fused_engine_step_id=engine_step_id,
+                    pivot_branches_draft_token_ids_per_position=None,
+                    pivot_branches_draft_token_confidence_per_position=None,
+                    pivot_branches_first_draft_token_ids=None,
+                    pivot_branches_first_draft_token_confidence=None,
                 )
             )
         pr.flush_spec_decode_rows(seqs, False, rows)

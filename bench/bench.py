@@ -205,9 +205,10 @@ def parse_arguments():
     parser.add_argument(
         "--pivot_precollapse_selection",
         type=str,
-        choices=["score", "slope"],
+        choices=["score", "slope", "score_expansion"],
         default="score",
-        help="pivot_precollapse: score=expand then draft-score collapse; slope=no expansion, slope-picked root.",
+        help="pivot_precollapse: score=expand then draft-score collapse to B; slope=no expansion, slope-picked root; "
+        "score_expansion=expand, draft-score keeps branch 0 + best alt and target verifies B+selected rows.",
     )
     parser.add_argument(
         "--pivot_precollapse_slope_thresholds",

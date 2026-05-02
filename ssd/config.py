@@ -75,8 +75,9 @@ class Config:
     # pivot_precollapse: draft-score collapse before B-row target verify
     pivot_precollapse_score_method: Literal["logprob_sum", "logit_sum"] = "logprob_sum"
     pivot_precollapse_score_temperature_aware: bool = False
-    # pivot_precollapse: "score" = expand then score-collapse; "slope" = no expansion, slope-picked root
-    pivot_precollapse_selection: Literal["score", "slope"] = "score"
+    # pivot_precollapse: "score" = expand then score-collapse to B; "slope" = no expansion, slope-picked root;
+    # "score_expansion" = expand, draft-score keeps branch 0 + best alt (B + selected target rows; flat collapse).
+    pivot_precollapse_selection: Literal["score", "slope", "score_expansion"] = "score"
     # Stored as negative floats (same domain as dynamic_expansion slope). CLI may pass absolute values.
     pivot_precollapse_slope_thresholds: tuple[float, float, float] = (-0.70, -0.58, -0.46)
 
@@ -273,9 +274,10 @@ class Config:
                         "pivot_precollapse_score_method must be one of "
                         "{'logprob_sum', 'logit_sum'}"
                     )
-                if self.pivot_precollapse_selection not in {"score", "slope"}:
+                if self.pivot_precollapse_selection not in {"score", "slope", "score_expansion"}:
                     raise ValueError(
-                        "pivot_precollapse_selection must be one of {'score', 'slope'}; "
+                        "pivot_precollapse_selection must be one of "
+                        "{'score', 'slope', 'score_expansion'}; "
                         f"got {self.pivot_precollapse_selection!r}"
                     )
                 pst_raw = self.pivot_precollapse_slope_thresholds
@@ -302,6 +304,12 @@ class Config:
                             "pivot_precollapse_selection='slope' requires pivot_topk >= 5 "
                             f"(got {self.pivot_topk})"
                         )
+                if self.pivot_precollapse_selection == "score_expansion" and self.use_eagle:
+                    raise NotImplementedError(
+                        "pivot_precollapse_selection='score_expansion' does not support "
+                        "use_eagle=True yet (PivotExecutorFlat verify/prefill are not "
+                        "Eagle-wired)."
+                    )
 
             if uses_pivot_root_expansion(self.spec_policy):
                 assert not self.draft_async, f"{self.spec_policy} requires draft_async=False (sync spec)"

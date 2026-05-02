@@ -19,6 +19,11 @@ Each row includes ``accumulated_draft_token_confidence``: the product of
 sampled token at each of the ``K`` draft positions), or ``null`` when the list is
 empty.
 
+Planner ``pivot`` with expansion (``pivot_expanded`` true): optional columns
+``pivot_branches_*`` list draft tokens / softmax confidences for **every** expanded
+branch (sorted by ``branch_idx``), while the flat ``draft_token_*_per_position``
+columns remain the **winner** branch for backward compatibility.
+
 Target hierarchical rows may include ``inter_target_prefix_accept_len``: greedy
 acceptance count restricted to candidate indices before the last ``K`` draft tail
 tokens (``K = num_speculative_token``).
@@ -138,6 +143,10 @@ def prefill_metadata_rows(
                 num_draft=nd,
                 num_verification=nv,
                 cost_fields=cost_fields,
+                pivot_branches_draft_token_ids_per_position=None,
+                pivot_branches_draft_token_confidence_per_position=None,
+                pivot_branches_first_draft_token_ids=None,
+                pivot_branches_first_draft_token_confidence=None,
             )
         )
     return rows
@@ -168,6 +177,10 @@ def trace_to_row_indexed(
     cost_fields: bool,
     hv_fused_subround_idx: int | None = None,
     hv_fused_engine_step_id: int | None = None,
+    pivot_branches_draft_token_ids_per_position: list[list[int]] | None = None,
+    pivot_branches_draft_token_confidence_per_position: list[list[float]] | None = None,
+    pivot_branches_first_draft_token_ids: list[list[int]] | None = None,
+    pivot_branches_first_draft_token_confidence: list[list[float]] | None = None,
 ) -> dict[str, Any]:
     inter_r, tgt_r = profiler.inter_target_counts_for_seq(seq.seq_id)
     # Decode JSONL uses a decode-only counter so prefill engine steps do not create gaps in ids.
@@ -190,6 +203,14 @@ def trace_to_row_indexed(
             draft_token_confidence_per_position
         ),
         "cache_hit": cache_hit,
+        "pivot_branches_draft_token_ids_per_position": pivot_branches_draft_token_ids_per_position,
+        "pivot_branches_draft_token_confidence_per_position": (
+            pivot_branches_draft_token_confidence_per_position
+        ),
+        "pivot_branches_first_draft_token_ids": pivot_branches_first_draft_token_ids,
+        "pivot_branches_first_draft_token_confidence": (
+            pivot_branches_first_draft_token_confidence
+        ),
     }
     if trace is not None:
         i = batch_index

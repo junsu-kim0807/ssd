@@ -1,4 +1,14 @@
-"""Sync pivot speculator with draft-score collapse before target verify (B rows)."""
+"""Sync pivot speculator with draft-score collapse before target verify.
+
+Selection modes (set via ``pivot_precollapse_selection``):
+
+- ``score`` / ``slope``: target verify always sees ``B`` rows. Single per-parent
+  winner is committed as the parent's draft tail before target verify.
+- ``score_expansion``: target verify sees ``B + selected_count`` rows. For each
+  expanded parent, branch 0 (the vanilla draft continuation) AND the best alt
+  branch (by accumulated draft confidence) survive precollapse and feed
+  ``PivotExecutorFlat`` which performs the final target-authoritative collapse.
+"""
 
 from __future__ import annotations
 
@@ -8,7 +18,7 @@ from time import perf_counter
 
 import torch
 
-from ssd.engine.block_manager import BlockManager
+from ssd.engine.block_manager import BlockManager, CowForkPlan
 from ssd.engine.helpers.speculate_types import SpeculateResult, VerifyResult
 from ssd.engine.pivot_branch_planner import (
     PivotExpansionPlan,
@@ -55,9 +65,10 @@ class PivotPrecollapseSpeculatorSync(PivotRootSpeculatorSync):
             raise NotImplementedError(
                 "pivot_precollapse_score_temperature_aware=True is not wired yet"
             )
-        if precollapse_selection not in {"score", "slope"}:
+        if precollapse_selection not in {"score", "slope", "score_expansion"}:
             raise ValueError(
-                "pivot_precollapse_selection must be one of {'score', 'slope'}; "
+                "pivot_precollapse_selection must be one of "
+                "{'score', 'slope', 'score_expansion'}; "
                 f"got {precollapse_selection!r}"
             )
         if len(precollapse_slope_thresholds) != 3:
@@ -169,7 +180,13 @@ class PivotPrecollapseSpeculatorSync(PivotRootSpeculatorSync):
         seqs: list[Sequence],
         plan: PivotExpansionPlan,
     ) -> PivotExpansionPlan:
-        """Draft-only expansion clamp (no target free-block accounting)."""
+        """Expansion clamp.
+
+        - "score" / "slope" modes: draft-only (target / inter never forked).
+        - "score_expansion" mode: also reserves target (and intermediate, when
+          ``i_bm is not None``) capacity for exactly ONE alt row per kept parent
+          because that alt row will survive precollapse and feed target verify.
+        """
         bsz = len(seqs)
         if bsz == 0:
             return plan
@@ -183,7 +200,13 @@ class PivotPrecollapseSpeculatorSync(PivotRootSpeculatorSync):
                 expand_mask_host[i] = False
 
         d_bm: BlockManager = self.scheduler.draft_block_manager
+        t_bm: BlockManager = self.scheduler.block_manager
+        i_bm: BlockManager | None = self.scheduler.intermediate_block_manager
         free_d = len(d_bm.free_block_ids)
+        free_t = len(t_bm.free_block_ids)
+        free_i = len(i_bm.free_block_ids) if i_bm is not None else 10**12
+
+        score_expansion = self.precollapse_selection == "score_expansion"
 
         scores_host = host.criteria_scores
         assert scores_host is not None
@@ -202,9 +225,40 @@ class PivotPrecollapseSpeculatorSync(PivotRootSpeculatorSync):
             )
             extras = max(0, int(branch_counts_src[idx]) - 1)
             need_d = per_extra_d * extras
-            if need_d <= free_d:
+
+            # score_expansion: one alt row per kept parent will survive precollapse.
+            # Size at the committed frontier so the reservation matches the
+            # post-scoring target COW fork (clen + lookahead + 1).
+            # Note: ``seq.num_tokens + self.lookahead + 1`` would be off by one
+            # because recovery has already been appended, making num_tokens =
+            # committed_len + 1.
+            if score_expansion:
+                clen = seq.num_cached_tokens
+                target_extra_one_alt = self._private_blocks_needed(
+                    cached_tokens=clen,
+                    required_tokens=clen + self.lookahead + 1,
+                    block_size=seq.block_size,
+                )
+                inter_extra_one_alt = (
+                    self._private_blocks_needed(
+                        cached_tokens=seq.num_inter_cached_tokens,
+                        required_tokens=seq.num_inter_cached_tokens + self.lookahead + 1,
+                        block_size=seq.block_size,
+                    )
+                    if i_bm is not None
+                    else 0
+                )
+                need_t = target_extra_one_alt
+                need_i = inter_extra_one_alt
+            else:
+                need_t = 0
+                need_i = 0
+
+            if need_d <= free_d and need_t <= free_t and need_i <= free_i:
                 kept_host[idx] = True
                 free_d -= need_d
+                free_t -= need_t
+                free_i -= need_i
 
         clamped_host = self._apply_variable_row_cap_host(
             kept_host, scores_host, branch_counts_src
@@ -320,6 +374,86 @@ class PivotPrecollapseSpeculatorSync(PivotRootSpeculatorSync):
             )
         if loser_d_tails:
             d_bm._deallocate_n_blocks(loser_d_tails)
+
+    def _release_score_expansion_loser_draft_forks(
+        self,
+        parent_seqs: list[Sequence],
+        expanded_seqs: list[Sequence | None],
+        branch_states: list[BranchForkState | None],
+        retained_abs_rows: set[int],
+    ) -> None:
+        """Release draft forks for non-zero branches that were dropped by
+        score_expansion precollapse (i.e. not branch 0 and not the best alt).
+
+        Retained alt rows keep their draft fork intact because target verify
+        still consumes their draft KV; ``PivotExecutorFlat._commit_winner_and_release_forks``
+        will release or graft them after the target-authoritative collapse.
+        Branch 0 is parent-in-place and is never touched here.
+
+        Each loser contributes exactly +1 shared-prefix ref bump (from
+        ``make_cow_fork_block_table``) and 1 private-tail block list. We
+        decrement those refs and dealloc the private tails per parent.
+        """
+        d_bm: BlockManager = self.scheduler.draft_block_manager
+
+        parent_loser_count_d: dict[int, int] = defaultdict(int)
+        parent_d_shared: dict[int, int] = {}
+        loser_d_tails: list[int] = []
+
+        for row_idx, (seq, st) in enumerate(zip(expanded_seqs, branch_states)):
+            if seq is None or st is None or st.is_parent_inplace:
+                continue
+            if not st.draft_kv_owned:
+                continue
+            if row_idx in retained_abs_rows:
+                # Retained alt: keep its shared-prefix ref bump and private
+                # tail; PivotExecutorFlat releases/grafts after target collapse.
+                continue
+            pidx = st.parent_seq_idx
+            parent_loser_count_d[pidx] += 1
+            parent_d_shared[pidx] = st.draft_shared_prefix_blocks
+            loser_d_tails.extend(st.draft_private_tail_block_ids)
+
+        for pidx, count in parent_loser_count_d.items():
+            d_bm.release_shared_prefix_n(
+                parent_seqs[pidx].draft_block_table, parent_d_shared[pidx], count
+            )
+        if loser_d_tails:
+            d_bm._deallocate_n_blocks(loser_d_tails)
+
+    def _allocate_target_cow_for_alt(
+        self,
+        parent: Sequence,
+        clen: int,
+    ) -> tuple[CowForkPlan, CowForkPlan | None]:
+        """Allocate target (and intermediate, if present) COW forks for a
+        retained alt branch using the committed frontier.
+
+        Sizes are computed from ``clen`` (== ``num_cached_tokens`` at speculate
+        entry, before recovery append). ``required_total_tokens`` is
+        ``clen + lookahead + 1`` because target verify will consume ``K + 1``
+        query tokens (recovery + K draft tokens) per row, leaving the target KV
+        at exactly that depth. Using ``parent.num_tokens + lookahead`` here
+        would over-reserve because the in-place branch-0 setup and the K-1
+        tail-draft loop have already inflated ``parent.num_tokens`` to
+        ``clen + 1 + K``.
+        """
+        t_bm: BlockManager = self.scheduler.block_manager
+        i_bm: BlockManager | None = self.scheduler.intermediate_block_manager
+        required_total = clen + self.lookahead + 1
+        t_plan = t_bm.make_cow_fork_block_table(
+            parent.block_table,
+            cached_tokens=clen,
+            required_total_tokens=required_total,
+        )
+        i_plan: CowForkPlan | None = None
+        if i_bm is not None and self.intermediate_runner is not None:
+            i_plan = i_bm.make_cow_fork_block_table(
+                parent.inter_block_table,
+                cached_tokens=clen,
+                required_total_tokens=required_total,
+            )
+        return t_plan, i_plan
 
     def _branch_scores(
         self,
@@ -818,13 +952,11 @@ class PivotPrecollapseSpeculatorSync(PivotRootSpeculatorSync):
                 winners_branch[pidx] = int(branch_idx_list[best])
                 winning_score_per_parent[pidx] = best_s
 
-        winner_rows_t = torch.tensor(winner_rows, dtype=torch.long, device=self.device)
-        collapsed_speculations = speculations_exp.index_select(0, winner_rows_t)
-        collapsed_logits_q = torch.stack(
-            [logits_j.index_select(0, winner_rows_t) for logits_j in logits_q_rows],
-            dim=1,
-        )
-
+        # ------------------------------------------------------------------
+        # Compute per-parent winning roots / expanded-row indices for the
+        # speculator's PivotPrecollapseDecision (used by all selection modes;
+        # winners_branch may be re-derived by score_expansion downstream).
+        # ------------------------------------------------------------------
         winning_roots: list[int] = []
         winning_expanded_rows: list[int] = []
         for pidx in range(batch_size):
@@ -832,22 +964,263 @@ class PivotPrecollapseSpeculatorSync(PivotRootSpeculatorSync):
             winning_expanded_rows.append(wr)
             winning_roots.append(int(root_token_list[wr]))
 
-        for pidx, parent in enumerate(seqs):
-            clen = committed_len_per_parent[pidx]
-            win_row = winner_rows[pidx]
-            suffix = list(host_spec_rows[win_row])
-            win_seq = expanded_seqs[win_row]
-            assert win_seq is not None
-            self._replace_parent_spec_tail(parent, clen, suffix)
-            parent.num_draft_cached_tokens = win_seq.num_draft_cached_tokens
-            parent.num_cached_tokens = clen
+        score_expansion = self.precollapse_selection == "score_expansion"
 
-        self._commit_precollapse_draft_winner_and_release(
-            seqs,
-            expanded_seqs,
-            branch_states,
-            winners_branch,
-        )
+        target_cow_copy_s = 0.0
+        if not score_expansion:
+            # ----- score / slope: collapse to B rows; graft single winner -----
+            winner_rows_t = torch.tensor(
+                winner_rows, dtype=torch.long, device=self.device
+            )
+            out_speculations = speculations_exp.index_select(0, winner_rows_t)
+            out_logits_q = torch.stack(
+                [logits_j.index_select(0, winner_rows_t) for logits_j in logits_q_rows],
+                dim=1,
+            )
+
+            for pidx, parent in enumerate(seqs):
+                clen = committed_len_per_parent[pidx]
+                win_row = winner_rows[pidx]
+                suffix = list(host_spec_rows[win_row])
+                win_seq = expanded_seqs[win_row]
+                assert win_seq is not None
+                self._replace_parent_spec_tail(parent, clen, suffix)
+                parent.num_draft_cached_tokens = win_seq.num_draft_cached_tokens
+                parent.num_cached_tokens = clen
+
+            self._commit_precollapse_draft_winner_and_release(
+                seqs,
+                expanded_seqs,
+                branch_states,
+                winners_branch,
+            )
+
+            retained_host = plan.host
+            retained_seqs_for_bundle: list[Sequence] | None = None
+            retained_states_for_bundle: list[BranchForkState] | None = None
+            after_collapse_bsz = batch_size
+            target_verify_bsz = batch_size
+        else:
+            # ----- score_expansion: retain branch 0 + best alt per parent -----
+            per_parent_rows_all: list[list[int]] = [[] for _ in range(batch_size)]
+            for row_idx, pidx in enumerate(parent_idx_list):
+                per_parent_rows_all[pidx].append(row_idx)
+
+            retained_abs_rows: list[int] = []
+            parent_index_retained: list[int] = []
+            branch_index_retained: list[int] = []
+            branch_counts_retained: list[int] = []
+            root_token_retained: list[int] = []
+            root_prob_retained: list[float] = []
+            alt_winner_row_per_parent: list[int | None] = [None] * batch_size
+
+            for pidx in range(batch_size):
+                rows_p = per_parent_rows_all[pidx]
+                # Branch 0 is always added first per-parent. PivotExecutorFlat
+                # initializes ``best_row = rows[0]`` and only switches winner
+                # on strictly-longer accept_len; putting alt at index 0 would
+                # silently invert "branch 0 unless alt strictly better" semantics.
+                branch0_row = next(
+                    r for r in rows_p if int(branch_idx_list[r]) == 0
+                )
+                retained_abs_rows.append(branch0_row)
+                parent_index_retained.append(pidx)
+                branch_index_retained.append(0)
+                root_token_retained.append(int(root_token_list[branch0_row]))
+                root_prob_retained.append(float(root_prob_list[branch0_row]))
+
+                alt_rows = [r for r in rows_p if int(branch_idx_list[r]) != 0]
+                if alt_rows:
+                    best = alt_rows[0]
+                    best_s = branch_scores_list[best]
+                    for r in alt_rows[1:]:
+                        s = branch_scores_list[r]
+                        if s > best_s:
+                            best = r
+                            best_s = s
+                    retained_abs_rows.append(best)
+                    parent_index_retained.append(pidx)
+                    # Keep the original sparse alt branch index (e.g. could be 3
+                    # under topk=5). PivotExecutorFlat looks winners up via
+                    # branch_index_per_parent equality, so sparse is fine.
+                    branch_index_retained.append(int(branch_idx_list[best]))
+                    root_token_retained.append(int(root_token_list[best]))
+                    root_prob_retained.append(float(root_prob_list[best]))
+                    branch_counts_retained.append(2)
+                    alt_winner_row_per_parent[pidx] = best
+                    # Update precollapse decision to reflect the actual retained
+                    # alt (not a no-alt fallback to branch 0 as the legacy
+                    # alt-preferred winner).
+                    winners_branch[pidx] = int(branch_idx_list[best])
+                    winner_rows[pidx] = best
+                    winning_roots[pidx] = int(root_token_list[best])
+                    winning_expanded_rows[pidx] = best
+                    winning_score_per_parent[pidx] = best_s
+                else:
+                    branch_counts_retained.append(1)
+                    winners_branch[pidx] = 0
+                    winner_rows[pidx] = branch0_row
+                    winning_roots[pidx] = int(root_token_list[branch0_row])
+                    winning_expanded_rows[pidx] = branch0_row
+
+            selected_count = sum(1 for c in branch_counts_retained if c > 1)
+            b_score = batch_size + selected_count
+            assert b_score == len(retained_abs_rows), (b_score, len(retained_abs_rows))
+
+            # Branch-0-first invariant assertion.
+            by_parent_rows_retained: list[list[int]] = [[] for _ in range(batch_size)]
+            for r, pidx in enumerate(parent_index_retained):
+                by_parent_rows_retained[pidx].append(r)
+            for pidx, rows_p in enumerate(by_parent_rows_retained):
+                assert rows_p, pidx
+                assert int(branch_index_retained[rows_p[0]]) == 0, (
+                    pidx,
+                    rows_p,
+                    branch_index_retained,
+                )
+
+            # Slice speculations / logits to retained rows.
+            retained_rows_t = torch.tensor(
+                retained_abs_rows, dtype=torch.long, device=self.device
+            )
+            out_speculations = speculations_exp.index_select(0, retained_rows_t)
+            out_logits_q = torch.stack(
+                [
+                    logits_j.index_select(0, retained_rows_t)
+                    for logits_j in logits_q_rows
+                ],
+                dim=1,
+            )
+
+            # Allocate target / inter COW for each retained alt row.
+            t_bm: BlockManager = self.scheduler.block_manager
+            target_copy_src_all: list[int] = []
+            target_copy_dst_all: list[int] = []
+            target_copy_valid_all: list[int] = []
+            inter_copy_src_all: list[int] = []
+            inter_copy_dst_all: list[int] = []
+            inter_copy_valid_all: list[int] = []
+
+            for pidx in range(batch_size):
+                alt_row = alt_winner_row_per_parent[pidx]
+                if alt_row is None:
+                    continue
+                parent = seqs[pidx]
+                alt_seq = expanded_seqs[alt_row]
+                alt_state = branch_states[alt_row]
+                assert alt_seq is not None and alt_state is not None
+                clen = committed_len_per_parent[pidx]
+                t_plan, i_plan = self._allocate_target_cow_for_alt(parent, clen)
+
+                # Patch alt sequence's target / inter block tables and patch
+                # the BranchForkState to advertise target ownership.
+                alt_seq.block_table = t_plan.fork_block_table
+                if i_plan is not None:
+                    alt_seq.inter_block_table = i_plan.fork_block_table
+
+                if t_plan.copy_src_block_ids:
+                    target_copy_src_all.extend(t_plan.copy_src_block_ids)
+                    target_copy_dst_all.extend(t_plan.copy_dst_block_ids)
+                    target_copy_valid_all.extend(t_plan.copy_valid_tokens)
+                    num_target_cow_copy_blocks += len(t_plan.copy_src_block_ids)
+                if i_plan is not None and i_plan.copy_src_block_ids:
+                    inter_copy_src_all.extend(i_plan.copy_src_block_ids)
+                    inter_copy_dst_all.extend(i_plan.copy_dst_block_ids)
+                    inter_copy_valid_all.extend(i_plan.copy_valid_tokens)
+                    num_inter_cow_copy_blocks += len(i_plan.copy_src_block_ids)
+
+                alt_state.target_shared_prefix_blocks = t_plan.shared_prefix_blocks
+                alt_state.target_private_tail_block_ids = t_plan.private_tail_block_ids
+                alt_state.target_kv_owned = True
+                if i_plan is not None:
+                    alt_state.inter_shared_prefix_blocks = i_plan.shared_prefix_blocks
+                    alt_state.inter_private_tail_block_ids = i_plan.private_tail_block_ids
+                    alt_state.inter_kv_owned = True
+
+            self._cuda_sync_for_pivot_cost()
+            t_target_copy0 = perf_counter()
+            if target_copy_src_all:
+                self.target_model_runner.call(
+                    "copy_kv_blocks",
+                    target_copy_src_all,
+                    target_copy_dst_all,
+                    target_copy_valid_all,
+                    "target",
+                )
+            if (
+                inter_copy_src_all
+                and self.intermediate_runner is not None
+            ):
+                self.intermediate_runner.call(
+                    "copy_kv_blocks",
+                    inter_copy_src_all,
+                    inter_copy_dst_all,
+                    inter_copy_valid_all,
+                    "intermediate",
+                )
+            self._cuda_sync_for_pivot_cost()
+            target_cow_copy_s = perf_counter() - t_target_copy0
+
+            # Release dropped non-zero non-alt-winner draft forks. Retained
+            # alt's draft fork is left intact; PivotExecutorFlat will release
+            # or graft it after target collapse. Branch 0 is parent-in-place.
+            self._release_score_expansion_loser_draft_forks(
+                seqs,
+                expanded_seqs,
+                branch_states,
+                set(retained_abs_rows),
+            )
+
+            # Build filtered host plan that only contains retained rows.
+            host_src = plan.host
+            assert host_src is not None
+            criteria_scores_h = (
+                list(host_src.criteria_scores)
+                if host_src.criteria_scores is not None
+                else None
+            )
+            top1_probs_h = (
+                list(host_src.top1_probs)
+                if host_src.top1_probs is not None
+                else None
+            )
+            residual_scores_h = (
+                list(host_src.residual_scores)
+                if host_src.residual_scores is not None
+                else None
+            )
+            slope_h = (
+                list(host_src.dynamic_expansion_slope_scores)
+                if host_src.dynamic_expansion_slope_scores is not None
+                else None
+            )
+            expand_mask_h = [c > 1 for c in branch_counts_retained]
+            retained_host = PivotHostPlan(
+                parent_index_per_branch=list(parent_index_retained),
+                branch_index_per_parent=list(branch_index_retained),
+                root_token_ids=list(root_token_retained),
+                branch_counts=list(branch_counts_retained),
+                expand_mask=expand_mask_h,
+                criteria_scores=criteria_scores_h,
+                root_token_probs=list(root_prob_retained) if host_src.root_token_probs is not None else None,
+                top1_probs=top1_probs_h,
+                residual_scores=residual_scores_h,
+                dynamic_expansion_slope_scores=slope_h,
+            )
+
+            # Retained Sequence and BranchForkState lists (one entry per
+            # retained row, in retained order). PivotExecutorFlat raises if
+            # expanded_seqs is None — score_expansion always populates these,
+            # including branch-0-only rows for no-expansion parents.
+            retained_seqs_for_bundle = [expanded_seqs[r] for r in retained_abs_rows]
+            retained_states_for_bundle = [branch_states[r] for r in retained_abs_rows]
+            for s in retained_seqs_for_bundle:
+                assert s is not None
+            for st in retained_states_for_bundle:
+                assert st is not None
+
+            after_collapse_bsz = b_score
+            target_verify_bsz = b_score
 
         decision = PivotPrecollapseDecision(
             winning_branch_idx_per_parent=list(winners_branch),
@@ -874,29 +1247,37 @@ class PivotPrecollapseSpeculatorSync(PivotRootSpeculatorSync):
             ),
         )
 
-        if dbg:
+        if dbg and not score_expansion:
             for pidx, parent in enumerate(seqs):
                 clen = committed_len_per_parent[pidx]
                 assert parent.num_cached_tokens == clen
                 assert parent.num_draft_cached_tokens == parent.num_tokens
                 tail = list(parent.token_ids[clen:])
-                cand = [int(x) for x in collapsed_speculations[pidx].detach().cpu().tolist()]
+                cand = [int(x) for x in out_speculations[pidx].detach().cpu().tolist()]
                 assert tail == cand, (tail, cand)
 
-        branch_bundle = PivotBranchBundle(
-            parent_batch_size=batch_size,
-            host_plan=plan.host,
-            expanded_seqs=None,
-            branch_states=None,
-            precollapse_decision=decision,
-        )
+        if score_expansion:
+            branch_bundle = PivotBranchBundle(
+                parent_batch_size=batch_size,
+                host_plan=retained_host,
+                expanded_seqs=retained_seqs_for_bundle,
+                branch_states=retained_states_for_bundle,
+                precollapse_decision=decision,
+            )
+        else:
+            branch_bundle = PivotBranchBundle(
+                parent_batch_size=batch_size,
+                host_plan=plan.host,
+                expanded_seqs=None,
+                branch_states=None,
+                precollapse_decision=decision,
+            )
 
         t_final_pack1 = perf_counter()
         branch_construct_s = t_branch_construct1 - t_branch_construct0
-        target_cow_copy_s = 0.0
         draft_cow_copy_s = t_draft_copy1 - t_draft_copy0
         inter_cow_copy_s = 0.0
-        cow_copy_s = draft_cow_copy_s
+        cow_copy_s = draft_cow_copy_s + target_cow_copy_s
         draft_cow_copy_mode = os.environ.get(
             "SSD_PIVOT_DRAFT_COW_COPY_MODE", "bucketed_partial"
         )
@@ -914,12 +1295,12 @@ class PivotPrecollapseSpeculatorSync(PivotRootSpeculatorSync):
                 "expanded_batch_size": int(b_exp),
                 "pivot_before_expansion_batch_size": int(batch_size),
                 "pivot_after_expansion_batch_size": int(b_exp),
-                "pivot_after_collapse_batch_size": int(batch_size),
-                "pivot_target_verify_batch_size": int(batch_size),
+                "pivot_after_collapse_batch_size": int(after_collapse_bsz),
+                "pivot_target_verify_batch_size": int(target_verify_bsz),
                 "expansion_ratio": float(b_exp / batch_size) if batch_size > 0 else 0.0,
                 "num_nonzero_branches": int(num_nonzero_branches),
-                "num_target_cow_copy_blocks": 0,
-                "pivot_num_target_cow_copy_blocks": 0,
+                "num_target_cow_copy_blocks": int(num_target_cow_copy_blocks),
+                "pivot_num_target_cow_copy_blocks": int(num_target_cow_copy_blocks),
                 "num_draft_cow_copy_blocks": int(num_draft_cow_copy_blocks),
                 "num_inter_cow_copy_blocks": int(num_inter_cow_copy_blocks),
                 "pivot_plan_build_s": float(t_plan1 - t_plan0),
@@ -947,8 +1328,8 @@ class PivotPrecollapseSpeculatorSync(PivotRootSpeculatorSync):
         )
 
         return SpeculateResult(
-            speculations=collapsed_speculations,
-            logits_q=collapsed_logits_q,
+            speculations=out_speculations,
+            logits_q=out_logits_q,
             cache_hits=None,
             branch_bundle=branch_bundle,
         )

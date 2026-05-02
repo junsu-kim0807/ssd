@@ -179,17 +179,30 @@ def build_spec_components(
             precollapse_selection=config.pivot_precollapse_selection,
             precollapse_slope_thresholds=tuple(config.pivot_precollapse_slope_thresholds),
         )
-        verifier = PivotPrecollapseVerifier(
-            lookahead=config.speculate_k,
-            device=config.device,
-            target_model_runner=model_runner,
-            sampler_x=config.sampler_x,
-            async_fan_out=config.async_fan_out,
-            jit_speculate=config.jit_speculate,
-            tokenizer=tokenizer,
-            metrics=metrics,
-            enable_profile_trace=enable_profile_trace,
-        )
+        if config.pivot_precollapse_selection == "score_expansion":
+            # score_expansion target verifies B + selected_count rows (branch 0
+            # plus best alt per expanded parent), so reuse the flat pivot
+            # executor which collapses on target acceptance length.
+            verifier = PivotExecutorFlat(
+                lookahead=config.speculate_k,
+                device=config.device,
+                target_model_runner=model_runner,
+                scheduler=scheduler,
+                metrics=metrics,
+                enable_profile_trace=enable_profile_trace,
+            )
+        else:
+            verifier = PivotPrecollapseVerifier(
+                lookahead=config.speculate_k,
+                device=config.device,
+                target_model_runner=model_runner,
+                sampler_x=config.sampler_x,
+                async_fan_out=config.async_fan_out,
+                jit_speculate=config.jit_speculate,
+                tokenizer=tokenizer,
+                metrics=metrics,
+                enable_profile_trace=enable_profile_trace,
+            )
         return SpecDecodeComponents(speculator=speculator, verifier=verifier)
 
     if config.spec_policy == "pivot_tree_scratch":

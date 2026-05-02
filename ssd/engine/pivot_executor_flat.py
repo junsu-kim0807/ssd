@@ -314,7 +314,16 @@ class PivotExecutorFlat(VerifierBase):
                         per_parent_top1_prob[pidx] = float(bundle.top1_probs[pidx])
                     else:
                         per_parent_top1_prob[pidx] = float(bundle.root_token_probs[rows[0]])
-                    winner_row = rows[winners[pidx]]
+                    # Look winner up by branch_index_per_parent equality. Under
+                    # ``score_expansion`` retained branch indices are sparse
+                    # (e.g. {0, 3} when the alt was top-3), so the legacy
+                    # ``rows[winners[pidx]]`` indexing — which assumes
+                    # row-position == branch_idx — would address the wrong row.
+                    winner_b = int(winners[pidx])
+                    winner_row = next(
+                        (r for r in rows if int(bundle.branch_index_per_parent[r]) == winner_b),
+                        rows[0],
+                    )
                     per_parent_selected_root[pidx] = int(bundle.root_token_ids[winner_row])
             profile_trace = VerifyProfileTrace(
                 verification_models=["target"] * parent_bsz,
@@ -362,4 +371,10 @@ class PivotExecutorFlat(VerifierBase):
             winning_branch_row_idx_per_parent=winner_rows,
             pivot_before_expansion_batch_size=int(parent_bsz),
             pivot_after_expansion_batch_size=int(len(bundle.parent_index_per_branch)),
+            # Target verify saw ``len(bundle.parent_index_per_branch)`` rows;
+            # final commit is one row per parent. Under ``score_expansion``
+            # these two values differ (B vs B + selected_count); under regular
+            # ``pivot`` flat collapse they equal the expanded shape too.
+            pivot_after_collapse_batch_size=int(parent_bsz),
+            pivot_target_verify_batch_size=int(len(bundle.parent_index_per_branch)),
         )

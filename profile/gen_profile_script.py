@@ -13,8 +13,9 @@ intermediate verifies plus one target verify. If ``--hv-rounds`` is omitted, gen
 
 ``--batch`` and ``--length`` are independent sweep dimensions (batch sizes vs speculative ``k``).
 
-With ``--batch`` or ``--length``, method ``pivot`` also sweeps ``--pivot_topk`` and
-``--pivot_expansion_pct`` over ``{2,3,5} × {0.1,0.2,0.5}`` (``pivot_legacy`` uses CLI defaults only).
+With ``--batch`` or ``--length``, methods ``pivot`` and ``pivot_precollapse_score_expansion``
+(and plain ``pivot_precollapse``) also sweep ``--pivot_topk`` and ``--pivot_expansion_pct`` over
+``{2,3,5} × {0.1,0.2,0.5}`` (``pivot_legacy`` uses CLI defaults only).
 
 When **either** ``--batch`` / ``--length`` / ``--temp`` is set, generated jobs cover the profile dataset set
 (alpaca, humaneval, gsm8k, math500, codeelo, livecodebench): profiler paths ``.../b<b>/k.../t0/r<R>/<dataset>/`` for hierarchical.
@@ -32,7 +33,8 @@ Sweep flags (optional, Cartesian product with other dimensions):
   --temp    → temperatures 0, 0.3, 0.7, 1.0
 
 Default ``--methods`` is ``sync,eagle3,pivot_static10,pivot_precollapse_dyn10,pivot_precollapse_de10``.
-Other ids (``ar``, ``async``, ``hierarchical``, ``pivot``, ``pivot_precollapse``, ``pivot_legacy``, …)
+Other ids (``ar``, ``async``, ``hierarchical``, ``pivot``, ``pivot_precollapse``,
+``pivot_precollapse_score_expansion``, ``pivot_legacy``, …)
 remain available via ``--methods``.
 
 Adding a method
@@ -130,6 +132,7 @@ DEFAULT_GPU_BY_FAMILY_METHOD: dict[tuple[str, str], int] = {
     ("llama", "pivot_static10"): 4,
     ("llama", "pivot_precollapse_dyn10"): 4,
     ("llama", "pivot_precollapse_de10"): 4,
+    ("llama", "pivot_precollapse_score_expansion"): 4,
     ("llama", "pivot_legacy"): 4,
     ("qwen", "ar"): 2,
     ("qwen", "sync"): 2,
@@ -141,6 +144,7 @@ DEFAULT_GPU_BY_FAMILY_METHOD: dict[tuple[str, str], int] = {
     ("qwen", "pivot_static10"): 2,
     ("qwen", "pivot_precollapse_dyn10"): 2,
     ("qwen", "pivot_precollapse_de10"): 2,
+    ("qwen", "pivot_precollapse_score_expansion"): 2,
     ("qwen", "pivot_legacy"): 3,
     ("gemma", "ar"): 2,
     ("gemma", "sync"): 2,
@@ -152,6 +156,7 @@ DEFAULT_GPU_BY_FAMILY_METHOD: dict[tuple[str, str], int] = {
     ("gemma", "pivot_static10"): 2,
     ("gemma", "pivot_precollapse_dyn10"): 2,
     ("gemma", "pivot_precollapse_de10"): 2,
+    ("gemma", "pivot_precollapse_score_expansion"): 2,
     ("gemma", "pivot_legacy"): 3,
     ("vicuna13b_160m", "ar"): 2,
     ("vicuna13b_160m", "sync"): 2,
@@ -163,6 +168,7 @@ DEFAULT_GPU_BY_FAMILY_METHOD: dict[tuple[str, str], int] = {
     ("vicuna13b_160m", "pivot_static10"): 2,
     ("vicuna13b_160m", "pivot_precollapse_dyn10"): 2,
     ("vicuna13b_160m", "pivot_precollapse_de10"): 2,
+    ("vicuna13b_160m", "pivot_precollapse_score_expansion"): 2,
     ("vicuna13b_160m", "pivot_legacy"): 3,
 }
 
@@ -216,6 +222,7 @@ def uses_pivot_profiler_layout(method_id: str) -> bool:
         "pivot_precollapse",
         "pivot_precollapse_dyn10",
         "pivot_precollapse_de10",
+        "pivot_precollapse_score_expansion",
         "pivot_legacy",
     }
 
@@ -224,7 +231,11 @@ def profiler_method_id_for_layout(method_id: str) -> str:
     """Profiler directory layout uses canonical pivot / pivot_precollapse segment names."""
     if method_id in {"pivot_static10"}:
         return "pivot"
-    if method_id in {"pivot_precollapse_dyn10", "pivot_precollapse_de10"}:
+    if method_id in {
+        "pivot_precollapse_dyn10",
+        "pivot_precollapse_de10",
+        "pivot_precollapse_score_expansion",
+    }:
         return "pivot_precollapse"
     return method_id
 
@@ -233,7 +244,12 @@ def job_layout_method_folder(spec_id: str) -> str:
     """Human-readable folder segment under profile_mode/<family>/ (matches profiler roots)."""
     if spec_id in {"pivot", "pivot_static10"}:
         return "pivot"
-    if spec_id in {"pivot_precollapse", "pivot_precollapse_dyn10", "pivot_precollapse_de10"}:
+    if spec_id in {
+        "pivot_precollapse",
+        "pivot_precollapse_dyn10",
+        "pivot_precollapse_de10",
+        "pivot_precollapse_score_expansion",
+    }:
         return "pivot_precollapse"
     return spec_id
 
@@ -255,7 +271,7 @@ def resolve_pivot_policy(spec_id: str, args: argparse.Namespace) -> str:
         return "dynamic_expansion"
     if spec_id == "pivot_precollapse_dyn10":
         return "dynamic"
-    if args.static and spec_id in {"pivot", "pivot_precollapse"}:
+    if args.static and spec_id in {"pivot", "pivot_precollapse", "pivot_precollapse_score_expansion"}:
         return PIVOT_STATIC_POLICY
     return str(args.pivot_expansion_policy)
 
@@ -281,7 +297,7 @@ def pivot_profiler_dynamic_expansion_extras(
 def uses_pivot_batch_length_topk_pct_sweep(method_id: str) -> bool:
     if method_id in {"pivot_static10", "pivot_precollapse_dyn10", "pivot_precollapse_de10"}:
         return False
-    return method_id in {"pivot", "pivot_precollapse"}
+    return method_id in {"pivot", "pivot_precollapse", "pivot_precollapse_score_expansion"}
 
 
 def iter_pivot_topk_pct_for_profile_sweep(
@@ -298,7 +314,7 @@ def iter_pivot_topk_pct_for_profile_sweep(
         return ((10, float(cli_pct)),)
     if method_id == "pivot_precollapse_de10":
         return ((10, float(cli_pct)),)
-    if static_mode and method_id in {"pivot", "pivot_precollapse"}:
+    if static_mode and method_id in {"pivot", "pivot_precollapse", "pivot_precollapse_score_expansion"}:
         return tuple((int(tk), float(PIVOT_STATIC_EXPANSION_PCT)) for tk in PIVOT_STATIC_TOPK_SWEEP)
     if multi_dataset_sweep and uses_pivot_batch_length_topk_pct_sweep(method_id):
         return tuple(
@@ -358,6 +374,19 @@ def _args_pivot_precollapse(k: int, _f: int) -> list[str]:
         str(k),
         "--spec_policy",
         "pivot_precollapse",
+    ]
+
+
+def _args_pivot_precollapse_score_expansion(k: int, _f: int) -> list[str]:
+    """pivot_precollapse with ``--pivot_precollapse_selection score_expansion`` (flat target collapse)."""
+    return [
+        "--spec",
+        "--k",
+        str(k),
+        "--spec_policy",
+        "pivot_precollapse",
+        "--pivot_precollapse_selection",
+        "score_expansion",
     ]
 
 
@@ -462,6 +491,13 @@ METHOD_REGISTRY: dict[str, BenchMethodSpec] = {
         uses_spec_k=True,
         default_k=5,
         extra_bench_args=_args_pivot_precollapse_de10,
+    ),
+    "pivot_precollapse_score_expansion": BenchMethodSpec(
+        id="pivot_precollapse_score_expansion",
+        description="pivot_precollapse + score_expansion (branch0 + best alt → PivotExecutorFlat)",
+        uses_spec_k=True,
+        default_k=5,
+        extra_bench_args=_args_pivot_precollapse_score_expansion,
     ),
     "pivot_legacy": BenchMethodSpec(
         id="pivot_legacy",
@@ -1002,7 +1038,7 @@ def main() -> None:
         type=str,
         default="eagle3,pivot_static10,pivot_precollapse_dyn10,pivot_precollapse_de10",
         help="Comma-separated method ids: ar | sync | eagle3 | async | hierarchical | pivot | pivot_static10 | "
-        "pivot_precollapse | pivot_precollapse_dyn10 | pivot_precollapse_de10 | pivot_legacy | … "
+        "pivot_precollapse | pivot_precollapse_dyn10 | pivot_precollapse_de10 | pivot_precollapse_score_expansion | pivot_legacy | … "
         "(defaults cover sync spec, sync EAGLE3 (default spec_policy), pivot static top10, pivot_precollapse dynamic top10, "
         "pivot_precollapse dynamic_expansion top10).",
     )
@@ -1196,7 +1232,12 @@ def main() -> None:
             run_length_chunks.append(argv_cmd)
         if args.temp:
             run_temp_chunks.append(argv_cmd)
-        if args.static and method_id in {"pivot", "pivot_precollapse", "pivot_static10"}:
+        if args.static and method_id in {
+            "pivot",
+            "pivot_precollapse",
+            "pivot_precollapse_score_expansion",
+            "pivot_static10",
+        }:
             run_pivot_static_chunks.append(argv_cmd)
 
     for fam, mid, k_val, b_val, temp_val, spec in iter_job_configs(
