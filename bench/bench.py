@@ -168,7 +168,8 @@ def parse_arguments():
         default="",
         metavar="T0,T1,...",
         help="dynamic_expansion only: comma-separated strictly increasing slope thresholds "
-        "(len in [1, pivot_topk-2]). Example: -0.06,-0.05",
+        "(len in [1, pivot_topk-2]). Negative values must use equals form so argparse does not "
+        "treat them as flags, e.g. --pivot_expansion_slope_thresholds=-0.06,-0.05,-0.04",
     )
     parser.add_argument(
         "--pivot_expansion_slope_branch_counts",

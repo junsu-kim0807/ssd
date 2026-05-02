@@ -6,7 +6,6 @@ import os
 from collections import defaultdict
 from time import perf_counter
 
-import numpy as np
 import torch
 
 from ssd.engine.block_manager import BlockManager
@@ -561,10 +560,27 @@ class PivotPrecollapseSpeculatorSync(PivotRootSpeculatorSync):
         t_branch0_setup1 = perf_counter()
 
         t_initial_pack0 = perf_counter()
-        spec_np = np.empty((b_exp, self.lookahead + 1), dtype=np.int64)
+        speculations_exp = torch.empty(
+            (b_exp, self.lookahead + 1), dtype=torch.long, device=self.device
+        )
+        host_spec_rows: list[list[int]] = []
         if b_exp > 0:
-            spec_np[:, 0] = [recovery_tokens[parent_idx_list[i]] for i in range(b_exp)]
-            spec_np[:, 1] = root_token_list
+            recovery_t = torch.tensor(
+                recovery_tokens, dtype=torch.long, device=self.device
+            )
+            pib_t = plan.parent_index_per_branch.to(
+                device=self.device, dtype=torch.long
+            )
+            speculations_exp[:, 0] = recovery_t.index_select(0, pib_t)
+            speculations_exp[:, 1] = plan.root_token_ids.to(
+                device=self.device, dtype=torch.long
+            )
+            tail_pad = self.lookahead - 1
+            host_spec_rows = [
+                [recovery_tokens[parent_idx_list[i]], int(root_token_list[i])]
+                + [0] * tail_pad
+                for i in range(b_exp)
+            ]
 
         logits_q_rows = [first_logits_q[plan.parent_index_per_branch]]
         t_initial_pack1 = perf_counter()
@@ -597,11 +613,19 @@ class PivotPrecollapseSpeculatorSync(PivotRootSpeculatorSync):
                     if s is not None:
                         s.num_draft_cached_tokens += 1
                 logits_q_rows.append(logits_k)
+                token_ids_k_t = (
+                    token_ids_k
+                    if isinstance(token_ids_k, torch.Tensor)
+                    else torch.tensor(
+                        token_ids_k, dtype=torch.long, device=self.device
+                    )
+                )
+                speculations_exp[:, _k + 1] = token_ids_k_t
                 for row_idx, (seq, tok) in enumerate(zip(expanded_seqs, token_ids_k)):
                     if seq is None:
                         continue
                     seq.append_token(tok)
-                    spec_np[row_idx, _k + 1] = tok
+                    host_spec_rows[row_idx][_k + 1] = int(tok)
         t_tail_draft1 = perf_counter()
 
         t_extra_draft0 = perf_counter()
@@ -618,20 +642,18 @@ class PivotPrecollapseSpeculatorSync(PivotRootSpeculatorSync):
         t_extra_draft1 = perf_counter()
 
         t_final_pack0 = perf_counter()
-        logits_q = torch.stack(logits_q_rows, dim=1)
-        speculations = torch.from_numpy(spec_np).to(self.device, non_blocking=True)
 
         cfg = getattr(self.scheduler, "config", None)
         dbg = cfg is not None and bool(getattr(cfg, "debug_mode", False))
         if dbg:
-            assert speculations.shape == (b_exp, self.lookahead + 1)
-            assert logits_q.shape[0] == b_exp
-            assert logits_q.shape[1] == self.lookahead
-            cand_dbg = speculations[:, 1 : self.lookahead + 1]
-            assert cand_dbg.shape == (b_exp, self.lookahead)
-            assert torch.equal(speculations[:, 1], plan.root_token_ids)
-            pib_t = plan.parent_index_per_branch.to(first_logits_q.device)
-            assert torch.all(logits_q[:, 0, :] == first_logits_q[pib_t])
+            assert speculations_exp.shape == (b_exp, self.lookahead + 1)
+            assert len(logits_q_rows) == self.lookahead
+            assert torch.equal(
+                speculations_exp[:, 1],
+                plan.root_token_ids.to(speculations_exp.device, dtype=torch.long),
+            )
+            pib_t_dbg = plan.parent_index_per_branch.to(first_logits_q.device)
+            assert torch.all(logits_q_rows[0] == first_logits_q[pib_t_dbg])
 
         no_expansion = plan.expanded_batch_size == plan.parent_batch_size or all(
             c == 1 for c in plan.branch_counts
@@ -647,7 +669,21 @@ class PivotPrecollapseSpeculatorSync(PivotRootSpeculatorSync):
             branch_scores_list = [0.0] * b_exp
             winning_score_per_parent = [0.0] * batch_size
         else:
-            scores_t = self._branch_scores(speculations, logits_q)
+            scores_t = torch.zeros(b_exp, dtype=torch.float32, device=self.device)
+            if self.score_method == "logit_sum":
+                for j, logits_j in enumerate(logits_q_rows):
+                    tok_j = speculations_exp[:, j + 1]
+                    scores_t = scores_t + logits_j.gather(
+                        1, tok_j.unsqueeze(1)
+                    ).squeeze(1).float()
+            else:  # logprob_sum
+                for j, logits_j in enumerate(logits_q_rows):
+                    v = logits_j.float()
+                    tok_j = speculations_exp[:, j + 1]
+                    scores_t = scores_t + (
+                        v.gather(1, tok_j.unsqueeze(1)).squeeze(1)
+                        - torch.logsumexp(v, dim=-1)
+                    )
             branch_scores_list = [float(x) for x in scores_t.detach().cpu().tolist()]
             per_parent_rows: list[list[int]] = [[] for _ in range(batch_size)]
             for row_idx, pidx in enumerate(parent_idx_list):
@@ -658,9 +694,9 @@ class PivotPrecollapseSpeculatorSync(PivotRootSpeculatorSync):
             for pidx in range(batch_size):
                 rows = per_parent_rows[pidx]
                 best = rows[0]
-                best_s = float(scores_t[best].item())
+                best_s = branch_scores_list[best]
                 for r in rows[1:]:
-                    s = float(scores_t[r].item())
+                    s = branch_scores_list[r]
                     if s > best_s:
                         best = r
                         best_s = s
@@ -669,8 +705,11 @@ class PivotPrecollapseSpeculatorSync(PivotRootSpeculatorSync):
                 winning_score_per_parent[pidx] = best_s
 
         winner_rows_t = torch.tensor(winner_rows, dtype=torch.long, device=self.device)
-        collapsed_speculations = speculations.index_select(0, winner_rows_t)
-        collapsed_logits_q = logits_q.index_select(0, winner_rows_t)
+        collapsed_speculations = speculations_exp.index_select(0, winner_rows_t)
+        collapsed_logits_q = torch.stack(
+            [logits_j.index_select(0, winner_rows_t) for logits_j in logits_q_rows],
+            dim=1,
+        )
 
         winning_roots: list[int] = []
         winning_expanded_rows: list[int] = []
@@ -681,8 +720,8 @@ class PivotPrecollapseSpeculatorSync(PivotRootSpeculatorSync):
 
         for pidx, parent in enumerate(seqs):
             clen = committed_len_per_parent[pidx]
-            suffix = [int(x) for x in collapsed_speculations[pidx].tolist()]
             win_row = winner_rows[pidx]
+            suffix = list(host_spec_rows[win_row])
             win_seq = expanded_seqs[win_row]
             assert win_seq is not None
             self._replace_parent_spec_tail(parent, clen, suffix)

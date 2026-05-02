@@ -669,7 +669,10 @@ def build_bench_argv(
         if pivot_expansion_criteria is not None:
             argv.extend(["--pivot_expansion_criteria", str(pivot_expansion_criteria)])
         if pivot_expansion_slope_thresholds is not None and str(pivot_expansion_slope_thresholds).strip():
-            argv.extend(["--pivot_expansion_slope_thresholds", str(pivot_expansion_slope_thresholds)])
+            # One argv token (--opt=value): values starting with '-' break space-separated parsing.
+            argv.append(
+                "--pivot_expansion_slope_thresholds=" + str(pivot_expansion_slope_thresholds).strip()
+            )
         if pivot_expansion_slope_branch_counts is not None and str(pivot_expansion_slope_branch_counts).strip():
             argv.extend(["--pivot_expansion_slope_branch_counts", str(pivot_expansion_slope_branch_counts)])
     argv.extend(
@@ -830,8 +833,9 @@ def build_multi_dataset_profile_loop_sh(
         if pivot_expansion_criteria is not None:
             body_lines.append(f"    --pivot_expansion_criteria {shlex.quote(str(pivot_expansion_criteria))} \\")
         if pivot_expansion_slope_thresholds is not None and str(pivot_expansion_slope_thresholds).strip():
+            _pv = str(pivot_expansion_slope_thresholds).strip()
             body_lines.append(
-                f"    --pivot_expansion_slope_thresholds {shlex.quote(str(pivot_expansion_slope_thresholds))} \\"
+                f"    --pivot_expansion_slope_thresholds={shlex.quote(_pv)} \\"
             )
         if pivot_expansion_slope_branch_counts is not None and str(pivot_expansion_slope_branch_counts).strip():
             body_lines.append(
