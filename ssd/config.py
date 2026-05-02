@@ -75,6 +75,10 @@ class Config:
     # pivot_precollapse: draft-score collapse before B-row target verify
     pivot_precollapse_score_method: Literal["logprob_sum", "logit_sum"] = "logprob_sum"
     pivot_precollapse_score_temperature_aware: bool = False
+    # pivot_precollapse: "score" = expand then score-collapse; "slope" = no expansion, slope-picked root
+    pivot_precollapse_selection: Literal["score", "slope"] = "score"
+    # Stored as negative floats (same domain as dynamic_expansion slope). CLI may pass absolute values.
+    pivot_precollapse_slope_thresholds: tuple[float, float, float] = (-0.70, -0.58, -0.46)
 
     # hierarchical verification (sync spec, single verify per step)
     intermediate: str = ""  # HF model dir; empty => use same path as draft
@@ -269,6 +273,35 @@ class Config:
                         "pivot_precollapse_score_method must be one of "
                         "{'logprob_sum', 'logit_sum'}"
                     )
+                if self.pivot_precollapse_selection not in {"score", "slope"}:
+                    raise ValueError(
+                        "pivot_precollapse_selection must be one of {'score', 'slope'}; "
+                        f"got {self.pivot_precollapse_selection!r}"
+                    )
+                pst_raw = self.pivot_precollapse_slope_thresholds
+                if isinstance(pst_raw, list):
+                    self.pivot_precollapse_slope_thresholds = tuple(float(x) for x in pst_raw)
+                elif len(pst_raw) == 0:
+                    self.pivot_precollapse_slope_thresholds = (-0.70, -0.58, -0.46)
+                else:
+                    self.pivot_precollapse_slope_thresholds = tuple(float(x) for x in pst_raw)
+                pst = self.pivot_precollapse_slope_thresholds
+                if len(pst) != 3:
+                    raise ValueError(
+                        "pivot_precollapse_slope_thresholds must have length 3 "
+                        f"(got {len(pst)})"
+                    )
+                if pst[0] >= pst[1] or pst[1] >= pst[2]:
+                    raise ValueError(
+                        "pivot_precollapse_slope_thresholds must be strictly increasing "
+                        f"(got {pst})"
+                    )
+                if self.pivot_precollapse_selection == "slope":
+                    if int(self.pivot_topk) < 5:
+                        raise ValueError(
+                            "pivot_precollapse_selection='slope' requires pivot_topk >= 5 "
+                            f"(got {self.pivot_topk})"
+                        )
 
             if uses_pivot_root_expansion(self.spec_policy):
                 assert not self.draft_async, f"{self.spec_policy} requires draft_async=False (sync spec)"

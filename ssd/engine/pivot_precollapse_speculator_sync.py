@@ -14,6 +14,7 @@ from ssd.engine.pivot_branch_planner import (
     PivotExpansionPlan,
     PivotHostPlan,
     build_pivot_expansion_plan,
+    compute_dynamic_expansion_slope,
 )
 from ssd.engine.pivot_executor_flat import PivotExecutorFlat
 from ssd.engine.pivot_speculator_sync import PivotRootSpeculatorSync
@@ -42,6 +43,8 @@ class PivotPrecollapseSpeculatorSync(PivotRootSpeculatorSync):
         *,
         score_method: str = "logprob_sum",
         score_temperature_aware: bool = False,
+        precollapse_selection: str = "score",
+        precollapse_slope_thresholds: tuple[float, float, float] = (-0.70, -0.58, -0.46),
     ):
         if score_method not in {"logprob_sum", "logit_sum"}:
             raise ValueError(
@@ -51,6 +54,16 @@ class PivotPrecollapseSpeculatorSync(PivotRootSpeculatorSync):
         if score_temperature_aware:
             raise NotImplementedError(
                 "pivot_precollapse_score_temperature_aware=True is not wired yet"
+            )
+        if precollapse_selection not in {"score", "slope"}:
+            raise ValueError(
+                "pivot_precollapse_selection must be one of {'score', 'slope'}; "
+                f"got {precollapse_selection!r}"
+            )
+        if len(precollapse_slope_thresholds) != 3:
+            raise ValueError(
+                "pivot_precollapse_slope_thresholds must have length 3; "
+                f"got {len(precollapse_slope_thresholds)}"
             )
         super().__init__(
             lookahead,
@@ -65,6 +78,84 @@ class PivotPrecollapseSpeculatorSync(PivotRootSpeculatorSync):
         )
         self.score_method = score_method
         self.score_temperature_aware = score_temperature_aware
+        self.precollapse_selection = precollapse_selection
+        self.precollapse_slope_thresholds = tuple(float(x) for x in precollapse_slope_thresholds)
+        self._cached_selected_ranks_per_parent: list[int] | None = None
+
+    def reset_step_state(self) -> None:
+        super().reset_step_state()
+        self._cached_selected_ranks_per_parent = None
+
+    def _rank_from_slope(self, slope: float) -> int:
+        t0, t1, t2 = self.precollapse_slope_thresholds
+        if slope < t0:
+            return 2
+        if slope < t1:
+            return 3
+        if slope < t2:
+            return 4
+        return 5
+
+    def _build_slope_direct_plan(
+        self,
+        first_logits_q: torch.Tensor,
+        batch_size: int,
+    ) -> tuple[PivotExpansionPlan, list[int], list[float]]:
+        """B-row plan: one root per parent from Top-{2,3,4,5} by slope bucket (no expansion)."""
+        tk = int(self.expansion_cfg.topk)
+        slope_t, _top_vals, top_ids = compute_dynamic_expansion_slope(
+            first_logits_q.float(), tk
+        )
+        device = first_logits_q.device
+        top_ids_host = top_ids.detach().cpu().tolist()
+        slope_list = slope_t.detach().cpu().tolist()
+        selected_ranks: list[int] = []
+        root_token_ids: list[int] = []
+        for pidx in range(batch_size):
+            rank = self._rank_from_slope(float(slope_list[pidx]))
+            selected_ranks.append(rank)
+            root_token_ids.append(int(top_ids_host[pidx][rank - 1]))
+
+        pib = list(range(batch_size))
+        bip = [0] * batch_size
+        bcounts = [1] * batch_size
+        expand_mask_host = [False] * batch_size
+
+        host = PivotHostPlan(
+            parent_index_per_branch=pib,
+            branch_index_per_parent=bip,
+            root_token_ids=root_token_ids,
+            branch_counts=bcounts,
+            expand_mask=expand_mask_host,
+            criteria_scores=list(slope_list),
+            root_token_probs=None,
+            top1_probs=None,
+            residual_scores=None,
+            dynamic_expansion_slope_scores=list(slope_list),
+        )
+
+        zf = torch.zeros(batch_size, dtype=torch.float32, device=device)
+        plan = PivotExpansionPlan(
+            parent_batch_size=batch_size,
+            expanded_batch_size=batch_size,
+            expand_mask=torch.zeros(batch_size, dtype=torch.bool, device=device),
+            parent_index_per_branch=torch.arange(
+                batch_size, dtype=torch.int64, device=device
+            ),
+            branch_index_per_parent=torch.zeros(
+                batch_size, dtype=torch.int64, device=device
+            ),
+            root_token_ids=torch.tensor(root_token_ids, dtype=torch.int64, device=device),
+            root_token_probs=torch.zeros(batch_size, dtype=torch.float32, device=device),
+            criteria_scores=slope_t.to(device),
+            top1_probs=zf,
+            residual_scores=zf,
+            branch_counts=bcounts,
+            branch_counts_tensor=torch.ones(batch_size, dtype=torch.int64, device=device),
+            dynamic_expansion_slope_scores=slope_t.to(device),
+            host=host,
+        )
+        return plan, selected_ranks, slope_list
 
     @staticmethod
     def _replace_parent_spec_tail(parent: Sequence, committed_len: int, suffix: list[int]) -> None:
@@ -304,19 +395,29 @@ class PivotPrecollapseSpeculatorSync(PivotRootSpeculatorSync):
 
         if self._cached_root_tokens_per_parent is None:
             t_plan0 = perf_counter()
-            plan = build_pivot_expansion_plan(
-                first_logits_q,
-                self.expansion_cfg,
-                max_expand_rows=None,
-                materialize_host=True,
-                profile_metadata=self.enable_profile_trace,
-            )
-            t_plan1 = perf_counter()
-            t_cap0 = perf_counter()
-            plan = self._apply_precollapse_capacity_limit(seqs, plan)
-            t_cap1 = perf_counter()
-            self._override_branch0_roots(plan, first_token_ids, first_logits_q)
-            t_cap2 = perf_counter()
+            selected_ranks_for_cache: list[int] | None = None
+            if self.precollapse_selection == "slope":
+                plan, selected_ranks_for_cache, _slope_scores = self._build_slope_direct_plan(
+                    first_logits_q, batch_size
+                )
+                t_plan1 = perf_counter()
+                t_cap0 = t_plan1
+                t_cap1 = t_plan1
+                t_cap2 = t_plan1
+            else:
+                plan = build_pivot_expansion_plan(
+                    first_logits_q,
+                    self.expansion_cfg,
+                    max_expand_rows=None,
+                    materialize_host=True,
+                    profile_metadata=self.enable_profile_trace,
+                )
+                t_plan1 = perf_counter()
+                t_cap0 = perf_counter()
+                plan = self._apply_precollapse_capacity_limit(seqs, plan)
+                t_cap1 = perf_counter()
+                self._override_branch0_roots(plan, first_token_ids, first_logits_q)
+                t_cap2 = perf_counter()
             assert plan.host is not None
             roots_per_parent: list[list[int]] = [[] for _ in range(batch_size)]
             for pidx, bidx, tok in zip(
@@ -332,6 +433,11 @@ class PivotPrecollapseSpeculatorSync(PivotRootSpeculatorSync):
             self._cached_slope_scores_per_parent = (
                 list(plan.host.dynamic_expansion_slope_scores)
                 if plan.host.dynamic_expansion_slope_scores is not None
+                else None
+            )
+            self._cached_selected_ranks_per_parent = (
+                list(selected_ranks_for_cache)
+                if selected_ranks_for_cache is not None
                 else None
             )
             if self.enable_profile_trace and plan.host.top1_probs is not None:
@@ -436,7 +542,8 @@ class PivotPrecollapseSpeculatorSync(PivotRootSpeculatorSync):
             t_cap0 = perf_counter()
             plan = self._apply_precollapse_capacity_limit(seqs, plan)
             t_cap1 = perf_counter()
-            self._override_branch0_roots(plan, first_token_ids, first_logits_q)
+            if self.precollapse_selection != "slope":
+                self._override_branch0_roots(plan, first_token_ids, first_logits_q)
             t_cap2 = perf_counter()
 
         self._debug_pivot_expansion(first_logits_q=first_logits_q, plan=plan)
@@ -753,6 +860,18 @@ class PivotPrecollapseSpeculatorSync(PivotRootSpeculatorSync):
             after_expansion_batch_size=b_exp,
             score_method=self.score_method,
             committed_len_per_parent=list(committed_len_per_parent),
+            selected_root_rank_per_parent=(
+                list(self._cached_selected_ranks_per_parent)
+                if self.precollapse_selection == "slope"
+                and self._cached_selected_ranks_per_parent is not None
+                else None
+            ),
+            slope_score_per_parent=(
+                list(self._cached_slope_scores_per_parent)
+                if self.precollapse_selection == "slope"
+                and self._cached_slope_scores_per_parent is not None
+                else None
+            ),
         )
 
         if dbg:

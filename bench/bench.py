@@ -32,6 +32,16 @@ def parse_pivot_expansion_slope_thresholds(s: str | None) -> tuple[float, ...]:
     return tuple(float(x.strip()) for x in str(s).split(",") if str(x).strip())
 
 
+def parse_pivot_precollapse_slope_thresholds(s: str | None) -> tuple[float, ...]:
+    """Comma-separated *absolute* values; Config stores negatives (slope threshold domain).
+
+    Example: ``0.70,0.58,0.46`` → ``(-0.70, -0.58, -0.46)``. Empty → ``()`` (Config defaults).
+    """
+    if s is None or not str(s).strip():
+        return ()
+    return tuple(-abs(float(x.strip())) for x in str(s).split(",") if str(x).strip())
+
+
 def parse_pivot_expansion_slope_branch_counts(s: str | None) -> tuple[int, ...]:
     """Comma-separated ints for ``dynamic_expansion`` bucket branch counts (validated in Config)."""
     if s is None or not str(s).strip():
@@ -191,6 +201,21 @@ def parse_arguments():
         choices=["logprob_sum", "logit_sum"],
         default="logprob_sum",
         help="pivot_precollapse only: collapse picks branch by sum of draft token logprobs or logits.",
+    )
+    parser.add_argument(
+        "--pivot_precollapse_selection",
+        type=str,
+        choices=["score", "slope"],
+        default="score",
+        help="pivot_precollapse: score=expand then draft-score collapse; slope=no expansion, slope-picked root.",
+    )
+    parser.add_argument(
+        "--pivot_precollapse_slope_thresholds",
+        type=str,
+        default="",
+        metavar="A0,A1,A2",
+        help="pivot_precollapse slope mode only: three comma-separated *absolute* values (e.g. 0.70,0.58,0.46); "
+        "stored internally as negative thresholds. Empty uses Config defaults.",
     )
     parser.add_argument(
         "--enable_pivot_draft_scratch_phase2",
@@ -586,6 +611,12 @@ def initialize_wandb(args, run_name):
             "pivot_precollapse_score_method": getattr(
                 args, "pivot_precollapse_score_method", "logprob_sum"
             ),
+            "pivot_precollapse_selection": getattr(
+                args, "pivot_precollapse_selection", "score"
+            ),
+            "pivot_precollapse_slope_thresholds": parse_pivot_precollapse_slope_thresholds(
+                getattr(args, "pivot_precollapse_slope_thresholds", "") or ""
+            ),
             "gpu_memory_utilization_arg": getattr(args, "gpu_memory_utilization", None),
         }
     )
@@ -638,6 +669,10 @@ def create_llm_kwargs(args, draft_path):
         pivot_topk=args.pivot_topk,
         pivot_precollapse_score_method=getattr(
             args, "pivot_precollapse_score_method", "logprob_sum"
+        ),
+        pivot_precollapse_selection=getattr(args, "pivot_precollapse_selection", "score"),
+        pivot_precollapse_slope_thresholds=parse_pivot_precollapse_slope_thresholds(
+            getattr(args, "pivot_precollapse_slope_thresholds", "") or ""
         ),
         debug_phase0_flat_compare=bool(getattr(args, "debug_phase0_flat_compare", False)),
         enable_pivot_draft_scratch_phase2=bool(

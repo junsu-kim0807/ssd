@@ -38,7 +38,7 @@ Notes:
       1) misspeculation top-k inclusiveness (top1..top10) for target_accept_len == 0 rows,
       2) misspeculation confidence correlation for target_accept_len == 0 rows,
       3) confidence_distribution for all metadata rows,
-      4) confidence_misspeuclation_position_correlation (buckets top2..top5, top10, others) for target_accept_len == 0 rows
+      4) confidence_misspeuclation_position_correlation (top2..top5, top10, others for target_accept_len == 0 rows, plus raw_distribution["top1"] for all target rows with residual confidence < 0.8)
       5) oracle_acceptance_length from metadata.jsonl plus analysis.jsonl,
       6) markov_chain over consecutive target_accept_len values within each request_id.
   - "trace" reads metadata.jsonl and stores target_accept_len for request IDs
@@ -772,6 +772,7 @@ def compute_confidence_distribution_rows(all_rows: List[Dict[str, Any]]) -> List
 
 
 MISSPEC_POSITION_CATEGORIES = ("top2", "top3", "top4", "top5", "top10", "others")
+LOW_RESIDUAL_TOP1_THRESHOLD = 0.8
 
 
 def _empty_category_lists() -> Dict[str, List[Any]]:
@@ -824,12 +825,70 @@ def _average_or_none(total: float, count: int) -> Optional[float]:
     return total / count if count > 0 else None
 
 
+def _accumulate_first_draft_confidence(
+    row: Dict[str, Any],
+    sums: List[float],
+    counts: List[int],
+) -> bool:
+    """
+    Accumulate one row's ``first_draft_token_confidence`` vector.
+
+    Returns True if at least one finite value was accumulated.
+    """
+    first_conf = row.get("first_draft_token_confidence") or []
+    if not isinstance(first_conf, list):
+        return False
+
+    _ensure_len(sums, len(first_conf), 0.0)
+    _ensure_len(counts, len(first_conf), 0)
+
+    has_value = False
+    for pos, value in enumerate(first_conf):
+        value_float = _as_float(value)
+        if value_float is None:
+            continue
+        sums[pos] += value_float
+        counts[pos] += 1
+        has_value = True
+
+    return has_value
+
+
+def _build_raw_distribution_entry(
+    count: int,
+    sums: List[float],
+    counts: List[int],
+) -> Dict[str, Any]:
+    avg = [
+        _average_or_none(total, count_at_pos)
+        for total, count_at_pos in zip(sums, counts)
+    ]
+
+    return {
+        "count": count,
+        "avg_first_draft_token_confidence": avg,
+        "sum_first_draft_token_confidence": sums,
+        "num_values_per_position": counts,
+    }
+
+
 def compute_confidence_misspeuclation_position_correlation(
     miss_rows: List[Dict[str, Any]],
+    all_target_rows: List[Dict[str, Any]],
     max_topk: int = FIRST_DRAFT_METADATA_TOPK,
+    low_residual_top1_threshold: float = LOW_RESIDUAL_TOP1_THRESHOLD,
 ) -> Dict[str, Any]:
     """
     Correlate misspeculation confidence with the target-token draft rank bucket.
+
+    Misspeculation rank buckets:
+      - top2, top3, top4, top5, top10, others
+      - computed only over target misspeculation rows where target_accept_len == 0
+
+    Added raw_distribution['top1'] bucket:
+      - computed over all target-side verification rows, not only misspeculation rows
+      - includes rows whose residual confidence is below ``low_residual_top1_threshold``
+      - residual confidence is first_draft_token_confidence[0] - first_draft_token_confidence[1]
 
     Output schema:
       selection_criteria:
@@ -837,24 +896,33 @@ def compute_confidence_misspeuclation_position_correlation(
         residual_confidence[category] contains
           first_draft_token_confidence[0] - first_draft_token_confidence[1]
 
-      raw_distribution[category] averages the full first_draft_token_confidence
-      vector over rows whose target_recovery_token lands in that category.
+      raw_distribution[category] contains:
+        count
+        avg_first_draft_token_confidence
+        sum_first_draft_token_confidence
+        num_values_per_position
 
-    Categories are top2, top3, top4, top5, top10 (ranks 6--10 within the stored
-    top-k list), and others. The total list length for each selection criterion
-    equals the number of misspeculation rows.
+    Important:
+      raw_distribution['top1'] has a different meaning from the misspeculation
+      rank buckets. It is a low-residual-confidence bucket over all target rows.
     """
     selection_criteria: Dict[str, Dict[str, List[Any]]] = {
         "top1_confidence": _empty_category_lists(),
         "residual_confidence": _empty_category_lists(),
     }
 
-    category_counts: Dict[str, int] = {category: 0 for category in MISSPEC_POSITION_CATEGORIES}
+    category_counts: Dict[str, int] = {
+        category: 0 for category in MISSPEC_POSITION_CATEGORIES
+    }
     unexpected_top1_match_count = 0
     missing_target_or_topk_count = 0
 
-    raw_sums: Dict[str, List[float]] = {category: [] for category in MISSPEC_POSITION_CATEGORIES}
-    raw_value_counts: Dict[str, List[int]] = {category: [] for category in MISSPEC_POSITION_CATEGORIES}
+    raw_sums: Dict[str, List[float]] = {
+        category: [] for category in MISSPEC_POSITION_CATEGORIES
+    }
+    raw_value_counts: Dict[str, List[int]] = {
+        category: [] for category in MISSPEC_POSITION_CATEGORIES
+    }
 
     rows_by_category: Dict[str, List[Dict[str, Any]]] = {
         category: [] for category in MISSPEC_POSITION_CATEGORIES
@@ -875,17 +943,11 @@ def compute_confidence_misspeuclation_position_correlation(
         selection_criteria["top1_confidence"][category].append(_as_float(top1_confidence))
         selection_criteria["residual_confidence"][category].append(_as_float(residual_confidence))
 
-        first_conf = row.get("first_draft_token_confidence") or []
-        if isinstance(first_conf, list):
-            _ensure_len(raw_sums[category], len(first_conf), 0.0)
-            _ensure_len(raw_value_counts[category], len(first_conf), 0)
-
-            for pos, value in enumerate(first_conf):
-                value_float = _as_float(value)
-                if value_float is None:
-                    continue
-                raw_sums[category][pos] += value_float
-                raw_value_counts[category][pos] += 1
+        _accumulate_first_draft_confidence(
+            row=row,
+            sums=raw_sums[category],
+            counts=raw_value_counts[category],
+        )
 
         rows_by_category[category].append(
             {
@@ -900,20 +962,68 @@ def compute_confidence_misspeuclation_position_correlation(
         )
 
     raw_distribution: Dict[str, Dict[str, Any]] = {}
-    for category in MISSPEC_POSITION_CATEGORIES:
-        sums = raw_sums[category]
-        counts = raw_value_counts[category]
-        avg = [
-            _average_or_none(total, count)
-            for total, count in zip(sums, counts)
-        ]
 
-        raw_distribution[category] = {
-            "count": category_counts[category],
-            "avg_first_draft_token_confidence": avg,
-            "sum_first_draft_token_confidence": sums,
-            "num_values_per_position": counts,
-        }
+    # New top1 bucket: all target verification rows with low residual confidence.
+    top1_low_residual_sums: List[float] = []
+    top1_low_residual_counts: List[int] = []
+    top1_low_residual_row_count = 0
+    top1_low_residual_missing_confidence_count = 0
+    top1_low_residual_rows: List[Dict[str, Any]] = []
+
+    for row in all_target_rows:
+        top1_confidence, residual_confidence = extract_first_draft_confidence_pair(row)
+        residual_confidence_float = _as_float(residual_confidence)
+
+        if residual_confidence_float is None:
+            top1_low_residual_missing_confidence_count += 1
+            continue
+
+        if residual_confidence_float >= low_residual_top1_threshold:
+            continue
+
+        accumulated = _accumulate_first_draft_confidence(
+            row=row,
+            sums=top1_low_residual_sums,
+            counts=top1_low_residual_counts,
+        )
+        if not accumulated:
+            top1_low_residual_missing_confidence_count += 1
+            continue
+
+        top1_low_residual_row_count += 1
+        top1_low_residual_rows.append(
+            {
+                "step_id": row.get("step_id"),
+                "request_id": row.get("request_id"),
+                "verification_model": row.get("verification_model"),
+                "target_accept_len": row.get("target_accept_len"),
+                "target_recovery_token": row.get("target_recovery_token"),
+                "top1_confidence": _as_float(top1_confidence),
+                "residual_confidence": residual_confidence_float,
+                "first_draft_token_ids": row.get("first_draft_token_ids"),
+                "first_draft_token_confidence": row.get("first_draft_token_confidence"),
+            }
+        )
+
+    raw_distribution["top1"] = _build_raw_distribution_entry(
+        count=top1_low_residual_row_count,
+        sums=top1_low_residual_sums,
+        counts=top1_low_residual_counts,
+    )
+    raw_distribution["top1"]["source"] = "all_target_rows_with_low_residual_confidence"
+    raw_distribution["top1"]["residual_confidence_threshold"] = low_residual_top1_threshold
+    raw_distribution["top1"]["selection_rule"] = (
+        "first_draft_token_confidence[0] - first_draft_token_confidence[1] "
+        f"< {low_residual_top1_threshold}"
+    )
+
+    for category in MISSPEC_POSITION_CATEGORIES:
+        raw_distribution[category] = _build_raw_distribution_entry(
+            count=category_counts[category],
+            sums=raw_sums[category],
+            counts=raw_value_counts[category],
+        )
+        raw_distribution[category]["source"] = "misspeculation_rows_by_target_recovery_rank"
 
     selection_criteria_list_lengths = {
         criterion: {
@@ -928,10 +1038,32 @@ def compute_confidence_misspeuclation_position_correlation(
         for criterion, lengths in selection_criteria_list_lengths.items()
     }
 
+    num_all_target_rows = len(all_target_rows)
+    top1_low_residual_probability_among_target_rows = (
+        top1_low_residual_row_count / num_all_target_rows
+        if num_all_target_rows > 0
+        else None
+    )
+
     return {
-        "category_definition": "target_recovery_token rank in first_draft_token_ids for target_accept_len == 0 rows",
-        "categories": list(MISSPEC_POSITION_CATEGORIES),
+        "category_definition": (
+            "top2, top3, top4, top5, top10, and others use target_recovery_token "
+            "rank in first_draft_token_ids for target_accept_len == 0 rows. "
+            "raw_distribution['top1'] uses all target rows with residual confidence "
+            f"less than {low_residual_top1_threshold}."
+        ),
+        "categories": ["top1", *list(MISSPEC_POSITION_CATEGORIES)],
+        "misspeculation_categories": list(MISSPEC_POSITION_CATEGORIES),
         "num_misspeculation_steps": len(miss_rows),
+        "num_all_target_rows": num_all_target_rows,
+        "low_residual_top1_threshold": low_residual_top1_threshold,
+        "top1_low_residual_count": top1_low_residual_row_count,
+        "top1_low_residual_probability_among_target_rows": (
+            top1_low_residual_probability_among_target_rows
+        ),
+        "top1_low_residual_missing_confidence_count": (
+            top1_low_residual_missing_confidence_count
+        ),
         "category_counts": category_counts,
         "category_probabilities": {
             category: (count / len(miss_rows) if miss_rows else None)
@@ -942,6 +1074,7 @@ def compute_confidence_misspeuclation_position_correlation(
         "selection_criteria_total_list_lengths": selection_criteria_total_list_lengths,
         "raw_distribution": raw_distribution,
         "rows_by_category": rows_by_category,
+        "top1_low_residual_rows": top1_low_residual_rows,
         "unexpected_top1_match_count": unexpected_top1_match_count,
         "missing_target_or_topk_count": missing_target_or_topk_count,
     }
@@ -953,11 +1086,13 @@ def build_insight_entry(
     analysis_path: Optional[Path] = None,
 ) -> Dict[str, Any]:
     rows = list(iter_jsonl(metadata_path))
+    target_rows = [row for row in rows if is_target_verify_row(row)]
     miss_rows = [row for row in rows if is_target_misspeculation_row(row)]
     analysis_obj = read_first_jsonl_object(analysis_path) if analysis_path is not None else None
 
     entry = dict(ctx)
     entry["num_metadata_rows"] = len(rows)
+    entry["num_target_rows"] = len(target_rows)
     entry["num_misspeculation_steps"] = len(miss_rows)
     entry["misspeculation_topk_inclusiveness"] = compute_topk_inclusiveness(
         miss_rows, max_topk=FIRST_DRAFT_METADATA_TOPK
@@ -966,7 +1101,10 @@ def build_insight_entry(
     entry["confidence_distribution"] = compute_confidence_distribution_rows(rows)
     entry["confidence_misspeuclation_position_correlation"] = (
         compute_confidence_misspeuclation_position_correlation(
-            miss_rows, max_topk=FIRST_DRAFT_METADATA_TOPK
+            miss_rows=miss_rows,
+            all_target_rows=target_rows,
+            max_topk=FIRST_DRAFT_METADATA_TOPK,
+            low_residual_top1_threshold=LOW_RESIDUAL_TOP1_THRESHOLD,
         )
     )
     entry["oracle_acceptance_length"] = compute_oracle_acceptance_length(rows, ctx, analysis_obj)

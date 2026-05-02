@@ -149,6 +149,8 @@ def build_spec_components(
                     config.pivot_expansion_criteria
                 ),
                 "pivot_precollapse_score_method": config.pivot_precollapse_score_method,
+                "pivot_precollapse_selection": config.pivot_precollapse_selection,
+                "pivot_precollapse_slope_thresholds": config.pivot_precollapse_slope_thresholds,
                 "pivot_topk": config.pivot_topk,
                 "max_expand_rows": max_expand_rows,
             },
@@ -174,6 +176,8 @@ def build_spec_components(
             enable_profile_trace=enable_profile_trace,
             score_method=config.pivot_precollapse_score_method,
             score_temperature_aware=config.pivot_precollapse_score_temperature_aware,
+            precollapse_selection=config.pivot_precollapse_selection,
+            precollapse_slope_thresholds=tuple(config.pivot_precollapse_slope_thresholds),
         )
         verifier = PivotPrecollapseVerifier(
             lookahead=config.speculate_k,

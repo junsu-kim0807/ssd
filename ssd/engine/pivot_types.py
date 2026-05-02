@@ -46,6 +46,9 @@ class PivotPrecollapseDecision:
     score_method: str = "logprob_sum"
     # Per-parent ``num_tokens`` before recovery append (debug rollback asserts).
     committed_len_per_parent: list[int] | None = None
+    # pivot_precollapse_selection == "slope": root rank in {2,3,4,5} (1-based top-k index).
+    selected_root_rank_per_parent: list[int] | None = None
+    slope_score_per_parent: list[float] | None = None
 
 
 @dataclass

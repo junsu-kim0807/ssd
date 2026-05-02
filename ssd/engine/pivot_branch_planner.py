@@ -264,6 +264,39 @@ def apply_capacity_limit(
     return _cap_low_scores(expand_mask, criteria_scores, max_expand_reqs)
 
 
+def compute_dynamic_expansion_slope(
+    logits_f: torch.Tensor,
+    topk: int,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Per-row slope ``(p_topK - p_top2) / (K - 2)`` with full-vocab softmax; top-``K`` logits slice.
+
+    Matches the ``dynamic_expansion`` branch in ``build_pivot_expansion_plan`` (``K == topk``).
+
+    Returns:
+        slope_scores: ``[B]`` float32
+        top_vals: ``[B, K]`` float32 logits at the top-``K`` indices
+        top_ids: ``[B, K]`` int64 token ids for those logits
+    """
+    if logits_f.ndim != 2:
+        raise ValueError(
+            f"logits_f must have shape [B, V], got {tuple(logits_f.shape)}"
+        )
+    _, vocab_size = int(logits_f.shape[0]), int(logits_f.shape[1])
+    tk = int(topk)
+    if tk < 3:
+        raise ValueError(f"topk must be >= 3 for dynamic expansion slope, got {tk}")
+    if vocab_size < tk:
+        raise ValueError(
+            f"vocab_size ({vocab_size}) must be >= topk ({tk}) for slope computation"
+        )
+    top_vals, top_ids = torch.topk(logits_f, k=tk, dim=-1)
+    log_z = torch.logsumexp(logits_f, dim=-1)
+    p2 = torch.exp(top_vals[:, 1] - log_z)
+    p_topk_rank = torch.exp(top_vals[:, tk - 1] - log_z)
+    slope = ((p_topk_rank - p2) / float(tk - 2)).to(torch.float32)
+    return slope, top_vals, top_ids
+
+
 def build_pivot_expansion_plan(
     first_step_logits: torch.Tensor,  # [B, V]
     cfg: PivotExpansionConfig,
@@ -290,19 +323,23 @@ def build_pivot_expansion_plan(
     device = first_step_logits.device
     topk = min(int(cfg.topk), max(1, vocab_size))
 
+    logits_f = first_step_logits.float()
+    slope_tensor: torch.Tensor | None = None
+
     if cfg.policy == "dynamic_expansion":
         tk_req = int(cfg.topk)
         if vocab_size < tk_req:
             raise ValueError(
                 f"dynamic_expansion requires vocab_size >= {tk_req} for top-{tk_req} softmax statistics"
             )
-        topk_eff = min(tk_req, vocab_size)
+        slope_tensor, top_vals_all, top_ids_all = compute_dynamic_expansion_slope(
+            logits_f, tk_req
+        )
+        topk_eff = tk_req
     else:
         # Need top-2 for logit margin / full-softmax residual and top-k for root candidates.
         topk_eff = min(max(topk, 2), vocab_size)
-
-    logits_f = first_step_logits.float()
-    top_vals_all, top_ids_all = torch.topk(logits_f, k=topk_eff, dim=-1)
+        top_vals_all, top_ids_all = torch.topk(logits_f, k=topk_eff, dim=-1)
 
     if vocab_size >= 2:
         logit_margin_scores = top_vals_all[:, 0] - top_vals_all[:, 1]
@@ -315,14 +352,10 @@ def build_pivot_expansion_plan(
     log_z: torch.Tensor | None = None
     p1: torch.Tensor | None = None
     p2: torch.Tensor | None = None
-    p_topk_rank: torch.Tensor | None = None  # full-softmax prob of draft's K-th root candidate (K == cfg.topk)
     if need_softmax_top_probs and vocab_size >= 2:
         log_z = torch.logsumexp(logits_f, dim=-1)
         p1 = torch.exp(top_vals_all[:, 0] - log_z)
         p2 = torch.exp(top_vals_all[:, 1] - log_z)
-        if cfg.policy == "dynamic_expansion":
-            k_idx = int(cfg.topk) - 1
-            p_topk_rank = torch.exp(top_vals_all[:, k_idx] - log_z)
 
     if cfg.criteria == "softmax_residual":
         if vocab_size >= 2:
@@ -347,11 +380,8 @@ def build_pivot_expansion_plan(
             "pass max_expand_rows=None into build_pivot_expansion_plan"
         )
 
-    slope_tensor: torch.Tensor | None = None
     if cfg.policy == "dynamic_expansion":
-        assert p2 is not None and p_topk_rank is not None
-        tk_slope = float(int(cfg.topk) - 2)
-        slope_tensor = ((p_topk_rank - p2) / tk_slope).to(torch.float32)
+        assert slope_tensor is not None
         branch_counts_t = _dynamic_expansion_branch_counts_from_slope(
             slope_tensor, expand_mask, cfg
         )
