@@ -693,13 +693,20 @@ class PivotPrecollapseSpeculatorSync(PivotRootSpeculatorSync):
             winning_score_per_parent = [0.0] * batch_size
             for pidx in range(batch_size):
                 rows = per_parent_rows[pidx]
-                best = rows[0]
-                best_s = branch_scores_list[best]
-                for r in rows[1:]:
-                    s = branch_scores_list[r]
-                    if s > best_s:
-                        best = r
-                        best_s = s
+                # Prefer non-branch-0 when this parent was expanded: collapse winner is argmax
+                # over alt branches only; branch 0 stays in the batch for vanilla / fallback.
+                alt_rows = [r for r in rows if int(branch_idx_list[r]) != 0]
+                if alt_rows:
+                    best = alt_rows[0]
+                    best_s = branch_scores_list[best]
+                    for r in alt_rows[1:]:
+                        s = branch_scores_list[r]
+                        if s > best_s:
+                            best = r
+                            best_s = s
+                else:
+                    best = rows[0]
+                    best_s = branch_scores_list[best]
                 winner_rows[pidx] = best
                 winners_branch[pidx] = int(branch_idx_list[best])
                 winning_score_per_parent[pidx] = best_s
