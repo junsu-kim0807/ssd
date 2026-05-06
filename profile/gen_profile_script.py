@@ -64,6 +64,8 @@ _REPO_ROOT = Path(__file__).resolve().parent.parent
 # Llama-3.1-8B-Instruct | Vicuna-7B (vicuna13b_160m preset only); see ``resolve_intermediate_model_path``.
 BENCH_PRESET_LLAMA_TARGET = "meta-llama/Llama-3.3-70B-Instruct"
 BENCH_PRESET_LLAMA_DRAFT = "meta-llama/Llama-3.2-1B-Instruct"
+BENCH_PRESET_LLAMA_DRAFT_3B = "meta-llama/Llama-3.2-3B-Instruct"
+BENCH_PRESET_LLAMA_DRAFT_8B = "meta-llama/Llama-3.1-8B-Instruct"
 BENCH_PRESET_QWEN_TARGET = "Qwen/Qwen3-32B"
 BENCH_PRESET_QWEN_DRAFT = "Qwen/Qwen3-0.6B"
 BENCH_PRESET_GEMMA_TARGET = "google/gemma-4-31B-it"
@@ -120,6 +122,12 @@ MODEL_PRESETS: dict[str, tuple[str, str, str]] = {
         BENCH_PRESET_VICUNA13B_160M_DRAFT,
     ),
 }
+
+LLAMA_SYNC_BATCH_LENGTH_DRAFT_VARIANTS: tuple[tuple[str, str], ...] = (
+    ("1", BENCH_PRESET_LLAMA_DRAFT),
+    ("3", BENCH_PRESET_LLAMA_DRAFT_3B),
+    ("8", BENCH_PRESET_LLAMA_DRAFT_8B),
+)
 
 DEFAULT_GPU_BY_FAMILY_METHOD: dict[tuple[str, str], int] = {
     ("llama", "ar"): 4,
@@ -1006,6 +1014,32 @@ def iter_job_configs(
                         yield fam, mid, k, b, t, spec
 
 
+def iter_spec_draft_variants(
+    *,
+    family: str,
+    method_id: str,
+    multi_dataset_sweep: bool,
+    uses_spec_k: bool,
+    default_draft_hub: str,
+    batch_or_length_sweep: bool,
+) -> tuple[tuple[str | None, str | None], ...]:
+    """Return (bench --draft value, draft hub id for path slug) variants.
+
+    For standard speculative decoding (sync) in llama batch/length sweeps,
+    profile all supported Llama drafts (1B, 3B, 8B) instead of only default 1B.
+    """
+    if not uses_spec_k:
+        return ((None, None),)
+    if (
+        family == "llama"
+        and method_id == "sync"
+        and multi_dataset_sweep
+        and batch_or_length_sweep
+    ):
+        return tuple((draft_size, draft_hub) for draft_size, draft_hub in LLAMA_SYNC_BATCH_LENGTH_DRAFT_VARIANTS)
+    return ((None, default_draft_hub),)
+
+
 def main() -> None:
     p = argparse.ArgumentParser(description="Generate Slurm scripts for bench.py profiling sweeps.")
     p.add_argument("--repo-dir", type=str, default=DEFAULT_REPO_DIR)
@@ -1271,127 +1305,54 @@ def main() -> None:
                 profiler_method_id_for_layout(spec.id) if uses_pivot_profiler_layout(spec.id) else spec.id
             )
             flag_name, target_hub, draft_hub = MODEL_PRESETS[fam]
-            pair_slug = target_plus_draft_slug(target_hub, None if not spec.uses_spec_k else draft_hub)
-            k_path = "kna" if not spec.uses_spec_k else f"k{int(k_val)}"
-            k_for_bench = int(spec.default_k) if not spec.uses_spec_k else int(k_val)
-
-            prof_hv_kw = int(hv_round) if hv_round is not None else None
-
-            pivot_prof_kwargs = dict(
-                pivot_round=str(args.pivot_profiler_round),
-                pivot_topk=int(pivot_topk_val),
-                pivot_expansion_pct=float(pivot_pct_val),
-                pivot_expansion_policy=str(pivot_policy_this),
+            draft_variants = iter_spec_draft_variants(
+                family=fam,
+                method_id=spec.id,
+                multi_dataset_sweep=multi_dataset_sweep,
+                uses_spec_k=spec.uses_spec_k,
+                default_draft_hub=draft_hub,
+                batch_or_length_sweep=bool(args.batch or args.length),
             )
+            for draft_size_override, draft_hub_for_slug in draft_variants:
+                pair_slug = target_plus_draft_slug(target_hub, None if not spec.uses_spec_k else draft_hub_for_slug)
+                k_path = "kna" if not spec.uses_spec_k else f"k{int(k_val)}"
+                k_for_bench = int(spec.default_k) if not spec.uses_spec_k else int(k_val)
 
-            prof_base_rel = profiler_rel_dir(
-                profile_mode=args.profile_mode,
-                method_id=prof_layout_mid,
-                batch_size=b_val,
-                k_path_token=k_path,
-                pair_slug=pair_slug,
-                temp=temp_val,
-                dataset_slug=None,
-                hv_round=prof_hv_kw,
-                **pivot_prof_kwargs,
-            )
-            prof_rel = "./" + prof_base_rel.replace(os.sep, "/")
+                prof_hv_kw = int(hv_round) if hv_round is not None else None
 
-            gpu_n = gpus_global if gpus_global is not None else DEFAULT_GPU_BY_FAMILY_METHOD[(fam, spec.id)]
-
-            pivot_bench_topk = int(pivot_topk_val) if uses_pivot_profiler_layout(spec.id) else None
-            pivot_bench_pct = float(pivot_pct_val) if uses_pivot_profiler_layout(spec.id) else None
-
-            bench_argv = build_bench_argv(
-                model_flag=flag_name,
-                dataset_flags=dataset_flags,
-                method=spec,
-                k=k_for_bench,
-                async_fan_out=int(args.async_fan_out),
-                batch_size=b_val,
-                temp=float(temp_val),
-                numseqs=int(args.numseqs),
-                output_len=int(args.output_len),
-                gpus=gpu_n,
-                profile_mode=args.profile_mode,
-                profiler_output_dir=prof_rel,
-                extra_bench_args=tuple(args.extra_bench_arg),
-                hv_target_verify_interval=hv_round,
-                pivot_topk=pivot_bench_topk,
-                pivot_expansion_pct=pivot_bench_pct,
-                pivot_expansion_policy=(pivot_policy_this if uses_pivot_profiler_layout(spec.id) else None),
-                pivot_expansion_criteria=(p_crit if uses_pivot_profiler_layout(spec.id) else None),
-                pivot_expansion_slope_thresholds=(p_slope if uses_pivot_profiler_layout(spec.id) else None),
-                pivot_expansion_slope_branch_counts=(p_branch if uses_pivot_profiler_layout(spec.id) else None),
-            )
-
-            temp_tag = temp_path_tag(temp_val)
-            r_tag = f"r{int(hv_round)}" if hv_round is not None else ""
-
-            if uses_pivot_profiler_layout(spec.id):
-                if spec.id == "pivot_legacy":
-                    rel_bits = (
-                        Path(args.profile_mode)
-                        / spec.id
-                        / f"b{b_val}"
-                        / k_path
-                        / pair_slug
-                        / temp_tag
-                        / f"r_{sanitize_path_component(str(args.pivot_profiler_round))}"
-                        / f"topk{int(pivot_topk_val)}"
-                        / pct_path_component(float(pivot_pct_val))
-                    )
-                else:
-                    layout_folder = job_layout_method_folder(spec.id)
-                    rel_bits = Path(args.profile_mode) / fam / layout_folder
-                    if layout_folder in {"pivot", "pivot_precollapse"}:
-                        rel_bits = rel_bits / sanitize_path_component(str(pivot_policy_this))
-                    rel_bits = (
-                        rel_bits
-                        / f"b{b_val}"
-                        / k_path
-                        / pair_slug
-                        / temp_tag
-                        / f"r_{sanitize_path_component(str(args.pivot_profiler_round))}"
-                        / f"topk{int(pivot_topk_val)}"
-                        / pct_path_component(float(pivot_pct_val))
-                    )
-            else:
-                rel_bits = Path(args.profile_mode) / fam / spec.id / f"b{b_val}" / k_path / pair_slug / temp_tag
-                if hv_round is not None:
-                    rel_bits = rel_bits / r_tag
-            job_dir = job_root / rel_bits
-            out_log_dir = out_log_root / rel_bits
-            err_log_dir = err_log_root / rel_bits
-            if not args.dry_run:
-                ensure_dir(job_dir)
-                ensure_dir(out_log_dir)
-                ensure_dir(err_log_dir)
-
-            optional_env = ""
-            if spec.id == "hierarchical":
-                optional_env = (
-                    'export PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}"\n'
+                pivot_prof_kwargs = dict(
+                    pivot_round=str(args.pivot_profiler_round),
+                    pivot_topk=int(pivot_topk_val),
+                    pivot_expansion_pct=float(pivot_pct_val),
+                    pivot_expansion_policy=str(pivot_policy_this),
                 )
 
-            if multi_dataset_sweep and args.multids_all_in_one:
-                job_name = f"bench_{fam}_{spec.id}_b{b_val}_{k_path}_{temp_tag}{'_' + r_tag if r_tag else ''}_multids_bl"[:64]
-                script_path = job_dir / f"{job_name}.sh"
-                mkdir_ov = profiler_mkdirs_block_for_datasets(
+                prof_base_rel = profiler_rel_dir(
                     profile_mode=args.profile_mode,
                     method_id=prof_layout_mid,
                     batch_size=b_val,
                     k_path_token=k_path,
                     pair_slug=pair_slug,
                     temp=temp_val,
-                    dataset_slugs=MULTI_DATASET_PROFILE_SLUGS,
+                    dataset_slug=None,
                     hv_round=prof_hv_kw,
                     **pivot_prof_kwargs,
                 )
-                custom_body = build_multi_dataset_profile_loop_sh(
+                prof_rel = "./" + prof_base_rel.replace(os.sep, "/")
+
+                gpu_n = gpus_global if gpus_global is not None else DEFAULT_GPU_BY_FAMILY_METHOD[(fam, spec.id)]
+
+                pivot_bench_topk = int(pivot_topk_val) if uses_pivot_profiler_layout(spec.id) else None
+                pivot_bench_pct = float(pivot_pct_val) if uses_pivot_profiler_layout(spec.id) else None
+                extra_bench_args_this = list(args.extra_bench_arg)
+                if draft_size_override is not None:
+                    extra_bench_args_this.extend(["--draft", str(draft_size_override)])
+
+                bench_argv = build_bench_argv(
                     model_flag=flag_name,
+                    dataset_flags=dataset_flags,
                     method=spec,
-                    k_bench=k_for_bench,
+                    k=k_for_bench,
                     async_fan_out=int(args.async_fan_out),
                     batch_size=b_val,
                     temp=float(temp_val),
@@ -1399,8 +1360,8 @@ def main() -> None:
                     output_len=int(args.output_len),
                     gpus=gpu_n,
                     profile_mode=args.profile_mode,
-                    profiler_base_rel=prof_base_rel,
-                    extra_bench_args=tuple(args.extra_bench_arg),
+                    profiler_output_dir=prof_rel,
+                    extra_bench_args=tuple(extra_bench_args_this),
                     hv_target_verify_interval=hv_round,
                     pivot_topk=pivot_bench_topk,
                     pivot_expansion_pct=pivot_bench_pct,
@@ -1409,90 +1370,74 @@ def main() -> None:
                     pivot_expansion_slope_thresholds=(p_slope if uses_pivot_profiler_layout(spec.id) else None),
                     pivot_expansion_slope_branch_counts=(p_branch if uses_pivot_profiler_layout(spec.id) else None),
                 )
-                for ds in MULTI_DATASET_PROFILE_SLUGS:
-                    ds_rb = dataset_bench_flags(ds)
-                    prof_rel_rb = "./" + profiler_rel_dir(
-                        profile_mode=args.profile_mode,
-                        method_id=prof_layout_mid,
-                        batch_size=b_val,
-                        k_path_token=k_path,
-                        pair_slug=pair_slug,
-                        temp=temp_val,
-                        dataset_slug=ds,
-                        hv_round=prof_hv_kw,
-                        **pivot_prof_kwargs,
-                    ).replace(os.sep, "/")
-                    _record_run_script_argv(
-                        build_bench_argv(
-                            model_flag=flag_name,
-                            dataset_flags=ds_rb,
-                            method=spec,
-                            k=k_for_bench,
-                            async_fan_out=int(args.async_fan_out),
-                            batch_size=b_val,
-                            temp=float(temp_val),
-                            numseqs=int(args.numseqs),
-                            output_len=int(args.output_len),
-                            gpus=gpu_n,
-                            profile_mode=args.profile_mode,
-                            profiler_output_dir=prof_rel_rb,
-                            extra_bench_args=tuple(args.extra_bench_arg),
-                            hv_target_verify_interval=hv_round,
-                            pivot_topk=pivot_bench_topk,
-                            pivot_expansion_pct=pivot_bench_pct,
-                            pivot_expansion_policy=(pivot_policy_this if uses_pivot_profiler_layout(spec.id) else None),
-                            pivot_expansion_criteria=(p_crit if uses_pivot_profiler_layout(spec.id) else None),
-                            pivot_expansion_slope_thresholds=(p_slope if uses_pivot_profiler_layout(spec.id) else None),
-                            pivot_expansion_slope_branch_counts=(p_branch if uses_pivot_profiler_layout(spec.id) else None),
-                        ),
-                        method_id=spec.id,
-                    )
-                text = make_slurm_script(
-                    job_name=job_name,
-                    account=args.account,
-                    qos=args.qos,
-                    gres=args.gres,
-                    mem_per_gpu=args.mem_per_gpu,
-                    time_limit=args.time_limit,
-                    cpus_per_task=int(args.cpus_per_task),
-                    out_path=out_log_dir / f"{job_name}.out",
-                    err_path=err_log_dir / f"{job_name}.err",
-                    repo_dir=repo_dir,
-                    venv_dir=venv_dir,
-                    bench_rel=args.bench_subdir,
-                    bench_argv=bench_argv,
-                    hf_home_fallback=str(args.hf_home_fallback),
-                    optional_env_before_bench=optional_env,
-                    custom_bench_body=custom_body,
-                    mkdir_block_override=mkdir_ov,
-                )
-                if args.dry_run:
-                    print(f"would write: {script_path}")
+
+                temp_tag = temp_path_tag(temp_val)
+                r_tag = f"r{int(hv_round)}" if hv_round is not None else ""
+
+                if uses_pivot_profiler_layout(spec.id):
+                    if spec.id == "pivot_legacy":
+                        rel_bits = (
+                            Path(args.profile_mode)
+                            / spec.id
+                            / f"b{b_val}"
+                            / k_path
+                            / pair_slug
+                            / temp_tag
+                            / f"r_{sanitize_path_component(str(args.pivot_profiler_round))}"
+                            / f"topk{int(pivot_topk_val)}"
+                            / pct_path_component(float(pivot_pct_val))
+                        )
+                    else:
+                        layout_folder = job_layout_method_folder(spec.id)
+                        rel_bits = Path(args.profile_mode) / fam / layout_folder
+                        if layout_folder in {"pivot", "pivot_precollapse"}:
+                            rel_bits = rel_bits / sanitize_path_component(str(pivot_policy_this))
+                        rel_bits = (
+                            rel_bits
+                            / f"b{b_val}"
+                            / k_path
+                            / pair_slug
+                            / temp_tag
+                            / f"r_{sanitize_path_component(str(args.pivot_profiler_round))}"
+                            / f"topk{int(pivot_topk_val)}"
+                            / pct_path_component(float(pivot_pct_val))
+                        )
                 else:
-                    script_path.write_text(text, encoding="utf-8")
-                    os.chmod(script_path, 0o755)
-                n_written += 1
-            elif multi_dataset_sweep:
-                for ds in MULTI_DATASET_PROFILE_SLUGS:
-                    ds_flags = dataset_bench_flags(ds)
-                    prof_rel_ds = "./" + profiler_rel_dir(
+                    rel_bits = Path(args.profile_mode) / fam / spec.id / f"b{b_val}" / k_path / pair_slug / temp_tag
+                    if hv_round is not None:
+                        rel_bits = rel_bits / r_tag
+                job_dir = job_root / rel_bits
+                out_log_dir = out_log_root / rel_bits
+                err_log_dir = err_log_root / rel_bits
+                if not args.dry_run:
+                    ensure_dir(job_dir)
+                    ensure_dir(out_log_dir)
+                    ensure_dir(err_log_dir)
+
+                optional_env = ""
+                if spec.id == "hierarchical":
+                    optional_env = (
+                        'export PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}"\n'
+                    )
+
+                if multi_dataset_sweep and args.multids_all_in_one:
+                    job_name = f"bench_{fam}_{spec.id}_b{b_val}_{k_path}_{temp_tag}{'_' + r_tag if r_tag else ''}_multids_bl"[:64]
+                    script_path = job_dir / f"{job_name}.sh"
+                    mkdir_ov = profiler_mkdirs_block_for_datasets(
                         profile_mode=args.profile_mode,
                         method_id=prof_layout_mid,
                         batch_size=b_val,
                         k_path_token=k_path,
                         pair_slug=pair_slug,
                         temp=temp_val,
-                        dataset_slug=ds,
+                        dataset_slugs=MULTI_DATASET_PROFILE_SLUGS,
                         hv_round=prof_hv_kw,
                         **pivot_prof_kwargs,
-                    ).replace(os.sep, "/")
-                    job_name = f"{ds}_{fam}_{spec.id}_b{b_val}_{k_path}_{temp_tag}{'_' + r_tag if r_tag else ''}"[:64]
-                    script_path = job_dir / f"{job_name}.sh"
-                    bench_argv_ds = build_bench_argv(
+                    )
+                    custom_body = build_multi_dataset_profile_loop_sh(
                         model_flag=flag_name,
-                        dataset_flags=ds_flags,
                         method=spec,
-                        k=k_for_bench,
+                        k_bench=k_for_bench,
                         async_fan_out=int(args.async_fan_out),
                         batch_size=b_val,
                         temp=float(temp_val),
@@ -1500,8 +1445,8 @@ def main() -> None:
                         output_len=int(args.output_len),
                         gpus=gpu_n,
                         profile_mode=args.profile_mode,
-                        profiler_output_dir=prof_rel_ds,
-                        extra_bench_args=tuple(args.extra_bench_arg),
+                        profiler_base_rel=prof_base_rel,
+                        extra_bench_args=tuple(extra_bench_args_this),
                         hv_target_verify_interval=hv_round,
                         pivot_topk=pivot_bench_topk,
                         pivot_expansion_pct=pivot_bench_pct,
@@ -1510,7 +1455,44 @@ def main() -> None:
                         pivot_expansion_slope_thresholds=(p_slope if uses_pivot_profiler_layout(spec.id) else None),
                         pivot_expansion_slope_branch_counts=(p_branch if uses_pivot_profiler_layout(spec.id) else None),
                     )
-                    _record_run_script_argv(bench_argv_ds, method_id=spec.id)
+                    for ds in MULTI_DATASET_PROFILE_SLUGS:
+                        ds_rb = dataset_bench_flags(ds)
+                        prof_rel_rb = "./" + profiler_rel_dir(
+                            profile_mode=args.profile_mode,
+                            method_id=prof_layout_mid,
+                            batch_size=b_val,
+                            k_path_token=k_path,
+                            pair_slug=pair_slug,
+                            temp=temp_val,
+                            dataset_slug=ds,
+                            hv_round=prof_hv_kw,
+                            **pivot_prof_kwargs,
+                        ).replace(os.sep, "/")
+                        _record_run_script_argv(
+                            build_bench_argv(
+                                model_flag=flag_name,
+                                dataset_flags=ds_rb,
+                                method=spec,
+                                k=k_for_bench,
+                                async_fan_out=int(args.async_fan_out),
+                                batch_size=b_val,
+                                temp=float(temp_val),
+                                numseqs=int(args.numseqs),
+                                output_len=int(args.output_len),
+                                gpus=gpu_n,
+                                profile_mode=args.profile_mode,
+                                profiler_output_dir=prof_rel_rb,
+                                extra_bench_args=tuple(extra_bench_args_this),
+                                hv_target_verify_interval=hv_round,
+                                pivot_topk=pivot_bench_topk,
+                                pivot_expansion_pct=pivot_bench_pct,
+                                pivot_expansion_policy=(pivot_policy_this if uses_pivot_profiler_layout(spec.id) else None),
+                                pivot_expansion_criteria=(p_crit if uses_pivot_profiler_layout(spec.id) else None),
+                                pivot_expansion_slope_thresholds=(p_slope if uses_pivot_profiler_layout(spec.id) else None),
+                                pivot_expansion_slope_branch_counts=(p_branch if uses_pivot_profiler_layout(spec.id) else None),
+                            ),
+                            method_id=spec.id,
+                        )
                     text = make_slurm_script(
                         job_name=job_name,
                         account=args.account,
@@ -1524,7 +1506,97 @@ def main() -> None:
                         repo_dir=repo_dir,
                         venv_dir=venv_dir,
                         bench_rel=args.bench_subdir,
-                        bench_argv=bench_argv_ds,
+                        bench_argv=bench_argv,
+                        hf_home_fallback=str(args.hf_home_fallback),
+                        optional_env_before_bench=optional_env,
+                        custom_bench_body=custom_body,
+                        mkdir_block_override=mkdir_ov,
+                    )
+                    if args.dry_run:
+                        print(f"would write: {script_path}")
+                    else:
+                        script_path.write_text(text, encoding="utf-8")
+                        os.chmod(script_path, 0o755)
+                    n_written += 1
+                elif multi_dataset_sweep:
+                    for ds in MULTI_DATASET_PROFILE_SLUGS:
+                        ds_flags = dataset_bench_flags(ds)
+                        prof_rel_ds = "./" + profiler_rel_dir(
+                            profile_mode=args.profile_mode,
+                            method_id=prof_layout_mid,
+                            batch_size=b_val,
+                            k_path_token=k_path,
+                            pair_slug=pair_slug,
+                            temp=temp_val,
+                            dataset_slug=ds,
+                            hv_round=prof_hv_kw,
+                            **pivot_prof_kwargs,
+                        ).replace(os.sep, "/")
+                        job_name = f"{ds}_{fam}_{spec.id}_b{b_val}_{k_path}_{temp_tag}{'_' + r_tag if r_tag else ''}"[:64]
+                        script_path = job_dir / f"{job_name}.sh"
+                        bench_argv_ds = build_bench_argv(
+                            model_flag=flag_name,
+                            dataset_flags=ds_flags,
+                            method=spec,
+                            k=k_for_bench,
+                            async_fan_out=int(args.async_fan_out),
+                            batch_size=b_val,
+                            temp=float(temp_val),
+                            numseqs=int(args.numseqs),
+                            output_len=int(args.output_len),
+                            gpus=gpu_n,
+                            profile_mode=args.profile_mode,
+                            profiler_output_dir=prof_rel_ds,
+                            extra_bench_args=tuple(extra_bench_args_this),
+                            hv_target_verify_interval=hv_round,
+                            pivot_topk=pivot_bench_topk,
+                            pivot_expansion_pct=pivot_bench_pct,
+                            pivot_expansion_policy=(pivot_policy_this if uses_pivot_profiler_layout(spec.id) else None),
+                            pivot_expansion_criteria=(p_crit if uses_pivot_profiler_layout(spec.id) else None),
+                            pivot_expansion_slope_thresholds=(p_slope if uses_pivot_profiler_layout(spec.id) else None),
+                            pivot_expansion_slope_branch_counts=(p_branch if uses_pivot_profiler_layout(spec.id) else None),
+                        )
+                        _record_run_script_argv(bench_argv_ds, method_id=spec.id)
+                        text = make_slurm_script(
+                            job_name=job_name,
+                            account=args.account,
+                            qos=args.qos,
+                            gres=args.gres,
+                            mem_per_gpu=args.mem_per_gpu,
+                            time_limit=args.time_limit,
+                            cpus_per_task=int(args.cpus_per_task),
+                            out_path=out_log_dir / f"{job_name}.out",
+                            err_path=err_log_dir / f"{job_name}.err",
+                            repo_dir=repo_dir,
+                            venv_dir=venv_dir,
+                            bench_rel=args.bench_subdir,
+                            bench_argv=bench_argv_ds,
+                            hf_home_fallback=str(args.hf_home_fallback),
+                            optional_env_before_bench=optional_env,
+                        )
+                        if args.dry_run:
+                            print(f"would write: {script_path}")
+                        else:
+                            script_path.write_text(text, encoding="utf-8")
+                            os.chmod(script_path, 0o755)
+                        n_written += 1
+                else:
+                    job_name = f"bench_{fam}_{spec.id}_b{b_val}_{k_path}_{temp_tag}{'_' + r_tag if r_tag else ''}"[:64]
+                    script_path = job_dir / f"{job_name}.sh"
+                    text = make_slurm_script(
+                        job_name=job_name,
+                        account=args.account,
+                        qos=args.qos,
+                        gres=args.gres,
+                        mem_per_gpu=args.mem_per_gpu,
+                        time_limit=args.time_limit,
+                        cpus_per_task=int(args.cpus_per_task),
+                        out_path=out_log_dir / f"{job_name}.out",
+                        err_path=err_log_dir / f"{job_name}.err",
+                        repo_dir=repo_dir,
+                        venv_dir=venv_dir,
+                        bench_rel=args.bench_subdir,
+                        bench_argv=bench_argv,
                         hf_home_fallback=str(args.hf_home_fallback),
                         optional_env_before_bench=optional_env,
                     )
@@ -1534,32 +1606,6 @@ def main() -> None:
                         script_path.write_text(text, encoding="utf-8")
                         os.chmod(script_path, 0o755)
                     n_written += 1
-            else:
-                job_name = f"bench_{fam}_{spec.id}_b{b_val}_{k_path}_{temp_tag}{'_' + r_tag if r_tag else ''}"[:64]
-                script_path = job_dir / f"{job_name}.sh"
-                text = make_slurm_script(
-                    job_name=job_name,
-                    account=args.account,
-                    qos=args.qos,
-                    gres=args.gres,
-                    mem_per_gpu=args.mem_per_gpu,
-                    time_limit=args.time_limit,
-                    cpus_per_task=int(args.cpus_per_task),
-                    out_path=out_log_dir / f"{job_name}.out",
-                    err_path=err_log_dir / f"{job_name}.err",
-                    repo_dir=repo_dir,
-                    venv_dir=venv_dir,
-                    bench_rel=args.bench_subdir,
-                    bench_argv=bench_argv,
-                    hf_home_fallback=str(args.hf_home_fallback),
-                    optional_env_before_bench=optional_env,
-                )
-                if args.dry_run:
-                    print(f"would write: {script_path}")
-                else:
-                    script_path.write_text(text, encoding="utf-8")
-                    os.chmod(script_path, 0o755)
-                n_written += 1
 
     def _write_run_only_script(
         path_str: str,
